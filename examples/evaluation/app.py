@@ -2,6 +2,8 @@
 
 
 def describe_items(items):
+    if isinstance(items, list) and not items:
+        return "データがありません"
     return ", ".join(items)
 
 
