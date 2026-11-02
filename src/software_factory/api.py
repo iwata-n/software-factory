@@ -31,6 +31,7 @@ from .db import Database
 from .models import (
     Artifact,
     Attempt,
+    Candidate,
     Job,
     JobDependency,
     PlanVersion,
@@ -95,8 +96,9 @@ def create_app(
         version="0.1.0",
         lifespan=lifespan,
         description=(
-            "Local foundation with Fake Agent only. Runs stop at ASSEMBLE_CANDIDATE; "
-            "no verified code, PR publication, or production authentication is provided yet."
+            "Local control plane with immutable Candidates and managed assembly. "
+            "Default Fake Agent produces no patch. Verification, publication and real-agent "
+            "integration are tracked by the implementation plan."
         ),
     )
     app.state.service = service
@@ -236,6 +238,60 @@ def create_app(
             }
 
         return service.read(token, query)
+
+    @app.get("/v1/runs/{run_id}/candidates", tags=["Candidates"])
+    def candidates_get(run_id: str, token: Token):
+        from .candidates import candidate_view
+
+        def query(s, a):
+            owned(s, Run, run_id, a.workspace_id)
+            return {
+                "candidates": [
+                    candidate_view(item)
+                    for item in s.scalars(
+                        select(Candidate)
+                        .where(Candidate.workspace_id == a.workspace_id, Candidate.run_id == run_id)
+                        .order_by(Candidate.generation)
+                    )
+                ]
+            }
+
+        return service.read(token, query)
+
+    @app.get("/v1/candidates/{candidate_id}", tags=["Candidates"])
+    def candidate_get(candidate_id: str, token: Token):
+        from .candidates import candidate_view
+
+        return service.read(
+            token, lambda s, a: candidate_view(owned(s, Candidate, candidate_id, a.workspace_id))
+        )
+
+    @app.put("/v1/candidates/{candidate_id}", tags=["Candidates"])
+    @app.patch("/v1/candidates/{candidate_id}", tags=["Candidates"])
+    @app.delete("/v1/candidates/{candidate_id}", tags=["Candidates"])
+    def candidate_mutation(candidate_id: str, token: Token):
+        def reject(s, a):
+            owned(s, Candidate, candidate_id, a.workspace_id)
+            raise DomainError(409, "CANDIDATE_IMMUTABLE")
+
+        return service.read(token, reject)
+
+    @app.get("/v1/worker/leases/{lease_id}/inputs/{artifact_id}/content", tags=["Artifacts"])
+    def input_content(lease_id: str, artifact_id: str, fence: int, token: Token):
+        with service.db.transaction() as s:
+            actor = service.principal(s, token, "WORKER")
+            _, job, run = service.artifacts.active(s, actor, lease_id, fence)
+            artifact = owned(s, Artifact, artifact_id, actor.workspace_id)
+            if artifact.run_id != run.id or artifact_id not in job.payload.get(
+                "input_artifact_ids", []
+            ):
+                raise DomainError(404, "NOT_FOUND")
+            body = service.artifacts.content(s, actor, artifact_id)
+        return Response(
+            content=body,
+            media_type="application/octet-stream",
+            headers={"X-Content-Type-Options": "nosniff"},
+        )
 
     @app.get("/v1/runs/{run_id}/graph", tags=["Runs"])
     def graph_get(run_id: str, token: Token):

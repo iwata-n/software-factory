@@ -1,11 +1,14 @@
 """Managed Linux runner. Only this supervisor can access the container runtime."""
 
+import fcntl
+import hashlib
 import json
 import os
 import re
 import subprocess
 import time
 from dataclasses import dataclass
+from pathlib import Path
 from threading import Event, Lock
 from uuid import uuid4
 
@@ -41,6 +44,57 @@ class DockerRunner:
         self.source_ca_pem = source_ca_pem
         self._active: set[str] = set()
         self._lock = Lock()
+        self.state_root = Path(
+            os.environ.get("FACTORY_RUNNER_STATE_ROOT", ".local/runner/owners")
+        ).absolute()
+        if any(path.is_symlink() for path in (self.state_root, *self.state_root.parents)):
+            raise ValueError("runner state directory cannot contain symlinks")
+        self.state_root.mkdir(mode=0o700, parents=True, exist_ok=True)
+        self.namespace = hashlib.sha256(str(self.state_root).encode()).hexdigest()[:24]
+        self.owner = uuid4().hex
+        self._owner_fd = os.open(
+            self.state_root / (self.owner + ".lock"),
+            os.O_RDWR | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+            0o600,
+        )
+        fcntl.flock(self._owner_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        self.cleanup_orphans()
+
+    def __del__(self):
+        if hasattr(self, "_owner_fd"):
+            os.close(self._owner_fd)
+
+    def cleanup_orphans(self):
+        listing = self.docker(
+            "ps", "-aq", "--filter", "label=factory.namespace=" + self.namespace, timeout=10
+        )
+        if listing.returncode:
+            raise RunnerError("CONTAINER_RUNTIME_UNAVAILABLE")
+        removed = []
+        for container in listing.stdout.decode().split():
+            inspected = self.docker("inspect", container, timeout=5)
+            if inspected.returncode:
+                continue
+            labels = json.loads(inspected.stdout)[0]["Config"].get("Labels") or {}
+            owner = labels.get("factory.owner", "")
+            if owner == self.owner or not re.fullmatch(r"[0-9a-f]{32}", owner):
+                continue
+            try:
+                fd = os.open(self.state_root / (owner + ".lock"), os.O_RDWR | os.O_NOFOLLOW)
+            except OSError:
+                continue
+            try:
+                try:
+                    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                except BlockingIOError:
+                    continue
+                result = self.docker("rm", "--force", container, timeout=7)
+                if result.returncode:
+                    raise RunnerError("ORPHAN_STOP_UNCONFIRMED")
+                removed.append(container)
+            finally:
+                os.close(fd)
+        return removed
 
     @staticmethod
     def docker(*args, **kwargs):
@@ -72,16 +126,23 @@ class DockerRunner:
         timeout: float = 120,
         network: bool = False,
         cancelled: Event | None = None,
+        pause_at: str | None = None,
     ) -> RunnerResult:
         self.verify_image()
         if timeout <= 10 or (cancelled and cancelled.is_set()):
             raise RunnerError("INSUFFICIENT_EXECUTION_TIME")
         name = "factory-" + uuid4().hex
+        if pause_at not in {None, "patch_applied", "before_commit"}:
+            raise ValueError("unsupported trusted test checkpoint")
         args = [
             "docker",
             "run",
             "--name",
             name,
+            "--label",
+            "factory.namespace=" + self.namespace,
+            "--label",
+            "factory.owner=" + self.owner,
             "--init",
             "-i",
             "--read-only",
@@ -107,8 +168,10 @@ class DockerRunner:
             "/tmp:rw,nosuid,nodev,noexec,size=16m,uid=65532,gid=65532",
             "--workdir",
             "/work",
-            self.image_digest,
         ]
+        if pause_at:
+            args += ["--env", "FACTORY_TEST_PAUSE_AT=" + pause_at]
+        args += [self.image_digest]
         started = time.monotonic()
         with self._lock:
             self._active.add(name)

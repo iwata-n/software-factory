@@ -94,7 +94,7 @@ def test_fake_plan_and_implementation_stop_before_unimplemented_candidate(world)
     run = world.run()
     assert run["status"] == "BLOCKED"
     assert run["phase"] == "ASSEMBLE_CANDIDATE"
-    assert run["stop_reason"] == "CANDIDATE_PIPELINE_NOT_IMPLEMENTED"
+    assert run["stop_reason"] == "CHANGE_ARTIFACT_MISSING"
     assert run["reserved_microusd"] == 0
     assert world.claim().status_code == 204
     graph = world.get(f"/v1/runs/{world.run_id}/graph").json()

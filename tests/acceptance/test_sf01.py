@@ -171,7 +171,12 @@ def test_previous_revision_data_survives_upgrade(database, evidence):
 def test_health_openapi_and_real_connection_failure(database, tmp_path, evidence):
     client = TestClient(create_app(database))
     assert client.get("/healthz").status_code == 200
-    assert "/v1/worker/leases/{lease_id}/events" in client.get("/openapi.json").json()["paths"]
+    paths = client.get("/openapi.json").json()["paths"]
+    assert "/v1/worker/leases/{lease_id}/events" in paths
+    operations = [
+        operation["operationId"] for path in paths.values() for operation in path.values()
+    ]
+    assert len(operations) == len(set(operations))
     failing = Database(
         database.engine.url.update_query_dict(
             {
@@ -286,7 +291,7 @@ def test_readme_startup_in_new_checkout(checkout, database, evidence):
             api + "/v1/runs/" + runid,
             headers={"Authorization": f"Bearer {bootstrap['user_token']}"},
         ).json()
-        assert run["stop_reason"] == "CANDIDATE_PIPELINE_NOT_IMPLEMENTED"
+        assert run["stop_reason"] == "CHANGE_ARTIFACT_MISSING"
         evidence(
             "README CLI/API/worker flow succeeds in fresh install",
             run["stop_reason"],

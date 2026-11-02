@@ -18,6 +18,15 @@ def main():
     enrollment = sub.add_parser("issue-enrollment", help="Issue a single-use worker enrollment")
     enrollment.add_argument("--workspace-id", required=True)
     enrollment.add_argument("--ttl-seconds", type=int, default=600)
+    enrollment.add_argument(
+        "--managed", action="store_true", help="Trust this locally managed runner"
+    )
+    enrollment.add_argument("--adapter", choices=["fake", "codex_cli"], default="fake")
+    enrollment.add_argument(
+        "--kinds",
+        nargs="+",
+        choices=["PLAN", "IMPLEMENT", "REPAIR", "ASSEMBLE_CANDIDATE", "VERIFY", "REVIEW"],
+    )
     revoke = sub.add_parser("revoke", help="Revoke a local user/worker credential")
     revoke.add_argument("--principal-id", required=True)
     revoke_repository = sub.add_parser(
@@ -54,6 +63,9 @@ def main():
                 "user_token": secret,
             }
         elif args.command == "issue-enrollment":
+            kinds = args.kinds or ["PLAN", "IMPLEMENT"]
+            if not args.managed and set(kinds) & {"ASSEMBLE_CANDIDATE", "VERIFY", "REVIEW"}:
+                parser.error("trusted stages require --managed")
             if not 1 <= args.ttl_seconds <= 3600:
                 parser.error("ttl-seconds must be between 1 and 3600")
             workspace = session.get(Workspace, args.workspace_id)
@@ -65,7 +77,8 @@ def main():
                 Enrollment(
                     workspace_id=workspace.id,
                     token_hash=token_hash(secret),
-                    capabilities=["PLAN", "IMPLEMENT", "adapter:fake"],
+                    capabilities=[*kinds, f"adapter:{args.adapter}"],
+                    managed=args.managed,
                     expires_at=db_now(session) + args.ttl_seconds,
                 )
             )

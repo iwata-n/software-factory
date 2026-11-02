@@ -154,7 +154,7 @@ def test_cli_demo_and_separate_worker_survive_control_plane_restart(database):
         )
         after = httpx.get(run_url, headers=headers).json()
         assert after["status"] == "BLOCKED"
-        assert after["stop_reason"] == "CANDIDATE_PIPELINE_NOT_IMPLEMENTED"
+        assert after["stop_reason"] == "CHANGE_ARTIFACT_MISSING"
         revoked = json.loads(
             module_command(
                 "software_factory.cli",

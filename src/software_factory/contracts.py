@@ -2,6 +2,7 @@
 
 import hashlib
 import json
+import re
 from pathlib import PurePosixPath
 from typing import Annotated, Literal
 
@@ -91,6 +92,22 @@ class TaskSpec(Contract):
     policy_request: PolicyRequest = Field(default_factory=PolicyRequest)
 
 
+class VerificationCommand(Contract):
+    check_id: Name
+    argv: list[Name] = Field(min_length=1, max_length=50)
+    expected_test_ids: list[Name] = Field(min_length=1, max_length=10000)
+    timeout_seconds: int = Field(default=120, ge=1, le=2700)
+    junit_path: Name = ".factory/junit.xml"
+
+    @model_validator(mode="after")
+    def validate_command(self):
+        if not safe_path(self.junit_path) or len(set(self.expected_test_ids)) != len(
+            self.expected_test_ids
+        ):
+            raise ValueError("canonical report path and unique test IDs required")
+        return self
+
+
 class ProjectPolicy(Contract):
     version: Literal[1] = 1
     allowed_write_paths: list[Name] = Field(min_length=1, max_length=100)
@@ -101,7 +118,10 @@ class ProjectPolicy(Contract):
     agent_configuration: dict[str, str] = Field(default_factory=lambda: {"version": "1"})
     verification: Verification
     execution_image_digest: Annotated[str, Field(pattern=r"^sha256:[0-9a-f]{64}$")]
-    agent_adapter: Literal["fake"] = "fake"
+    agent_adapter: Literal["fake", "codex_cli"] = "fake"
+    verification_commands: list[VerificationCommand] = Field(default_factory=list, max_length=100)
+    protected_manifest: dict[str, str] = Field(default_factory=dict, max_length=10000)
+    allow_external_model: bool = False
     run_budget_microusd: int = Field(gt=0, le=10**12)
     job_reservation_microusd: int = Field(gt=0, le=10**12)
     max_infra_attempts_per_job: int = Field(default=3, ge=1, le=3)
@@ -116,6 +136,14 @@ class ProjectPolicy(Contract):
             raise ValueError("policy paths must be relative canonical paths without wildcards")
         if self.job_reservation_microusd > self.run_budget_microusd:
             raise ValueError("a job reservation must fit within the run budget")
+        if any(
+            not safe_path(path) or not re.fullmatch(r"[0-9a-f]{64}", value)
+            for path, value in self.protected_manifest.items()
+        ):
+            raise ValueError("protected manifest must contain canonical paths and SHA-256 values")
+        ids = [command.check_id for command in self.verification_commands]
+        if len(ids) != len(set(ids)) or not set(ids).issubset(self.verification.required_checks):
+            raise ValueError("verification command IDs must be unique required checks")
         return self
 
 
@@ -238,10 +266,37 @@ class WorkerEventBatch(Contract):
 
 class ArtifactReserve(Contract):
     fence: int = Field(ge=1)
-    kind: Literal["PATCH", "LOG", "RESULT", "EVIDENCE"]
+    kind: Literal["PATCH", "LOG", "RESULT", "EVIDENCE", "SOURCE"]
     size_bytes: int = Field(ge=0, le=10**12, strict=True)
     sha256: Annotated[str, Field(pattern=r"^[0-9a-f]{64}$")]
 
 
 class ArtifactFinalize(Contract):
     fence: int = Field(ge=1)
+
+
+Digest = Annotated[str, Field(pattern=r"^[0-9a-f]{64}$")]
+ImageDigest = Annotated[str, Field(pattern=r"^sha256:[0-9a-f]{64}$")]
+
+
+class CandidateReport(Contract):
+    base_sha: Sha
+    head_sha: Sha
+    parent_sha: Sha | None = None
+    tree_sha: Sha
+    source_digest: Digest
+    spec_hash: Digest
+    profile_hash: Digest
+    image_digest: ImageDigest
+    source_artifact_id: Name
+    patch_artifact_id: Name
+    commit_object: Annotated[str, Field(min_length=1, max_length=100000)]
+    file_manifest: dict[str, Digest] = Field(min_length=1, max_length=10000)
+    changed_paths: list[Name] = Field(min_length=1, max_length=10000)
+    isolation: dict = Field(max_length=30)
+
+    @model_validator(mode="after")
+    def validate_paths(self):
+        if not all(safe_path(path) for path in list(self.file_manifest) + self.changed_paths):
+            raise ValueError("candidate paths must be canonical")
+        return self

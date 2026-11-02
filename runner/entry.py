@@ -4,11 +4,13 @@ import base64
 import hashlib
 import io
 import json
+import os
 import posixpath
 import re
 import subprocess
 import sys
 import tarfile
+import time
 from pathlib import Path, PurePosixPath
 
 MAX_SOURCE_BYTES = 128 * 1024 * 1024
@@ -53,6 +55,13 @@ ENV = {
 class Refused(Exception):
     def __init__(self, code, category="POLICY"):
         self.code, self.category = code, category
+
+
+def checkpoint(name):
+    print("FACTORY_STAGE:" + name, file=sys.stderr, flush=True)
+    if os.environ.get("FACTORY_TEST_PAUSE_AT") == name:
+        while True:
+            time.sleep(0.05)
 
 
 def git(*args, input=None, check=True):
@@ -268,14 +277,24 @@ def assemble(data):
     if checked.returncode:
         raise Refused("PATCH_APPLY_DENIED")
     git("apply", "--index", "--whitespace=nowarn", "-", input=patch)
+    checkpoint("patch_applied")
     paths = [
         name.decode()
-        for name in git("diff", "--cached", "--name-only", "-z", sha).split(b"\0")
+        for name in git("diff", "--cached", "--no-renames", "--name-only", "-z", sha).split(b"\0")
         if name
     ]
     protected = data["protected_paths"] + list(data.get("protected_manifest", {}))
     baseline = [".github", "migrations", "auth", "billing", "src/auth", "src/billing"]
     for path in paths:
+        if path.rsplit("/", 1)[-1] in {
+            "conftest.py",
+            "pytest.ini",
+            "tox.ini",
+            "setup.cfg",
+            "pyproject.toml",
+            ".coveragerc",
+        }:
+            raise Refused("PROTECTED_VERIFICATION_CHANGE")
         if any(path == root or path.startswith(root + "/") for root in protected + baseline):
             raise Refused("PROTECTED_VERIFICATION_CHANGE")
         if not canonical_path(path) or not any(
@@ -301,6 +320,7 @@ def assemble(data):
         raise Refused("NO_CODE_CHANGE")
     # Reproducible commit: its identity depends on the parent and resulting tree, not wall time.
     ENV["GIT_AUTHOR_DATE"] = ENV["GIT_COMMITTER_DATE"] = "2000-01-01T00:00:00Z"
+    checkpoint("before_commit")
     git("commit", "-qm", "Software Factory candidate")
     head = git("rev-parse", "HEAD").decode().strip()
     return {
@@ -310,6 +330,9 @@ def assemble(data):
         "source_digest": candidate_digest,
         "code_digest": candidate_digest,
         "base_source_digest": source_digest,
+        "file_manifest": {
+            name: hashlib.sha256(body).hexdigest() for name, _, body in candidate_entries
+        },
         "changed_paths": paths,
         "archive": base64.b64encode(archive).decode(),
         "symlink_paths": links,

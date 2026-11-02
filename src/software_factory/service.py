@@ -67,6 +67,17 @@ def scrub(value):
     return redact(value, request_secrets.get())
 
 
+def scrub_project_body(body, known_secrets=()):
+    """Validated file-hash maps contain paths/hashes, not credential-name/value pairs."""
+    policy = dict(body["policy"])
+    manifest = policy.pop("protected_manifest", {})
+    cleaned = redact({**body, "policy": policy}, known_secrets)
+    cleaned["policy"]["protected_manifest"] = {
+        redact(path, known_secrets): value for path, value in manifest.items()
+    }
+    return cleaned
+
+
 class DomainError(Exception):
     def __init__(self, status: int, code: str):
         self.status = status
@@ -106,6 +117,7 @@ def run_view(run: Run) -> dict:
         "reserved_microusd": run.reserved_microusd,
         "spent_microusd": run.spent_microusd,
         "wait_context": run.wait_context,
+        "current_candidate_id": run.current_candidate_id,
     }
 
 
@@ -130,6 +142,7 @@ def enqueue(
     depends_on: tuple[str, ...] = (),
     priority: int = 0,
     step_key: str | None = None,
+    payload: dict | None = None,
 ) -> Job:
     now = db_now(session)
     dependencies = [owned(session, Job, dep, run.workspace_id) for dep in depends_on]
@@ -144,6 +157,7 @@ def enqueue(
         available_at=now,
         created_at=now,
         priority=priority,
+        payload=payload or {},
         state="READY" if all(dep.state == "SUCCEEDED" for dep in dependencies) else "PENDING",
     )
     session.add(job)
@@ -160,21 +174,33 @@ def enqueue(
     return job
 
 
-def transition(session: Session, run: Run, kind: str, reason: str | None = None) -> None:
+def transition(
+    session: Session, run: Run, kind: str, reason: str | None = None, *, payload=None
+) -> None:
+    previous_phase = run.phase
     decision = decide(
         RunSnapshot(run.status, run.phase, run.stop_reason), DomainEvent(kind, reason)
     )
     run.status, run.phase, run.stop_reason = decision.status, decision.phase, decision.reason
     if decision.next_job:
         previous = session.scalar(
-            select(Job.id).where(
+            select(Job.id)
+            .where(
                 Job.workspace_id == run.workspace_id,
                 Job.run_id == run.id,
-                Job.kind == "PLAN",
+                Job.kind == previous_phase,
                 Job.state == "SUCCEEDED",
             )
+            .order_by(Job.created_at.desc(), Job.id)
+            .limit(1)
         )
-        enqueue(session, run, decision.next_job, depends_on=(previous,) if previous else ())
+        enqueue(
+            session,
+            run,
+            decision.next_job,
+            depends_on=(previous,) if previous else (),
+            payload=payload,
+        )
     event(session, run, kind, {"reason": decision.reason, "phase": run.phase})
 
 
@@ -188,11 +214,13 @@ class Service:
         storage=None,
     ):
         from .artifacts import ArtifactCommands
+        from .candidates import CandidateCommands
 
         self.db = database
         self.resolver = resolver or configured_resolver()
         self.checkpoint = checkpoint or (lambda name: None)
         self.artifacts = ArtifactCommands(self, storage)
+        self.candidates = CandidateCommands(self)
 
     def principal(self, session: Session, token: str, role: str) -> Principal:
         actor = session.scalar(select(Principal).where(Principal.token_hash == token_hash(token)))
@@ -230,8 +258,14 @@ class Service:
             session.refresh(actor)  # Revocation wins even if it raced the initial lookup.
             if not actor.active:
                 raise DomainError(401, "UNAUTHENTICATED")
-            if role == "USER" and redact(body, (token,)) != body:
-                raise DomainError(422, "SENSITIVE_INPUT")
+            if role == "USER":
+                cleaned = (
+                    scrub_project_body(body, (token,))
+                    if operation.startswith("projects:")
+                    else redact(body, (token,))
+                )
+                if cleaned != body:
+                    raise DomainError(422, "SENSITIVE_INPUT")
             request_hash = digest(body)
             previous = session.scalar(
                 select(IdempotencyRecord).where(
@@ -275,7 +309,9 @@ class Service:
 
     def create_project(self, session: Session, actor: Principal, data: ProjectCreate) -> dict:
         project = Project(
-            workspace_id=actor.workspace_id, name=data.name, policy=scrub(data.policy.model_dump())
+            workspace_id=actor.workspace_id,
+            name=data.name,
+            policy=scrub_project_body(data.model_dump(), request_secrets.get())["policy"],
         )
         session.add(project)
         session.flush()
@@ -502,8 +538,16 @@ class Service:
             "agent_adapter": policy.agent_adapter,
             "agent_configuration": policy.agent_configuration,
             "execution_image_digest": policy.execution_image_digest,
-            "simulation": True,
+            "simulation": policy.agent_adapter == "fake",
         }
+        if policy.verification_commands:
+            snapshot["verification_profile"] = {
+                **spec.verification.model_dump(),
+                "schema_version": 1,
+                "commands": [command.model_dump() for command in policy.verification_commands],
+                "protected_manifest": policy.protected_manifest,
+            }
+            snapshot["verification_profile_hash"] = digest(snapshot["verification_profile"])
         if repo.remote_url:
             snapshot["source"] = {"remote_url": repo.remote_url, "base_sha": base_sha}
             if source_details:
@@ -595,6 +639,7 @@ class Service:
                     workspace_id=enrollment.workspace_id,
                     name=name,
                     capabilities=enrollment.capabilities,
+                    managed=enrollment.managed,
                 )
             )
             enrollment.consumed_at = now
@@ -643,6 +688,8 @@ class Service:
                     job.kind not in worker.capabilities
                     or f"adapter:{adapter}" not in worker.capabilities
                 ):
+                    continue
+                if job.kind in {"ASSEMBLE_CANDIDATE", "VERIFY", "REVIEW"} and not worker.managed:
                     continue
                 run_busy = session.scalar(
                     select(Job.id)
@@ -722,6 +769,7 @@ class Service:
                         "snapshot": run.snapshot,
                         "kind": job.kind,
                         "plan": plan.body if plan else None,
+                        "input": job.payload,
                     }
                 )
                 return {
@@ -737,6 +785,7 @@ class Service:
                         "execution": {"timeout_seconds": execution["max_job_execution_seconds"]},
                         "snapshot": run.snapshot,
                         "plan": plan.body if plan else None,
+                        "input": job.payload,
                     },
                     "lease": {
                         "id": attempt.lease_id,
@@ -841,9 +890,18 @@ class Service:
             return {"accepted": True, "attempt_id": attempt.id, "run": run_view(run)}
         if run.status not in {RunStatus.RUNNING, RunStatus.CANCELLING}:
             raise DomainError(409, "INVALID_RUN_STATE")
-        self.artifacts.validate_completion(session, actor, attempt, data.artifact_ids)
+        artifacts = self.artifacts.validate_completion(session, actor, attempt, data.artifact_ids)
         if data.outcome == "CANCELLED" and run.status != RunStatus.CANCELLING:
             raise DomainError(409, "CANCELLATION_NOT_REQUESTED")
+        report = None
+        if run.status != RunStatus.CANCELLING:
+            phase = "VERIFY_REVIEW" if job.kind in {"VERIFY", "REVIEW"} else job.kind
+            if run.phase != phase:
+                raise DomainError(409, "JOB_PHASE_MISMATCH")
+            if job.kind == "ASSEMBLE_CANDIDATE":
+                report = self.candidates.validate(
+                    session, actor, attempt, job, run, data.result, data.artifact_ids
+                )
         self.settle(run, attempt, data.usage_microusd)
         clean_result = scrub(data.result)
         attempt.result = scrub(data.model_dump())
@@ -883,8 +941,28 @@ class Service:
                     transition(session, run, "BLOCKED", error)
                 else:
                     transition(session, run, "PLAN_ACCEPTED")
+            elif job.kind in {"IMPLEMENT", "REPAIR"}:
+                patches = [artifact for artifact in artifacts if artifact.kind == "PATCH"]
+                if len(patches) > 1:
+                    raise DomainError(409, "SINGLE_PATCH_REQUIRED")
+                if not patches:
+                    transition(session, run, "IMPLEMENT_EXECUTED")
+                else:
+                    transition(
+                        session,
+                        run,
+                        "CHANGE_ARTIFACT_READY",
+                        payload={
+                            "patch_artifact_id": patches[0].id,
+                            "input_artifact_ids": [patches[0].id],
+                            "parent_sha": run.base_sha,
+                        },
+                    )
+            elif job.kind == "ASSEMBLE_CANDIDATE":
+                transition(session, run, "CANDIDATE_ASSEMBLED")
+                self.candidates.create(session, actor, attempt, job, run, report)
             else:
-                transition(session, run, "IMPLEMENT_EXECUTED")
+                raise DomainError(409, "UNSUPPORTED_COMPLETION_KIND")
         return {"accepted": True, "attempt_id": attempt.id, "run": run_view(run)}
 
     def retry_or_fail(self, session: Session, job: Job, run: Run) -> None:
@@ -914,6 +992,14 @@ class Service:
             transition(session, run, "BLOCKED", "BUDGET_EXCEEDED")
         elif data.category == "INFRASTRUCTURE":
             self.retry_or_fail(session, job, run)
+        elif data.category == "POLICY" and job.kind == "ASSEMBLE_CANDIDATE":
+            job.state = "FAILED"
+            reason = (
+                data.reason
+                if data.reason in {"PROTECTED_VERIFICATION_CHANGE", "NO_CODE_CHANGE"}
+                else "POLICY_DENIED"
+            )
+            transition(session, run, "BLOCKED", reason)
         else:
             job.state = "FAILED"
             transition(session, run, "BLOCKED", scrub(f"{data.category}: {data.reason}"))

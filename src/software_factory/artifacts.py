@@ -98,6 +98,18 @@ class ArtifactCommands:
         if len(body) != artifact.size_bytes or content_hash(body) != artifact.sha256:
             raise DomainError(409, "ARTIFACT_CONTENT_MISMATCH")
         stored = body
+        if artifact.kind == "PATCH":
+            try:
+                patch = body.decode("utf-8")
+            except UnicodeDecodeError:
+                raise DomainError(422, "PATCH_ENCODING_INVALID") from None
+            if (
+                not patch.startswith(("diff --git ", "--- "))
+                or "\x00" in patch
+                or "GIT binary patch" in patch
+                or "Binary files " in patch
+            ):
+                raise DomainError(422, "PATCH_FORMAT_UNSUPPORTED")
         if artifact.kind == "LOG":
             try:
                 stored = redact(body.decode("utf-8"), request_secrets.get()).encode()

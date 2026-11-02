@@ -1,6 +1,7 @@
 """Outbound HTTP-only worker. No DB module, user token, git token, or Agent secrets."""
 
 import argparse
+import hashlib
 import json
 import os
 import time
@@ -45,11 +46,13 @@ class Supervisor:
             raise RuntimeError("Worker received an unsupported protocol")
         job, lease = assignment["job"], assignment["lease"]
         if (
-            job["snapshot"]["agent_adapter"] != "fake"
+            job["snapshot"]["agent_adapter"] not in self.adapter.capabilities.adapters
             or job["kind"] not in self.adapter.capabilities.kinds
         ):
             raise RuntimeError("Worker received an unsupported adapter or job kind")
         lease_path = f"/v1/worker/leases/{lease['id']}"
+        if hasattr(self.adapter, "bind_transport"):
+            self.adapter.bind_transport(self.client, lease_path, lease["fence"])
         # Confirm the lease before starting. Round-trip time consumes the returned allowance.
         deadline = 0.0
 
@@ -87,7 +90,11 @@ class Supervisor:
             preparation = None
             preparation_error = None
             if not cancelled and time.monotonic() < deadline:
-                if job["snapshot"].get("source"):
+                if (
+                    job["snapshot"].get("source")
+                    and job["kind"] in {"PLAN", "IMPLEMENT", "ASSEMBLE_CANDIDATE"}
+                    and not job.get("input", {}).get("source_candidate_id")
+                ):
                     preparation = Future()
 
                     def fetch_source():
@@ -165,6 +172,56 @@ class Supervisor:
                 self.adapter.cancel()
                 raise TimeoutError("confirmed lease deadline reached before submission")
             buffered_events.extend(self.adapter.events())
+            artifact_ids = []
+            references = {}
+            for artifact in result.artifacts:
+                if time.monotonic() >= deadline:
+                    raise TimeoutError(
+                        "confirmed lease deadline reached before artifact submission"
+                    )
+                if "$artifact/" + artifact.key in references:
+                    raise ValueError("duplicate artifact output key")
+                key = f"artifact:{job['attempt_id']}:{artifact.key}"
+                reserved = self.client.post(
+                    lease_path + "/artifacts",
+                    json={
+                        "fence": lease["fence"],
+                        "kind": artifact.kind,
+                        "size_bytes": len(artifact.body),
+                        "sha256": hashlib.sha256(artifact.body).hexdigest(),
+                    },
+                    headers={"Idempotency-Key": key + ":reserve"},
+                    timeout=10,
+                )
+                reserved.raise_for_status()
+                aid = reserved.json()["id"]
+                uploaded = self.client.put(
+                    lease_path + f"/artifacts/{aid}/content",
+                    params={"fence": lease["fence"]},
+                    content=artifact.body,
+                    headers={"Idempotency-Key": key + ":upload"},
+                    timeout=10,
+                )
+                uploaded.raise_for_status()
+                finalized = self.client.post(
+                    lease_path + f"/artifacts/{aid}/finalize",
+                    json={"fence": lease["fence"]},
+                    headers={"Idempotency-Key": key + ":finalize"},
+                    timeout=10,
+                )
+                finalized.raise_for_status()
+                artifact_ids.append(aid)
+                references["$artifact/" + artifact.key] = aid
+
+            def resolve_references(value):
+                if isinstance(value, str):
+                    return references.get(value, value)
+                if isinstance(value, list):
+                    return [resolve_references(item) for item in value]
+                if isinstance(value, dict):
+                    return {key: resolve_references(item) for key, item in value.items()}
+                return value
+
             for offset in range(0, len(buffered_events), 100):
                 if time.monotonic() >= deadline:
                     raise TimeoutError("confirmed lease deadline reached before event submission")
@@ -191,8 +248,8 @@ class Supervisor:
                 body = {
                     "fence": lease["fence"],
                     "outcome": result.outcome,
-                    "artifact_ids": [],
-                    "result": result.result,
+                    "artifact_ids": artifact_ids,
+                    "result": resolve_references(result.result),
                     "usage_microusd": result.usage_microusd,
                 }
             # Identical key and body across retries, including a lost completion response.
@@ -237,6 +294,7 @@ def main():
     parser.add_argument(
         "--scenario", choices=["success", "infra-fail", "inconclusive"], default="success"
     )
+    parser.add_argument("--adapter", choices=["fake", "pipeline"], default="fake")
     args = parser.parse_args()
     validate_api_url(args.api_url)
     token = os.environ.get("FACTORY_WORKER_TOKEN")
@@ -245,7 +303,17 @@ def main():
     with httpx.Client(
         base_url=args.api_url, headers={"Authorization": f"Bearer {token}"}
     ) as client:
-        supervisor = Supervisor(client, FakeAgent(args.scenario))
+        if args.adapter == "pipeline":
+            from .pipeline_worker import PipelineAdapter
+            from .sandbox import DockerRunner
+
+            image = os.environ.get("FACTORY_RUNNER_IMAGE_DIGEST")
+            if not image:
+                parser.error("FACTORY_RUNNER_IMAGE_DIGEST is required for managed stages")
+            adapter = PipelineAdapter(DockerRunner(image))
+        else:
+            adapter = FakeAgent(args.scenario)
+        supervisor = Supervisor(client, adapter)
         while True:
             try:
                 result = supervisor.run_once(wait_seconds=0 if args.once or args.drain else 20)

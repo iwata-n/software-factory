@@ -43,7 +43,7 @@ def test_fake_scenarios_never_create_code_or_verified_success(world, clock, evid
     expected = {"success": "BLOCKED", "infra-fail": "QUEUED", "inconclusive": "BLOCKED"}[scenario]
     assert run["status"] == expected and run["status"] != "SUCCEEDED"
     if scenario == "success":
-        assert run["stop_reason"] == "CANDIDATE_PIPELINE_NOT_IMPLEMENTED"
+        assert run["stop_reason"] == "CHANGE_ARTIFACT_MISSING"
     if scenario == "infra-fail":
         with world.database.transaction() as session:
             assert session.scalar(select(func.count()).select_from(Job)) == 1

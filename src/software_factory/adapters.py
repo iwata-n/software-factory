@@ -8,6 +8,14 @@ from typing import Protocol
 class Capabilities:
     kinds: tuple[str, ...] = ("PLAN", "IMPLEMENT")
     supports_resume: bool = False
+    adapters: tuple[str, ...] = ("fake",)
+
+
+@dataclass(frozen=True)
+class ProducedArtifact:
+    key: str
+    kind: str
+    body: bytes
 
 
 @dataclass(frozen=True)
@@ -17,6 +25,7 @@ class AgentResult:
     category: str | None = None
     reason: str | None = None
     usage_microusd: int = 0
+    artifacts: tuple[ProducedArtifact, ...] = ()
 
 
 class AgentAdapter(Protocol):

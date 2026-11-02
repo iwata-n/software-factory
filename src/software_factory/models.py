@@ -54,6 +54,7 @@ class Enrollment(Tenant, Base):
     capabilities: Mapped[list] = mapped_column(JSON)
     expires_at: Mapped[float] = mapped_column(Float)
     consumed_at: Mapped[float | None] = mapped_column(Float, nullable=True)
+    managed: Mapped[bool] = mapped_column(Boolean, default=False, server_default="false")
 
 
 class Worker(Tenant, Base):
@@ -64,6 +65,7 @@ class Worker(Tenant, Base):
     )
     name: Mapped[str] = mapped_column(String(200))
     capabilities: Mapped[list] = mapped_column(JSON)
+    managed: Mapped[bool] = mapped_column(Boolean, default=False, server_default="false")
     # Exactly one slot in this first slice; worker row is the slot mutex.
 
 
@@ -138,6 +140,12 @@ class Run(Tenant, Base):
             ["repositories.workspace_id", "repositories.id"],
         ),
         CheckConstraint("budget_microusd > 0 AND reserved_microusd >= 0 AND spent_microusd >= 0"),
+        ForeignKeyConstraint(
+            ["workspace_id", "id", "current_candidate_id"],
+            ["candidates.workspace_id", "candidates.run_id", "candidates.id"],
+            name="fk_runs_current_candidate",
+            use_alter=True,
+        ),
     )
     task_id: Mapped[str] = mapped_column(String(36))
     spec_version: Mapped[int] = mapped_column(Integer)
@@ -153,6 +161,7 @@ class Run(Tenant, Base):
     spent_microusd: Mapped[int] = mapped_column(BigInteger, default=0)
     created_at: Mapped[float] = mapped_column(Float)
     wait_context: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    current_candidate_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
 
 
 class PlanVersion(Tenant, Base):
@@ -186,6 +195,7 @@ class Job(Tenant, Base):
     available_at: Mapped[float] = mapped_column(Float)
     created_at: Mapped[float] = mapped_column(Float)
     priority: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
+    payload: Mapped[dict] = mapped_column(JSON, default=dict, server_default="{}")
 
 
 class JobDependency(Tenant, Base):
@@ -302,6 +312,10 @@ class Artifact(Tenant, Base):
     __tablename__ = "artifacts"
     __table_args__ = (
         UniqueConstraint("workspace_id", "id"),
+        UniqueConstraint("workspace_id", "run_id", "id", name="uq_artifacts_workspace_run_id"),
+        UniqueConstraint(
+            "workspace_id", "attempt_id", "id", name="uq_artifacts_workspace_attempt_id"
+        ),
         ForeignKeyConstraint(
             ["workspace_id", "run_id", "job_id"], ["jobs.workspace_id", "jobs.run_id", "jobs.id"]
         ),
@@ -325,3 +339,44 @@ class Artifact(Tenant, Base):
     created_at: Mapped[float] = mapped_column(Float)
     expires_at: Mapped[float] = mapped_column(Float)
     finalized_at: Mapped[float | None] = mapped_column(Float, nullable=True)
+
+
+class Candidate(Tenant, Base):
+    __tablename__ = "candidates"
+    __table_args__ = (
+        UniqueConstraint("workspace_id", "id"),
+        UniqueConstraint("workspace_id", "run_id", "id", name="uq_candidates_workspace_run_id"),
+        UniqueConstraint("workspace_id", "run_id", "generation"),
+        UniqueConstraint("workspace_id", "assembly_job_id"),
+        ForeignKeyConstraint(
+            ["workspace_id", "run_id", "assembly_job_id"],
+            ["jobs.workspace_id", "jobs.run_id", "jobs.id"],
+        ),
+        ForeignKeyConstraint(
+            ["workspace_id", "assembly_job_id", "producer_attempt_id"],
+            ["job_attempts.workspace_id", "job_attempts.job_id", "job_attempts.id"],
+        ),
+        ForeignKeyConstraint(
+            ["workspace_id", "run_id", "patch_artifact_id"],
+            ["artifacts.workspace_id", "artifacts.run_id", "artifacts.id"],
+        ),
+        ForeignKeyConstraint(
+            ["workspace_id", "producer_attempt_id", "source_artifact_id"],
+            ["artifacts.workspace_id", "artifacts.attempt_id", "artifacts.id"],
+        ),
+    )
+    run_id: Mapped[str] = mapped_column(String(36))
+    generation: Mapped[int] = mapped_column(Integer)
+    assembly_job_id: Mapped[str] = mapped_column(String(36))
+    producer_attempt_id: Mapped[str] = mapped_column(String(36))
+    patch_artifact_id: Mapped[str] = mapped_column(String(36))
+    source_artifact_id: Mapped[str] = mapped_column(String(36))
+    base_sha: Mapped[str] = mapped_column(String(64))
+    head_sha: Mapped[str] = mapped_column(String(64))
+    tree_sha: Mapped[str] = mapped_column(String(64))
+    source_digest: Mapped[str] = mapped_column(String(64))
+    spec_hash: Mapped[str] = mapped_column(String(64))
+    profile_hash: Mapped[str] = mapped_column(String(64))
+    image_digest: Mapped[str] = mapped_column(String(71))
+    metadata_body: Mapped[dict] = mapped_column(JSON)
+    created_at: Mapped[float] = mapped_column(Float)

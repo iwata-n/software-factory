@@ -74,7 +74,9 @@ def decide(
         return Decision(RunStatus.QUEUED, "IMPLEMENT", next_job="IMPLEMENT")
     if event.kind == "IMPLEMENT_EXECUTED" and run.phase == "IMPLEMENT":
         # A fake implementation is not an immutable Candidate or verified code.
-        return Decision(
-            RunStatus.BLOCKED, "ASSEMBLE_CANDIDATE", "CANDIDATE_PIPELINE_NOT_IMPLEMENTED"
-        )
+        return Decision(RunStatus.BLOCKED, "ASSEMBLE_CANDIDATE", "CHANGE_ARTIFACT_MISSING")
+    if event.kind == "CHANGE_ARTIFACT_READY" and run.phase in {"IMPLEMENT", "REPAIR"}:
+        return Decision(RunStatus.QUEUED, "ASSEMBLE_CANDIDATE", next_job="ASSEMBLE_CANDIDATE")
+    if event.kind == "CANDIDATE_ASSEMBLED" and run.phase == "ASSEMBLE_CANDIDATE":
+        return Decision(RunStatus.QUEUED, "VERIFY_REVIEW")
     raise ValueError(f"invalid event {event.kind} for {run.status}/{run.phase}")

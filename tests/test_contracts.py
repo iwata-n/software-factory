@@ -104,7 +104,7 @@ def test_fake_execution_cannot_produce_success():
     result = decide(snapshot, event)
     assert result == decide(snapshot, event)
     assert result.status == "BLOCKED"
-    assert result.reason == "CANDIDATE_PIPELINE_NOT_IMPLEMENTED"
+    assert result.reason == "CHANGE_ARTIFACT_MISSING"
 
 
 def test_cancellation_ignores_normal_progress_until_execution_right_ends():
