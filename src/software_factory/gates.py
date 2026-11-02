@@ -279,6 +279,8 @@ class GateCommands:
             "constraints_digest": constraint_digest(run.snapshot),
             "input_artifact_ids": sorted(artifacts),
         }
+        if candidate.metadata_body.get("plan_id"):
+            payload["plan_id"] = candidate.metadata_body["plan_id"]
         enqueue(
             session,
             run,

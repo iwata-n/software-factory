@@ -6,7 +6,7 @@
 
 前段のSF-01〜07再評価では、不足する基盤実装とAC付き試験を追加し、ローカルと実GitHub CIのPostgreSQL 17で各327ケースが成功した。全43 ACと共通6条件の証拠49件を対象SHAへ照合して受け入れた。現在の既定Fake実行は `PLAN → VALIDATE → IMPLEMENT` を模擬し、patchを生成しないため `ASSEMBLE_CANDIDATE` で `BLOCKED / CHANGE_ARTIFACT_MISSING` に停止する。PATCHを提出するWorkerには管理Assemblerを接続する。
 
-残り17タスクの実装を継続し、SF-08/09を追加で受け入れた。現在はSF-01〜12が受け入れ済みで、残り12タスク。最新の受入基準revisionは `d5be902db764d5bf018441d6977ec4b9f8b835cb`、全727ケースと82件の条件別証拠を実CIまで照合済み。SF-13の修正上限と進展判定を実装中。未検証条件を実装済みの部分だけで合格へ変更しない。以後のコード変更では全回帰・証拠・実CIを再評価する。
+残り17タスクの実装を継続し、SF-08/09を追加で受け入れた。現在はSF-01〜13が受け入れ済みで、残り11タスク。最新の受入基準revisionは `633c17825a5befbf6bbe390352f32c81faffb1a2`、全767ケースと88件の条件別証拠を実CIまで照合済み。SF-14のPlan版と対象を固定する承認を実装中。未検証条件を実装済みの部分だけで合格へ変更しない。以後のコード変更では全回帰・証拠・実CIを再評価する。
 
 ## マイルストーンと依存関係
 
@@ -22,7 +22,7 @@ M1は全ACと共通条件を満たし受け入れ済み。設計書17章の「�
 
 ## タスク一覧
 
-各タスクはコード、必要なマイグレーション、API契約、失敗系テスト、起動・運用手順を含む。実装状態と受け入れ状態は別に記録する。SF-01〜12は実CIとArtifact照合まで完了した。対象revisionと証拠は末尾の受入確定に記載する。
+各タスクはコード、必要なマイグレーション、API契約、失敗系テスト、起動・運用手順を含む。実装状態と受け入れ状態は別に記録する。SF-01〜13は実CIとArtifact照合まで完了した。対象revisionと証拠は末尾の受入確定に記載する。
 
 | ID | タスクと成果物 | 依存 | 受け入れ条件 | 実装状態 | 受入状態 |
 |---|---|---|---|---|---|
@@ -38,8 +38,8 @@ M1は全ACと共通条件を満たし受け入れ済み。設計書17章の「�
 | [SF-10](#sf-10-隔離assemblerとcandidate) | 隔離Assembler・不変Candidate | SF-08、SF-09 | SF-10-AC01〜07 | 実装済み | 受け入れ済み |
 | [SF-11](#sf-11-独立検証とレビュー証拠) | Verifier・Reviewer・Check・Finding | SF-10 | SF-11-AC01〜06 | 実装済み | 受け入れ済み |
 | [SF-12](#sf-12-決定論的な品質gate) | Local Gate・最終Gate | SF-11 | SF-12-AC01〜07 | 実装済み | 受け入れ済み |
-| [SF-13](#sf-13-修正上限と進展の判定) | Repair・Candidate世代・早期打切り | SF-12 | SF-13-AC01〜06 | 実装済み | 未判定 |
-| [SF-14](#sf-14-plan版と対象を固定する承認) | Plan版・再計画・計画承認 | SF-04、SF-12 | SF-14-AC01〜06 | 未着手 | 未判定 |
+| [SF-13](#sf-13-修正上限と進展の判定) | Repair・Candidate世代・早期打切り | SF-12 | SF-13-AC01〜06 | 実装済み | 受け入れ済み |
+| [SF-14](#sf-14-plan版と対象を固定する承認) | Plan版・再計画・計画承認 | SF-04、SF-12 | SF-14-AC01〜06 | 実装済み | 未判定 |
 | [SF-15](#sf-15-費用台帳と予算変更) | 費用/予約台帳・精算・予算変更 | SF-05、SF-13 | SF-15-AC01〜06 | 一部実装 | 未判定 |
 | [SF-16](#sf-16-人間の介入コマンド) | 介入と承認の共通処理 | SF-14、SF-15 | SF-16-AC01〜06 | 未着手 | 未判定 |
 | [SF-17](#sf-17-trusted-publisherとdraft-pr) | Trusted Publisher・Draft PR・操作台帳 | SF-10、SF-12、SF-16 | SF-17-AC01〜06 | 未着手 | 未判定 |
@@ -512,7 +512,7 @@ uv run ruff format --check .
 
 ## 次の実装単位
 
-SF-01〜12は実CIとArtifact照合まで完了した。次の機能実装単位はSF-10〜12とする。隔離Assemblerを不変Candidateへ接続し、独立検証・Review・決定論的Gateをつなぐ。以後も残るSF-13〜24まで全受け入れ条件を検証する。
+SF-01〜13は実CIとArtifact照合まで完了した。次の機能実装単位はSF-10〜12とする。隔離Assemblerを不変Candidateへ接続し、独立検証・Review・決定論的Gateをつなぐ。以後も残るSF-13〜24まで全受け入れ条件を検証する。
 
 受け入れ設定は上記の値で固定する。実環境の設定manifestとして、評価用HTTPS Repository/Integration ID、実Agentのengine/model/料金版、image digest、許可接続先、検証command/AC対応、通知先、backup保存先を担当タスクの開始時に記入する。未設定や資格情報不足は該当ACを未検証とし、代替Fakeで合格扱いにしない。値の変更はPolicy/manifestの新版と影響ACの再検証を必要とする。
 
@@ -654,3 +654,19 @@ SF-12追加130ケースは、判定表、到着順・20回競合、同じ入力�
 0008でFindingの安定codeとSpec変更区分を追加し、必須Check/AC/Findingの正規化失敗集合、真部分集合による進展、2回上限をLocal/Final双方へ接続した。Repairは親Candidate/証拠/制約digestを固定し、インフラretryではroundを増やさない。Assemblerは親Archiveを再検算して適用し、root base SHAと親headを別に記録する。同一コードの昇格拒否、保護検証の変更拒否、新Spec要求の停止を実装した。
 
 SF-13の実DB/Runner試験40ケースがPASS。実3世代・2修正と上限、同じRepairの再試行、2 patch形式とcommit messageだけ異なる同一コード、B集合の全比較、実行結果での同一/新規/比較不能、行番号・自由文変更、保護差分、旧結果再送、Local/Final再検証、20回同時完了、全TX rollbackを含む。Final CI部分は固定した合成証拠による契約試験であり、実接続はSF-18/19に残す。全回帰と実CI照合までSF-13は未判定。
+
+
+### SF-13の受入確定
+
+対象commit `633c17825a5befbf6bbe390352f32c81faffb1a2` の[実CI run 41390810231](https://github.com/iwata-n/software-factory/actions/runs/41390810231)が成功した。固定worktreeのローカル767件PASS（493.89秒）、CI767件PASS（503.86秒）、両環境skip/xfail 0。0008のモデル一致と、0001/直前0007からのデータ保持を含む。
+
+入力digest `a76c9c6dd5ea7f36061df6ddbd95793d6e4da56cbe5d48e1ae8018241d0f16d1`、[factory-acceptance Artifact](https://github.com/iwata-n/software-factory/actions/runs/41390810231/artifacts/13117089057)のZIP SHA-256 `ffe427d3d9badcde876efffa678b31420e5a0b618aee840330816504890f39a9` が実GitHub APIと一致した。全82 ACと共通6条件を対象SHA・JUnit・fixtureへ照合し、`verified_records=88, external_pending=[]`。保存先は `.local/acceptance/633c17825a5befbf6bbe390352f32c81faffb1a2+inputs-a76c9c6dd5ea7f36/`。
+
+SF-13追加40ケースは実Local/Final修正、2回上限、同一入力retry、code digest同一拒否、Bの厳密比較、保護変更・新Spec停止、旧結果不採用、20回競合と全TX rollbackを含む。Final CIは契約用の合成入力で、実CI同期はSF-18/19に残る。
+
+
+### SF-14の実装と検証中の記録
+
+0009でPlan body/hashの不変性・生成Jobの一意性、固定対象の承認要求と追記専用決定を追加した。旧Planのbodyを保持してhashを補完する。構造/AC網羅の再計画を最大1回に制限し、採用Plan ID/hashを後続工程に固定した。承認必須Policyでは24時間待機し、Plan/Spec/base/Profile/Policy/revision/Candidate/証拠/現予算を照合する。異なる目的/AC/Repositoryの要求はsnapshotを上書きせず新Spec・新Runを必要とする。
+
+SF-14の59ケースがPASS。Plan版2採用と再不採用、max_replans=0、質問/保護path停止、待機復元、approve/denyの20回競合と再送、8種類のstale対象、期限−1ms/一致/+1ms、受理済み期限後再送、新設4 APIの認可、全TX rollback、旧0008の実Plan backfill、承認後の実Assembler保護差分、実行中の仕様変更停止を含む。既存の不正Plan試験は、採用しないことと再計画上限の新契約へ合わせて回帰した。全回帰・実CI照合までSF-14は未判定。

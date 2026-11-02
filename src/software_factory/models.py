@@ -168,11 +168,20 @@ class PlanVersion(Tenant, Base):
     __tablename__ = "plan_versions"
     __table_args__ = (
         UniqueConstraint("workspace_id", "run_id", "version"),
+        UniqueConstraint("workspace_id", "run_id", "id", name="uq_plans_workspace_run_id"),
+        UniqueConstraint("workspace_id", "producer_job_id", name="uq_plans_producer_job"),
+        ForeignKeyConstraint(
+            ["workspace_id", "run_id", "producer_job_id"],
+            ["jobs.workspace_id", "jobs.run_id", "jobs.id"],
+            name="fk_plan_producer_job",
+        ),
         ForeignKeyConstraint(["workspace_id", "run_id"], ["runs.workspace_id", "runs.id"]),
     )
     run_id: Mapped[str] = mapped_column(String(36))
     version: Mapped[int] = mapped_column(Integer)
     body: Mapped[dict] = mapped_column(JSON)
+    body_hash: Mapped[str] = mapped_column(String(64))
+    producer_job_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
     validation_error: Mapped[str | None] = mapped_column(String(200), nullable=True)
 
 
@@ -474,4 +483,53 @@ class Gate(Tenant, Base):
     evidence_digest: Mapped[str] = mapped_column(String(64))
     policy_version: Mapped[int] = mapped_column(Integer)
     metadata_body: Mapped[dict] = mapped_column(JSON)
+    created_at: Mapped[float] = mapped_column(Float)
+
+
+class ApprovalRequest(Tenant, Base):
+    __tablename__ = "approval_requests"
+    __table_args__ = (
+        UniqueConstraint("workspace_id", "id"),
+        UniqueConstraint(
+            "workspace_id", "run_id", "id", name="uq_approval_requests_workspace_run_id"
+        ),
+        UniqueConstraint("workspace_id", "run_id", "action", "target_hash"),
+        ForeignKeyConstraint(["workspace_id", "run_id"], ["runs.workspace_id", "runs.id"]),
+        ForeignKeyConstraint(
+            ["workspace_id", "run_id", "plan_id"],
+            ["plan_versions.workspace_id", "plan_versions.run_id", "plan_versions.id"],
+        ),
+        CheckConstraint("status IN ('PENDING','APPROVED','DENIED','EXPIRED','INVALIDATED')"),
+    )
+    run_id: Mapped[str] = mapped_column(String(36))
+    plan_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    action: Mapped[str] = mapped_column(String(40))
+    target: Mapped[dict] = mapped_column(JSON)
+    target_hash: Mapped[str] = mapped_column(String(64))
+    status: Mapped[str] = mapped_column(String(20), default="PENDING")
+    created_at: Mapped[float] = mapped_column(Float)
+    expires_at: Mapped[float] = mapped_column(Float)
+
+
+class ApprovalDecision(Tenant, Base):
+    __tablename__ = "approval_decisions"
+    __table_args__ = (
+        UniqueConstraint("workspace_id", "approval_id"),
+        ForeignKeyConstraint(
+            ["workspace_id", "run_id", "approval_id"],
+            ["approval_requests.workspace_id", "approval_requests.run_id", "approval_requests.id"],
+        ),
+        ForeignKeyConstraint(
+            ["workspace_id", "actor_id"], ["principals.workspace_id", "principals.id"]
+        ),
+        CheckConstraint("decision IN ('approve','deny')"),
+    )
+    run_id: Mapped[str] = mapped_column(String(36))
+    approval_id: Mapped[str] = mapped_column(String(36))
+    actor_id: Mapped[str] = mapped_column(String(36))
+    decision: Mapped[str] = mapped_column(String(20))
+    reason: Mapped[str] = mapped_column(String(4000))
+    target_hash: Mapped[str] = mapped_column(String(64))
+    before_revision: Mapped[int] = mapped_column(Integer)
+    after_revision: Mapped[int] = mapped_column(Integer)
     created_at: Mapped[float] = mapped_column(Float)

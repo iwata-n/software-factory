@@ -208,6 +208,12 @@ def test_invalid_plan_job_completion_does_not_create_implementation(world, resul
     assignment = world.claim().json()
     reply = submit(world, assignment, body=completion(assignment) | {"result": result})
     assert reply.status_code == 200
+    if world.run()["status"] == "QUEUED":
+        second = world.claim().json()
+        assert second["job"]["kind"] == "PLAN"
+        assert (
+            submit(world, second, body=completion(second) | {"result": result}).status_code == 200
+        )
     assert world.run()["status"] == "BLOCKED"
     assert world.claim().status_code == 204
 

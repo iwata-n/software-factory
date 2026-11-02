@@ -141,6 +141,7 @@ class CandidateCommands:
                 "parent_candidate_id": job.payload.get("source_candidate_id"),
                 "repair_job_id": job.payload.get("repair_job_id"),
                 "repair_round": job.payload.get("repair_round", 0),
+                "plan_id": job.payload.get("plan_id"),
                 "file_manifest": report.file_manifest,
                 "changed_paths": report.changed_paths,
                 "isolation": report.isolation,

@@ -205,6 +205,7 @@ class ProjectPolicy(Contract):
     required_ci_checks: list[RequiredCICheck] = Field(default_factory=list, max_length=100)
     protected_manifest: dict[str, str] = Field(default_factory=dict, max_length=10000)
     allow_external_model: bool = False
+    require_plan_approval: bool = False
     run_budget_microusd: int = Field(gt=0, le=10**12)
     job_reservation_microusd: int = Field(gt=0, le=10**12)
     max_infra_attempts_per_job: int = Field(default=3, ge=1, le=3)
@@ -302,6 +303,19 @@ class RepositoryCreate(Contract):
 class RunStart(Contract):
     spec_version: int = Field(ge=1)
     strategy: Literal["implement_and_review"] = "implement_and_review"
+
+
+class ReplanRequest(Contract):
+    expected_run_revision: int = Field(ge=1)
+    reason: Annotated[str, Field(min_length=1, max_length=4000)]
+    requested_task: TaskDefinition | None = None
+
+
+class ApprovalSubmission(Contract):
+    expected_run_revision: int = Field(ge=1)
+    target_hash: Annotated[str, Field(pattern=r"^[0-9a-f]{64}$")]
+    decision: Literal["approve", "deny"]
+    reason: Annotated[str, Field(min_length=1, max_length=4000)]
 
 
 class Claim(Contract):

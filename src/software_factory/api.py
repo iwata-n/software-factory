@@ -13,6 +13,7 @@ from sqlalchemy.exc import SQLAlchemyError
 from starlette.concurrency import run_in_threadpool
 
 from .contracts import (
+    ApprovalSubmission,
     ArtifactFinalize,
     ArtifactReserve,
     Cancel,
@@ -22,6 +23,7 @@ from .contracts import (
     Fail,
     Heartbeat,
     ProjectCreate,
+    ReplanRequest,
     RepositoryCreate,
     RunStart,
     TaskSpec,
@@ -29,6 +31,7 @@ from .contracts import (
 )
 from .db import Database
 from .models import (
+    ApprovalRequest,
     Artifact,
     Attempt,
     Candidate,
@@ -234,6 +237,8 @@ def create_app(
                         "plan_id": p.id,
                         "version": p.version,
                         "body": p.body,
+                        "body_hash": p.body_hash,
+                        "producer_job_id": p.producer_job_id,
                         "validation_error": p.validation_error,
                     }
                     for p in plans
@@ -241,6 +246,61 @@ def create_app(
             }
 
         return service.read(token, query)
+
+    @app.get("/v1/runs/{run_id}/approvals", tags=["Approvals"])
+    def approvals_get(run_id: str, token: Token):
+        from .plans import approval_view
+
+        def query(s, a):
+            owned(s, Run, run_id, a.workspace_id)
+            return [
+                approval_view(row)
+                for row in s.scalars(
+                    select(ApprovalRequest)
+                    .where(
+                        ApprovalRequest.workspace_id == a.workspace_id,
+                        ApprovalRequest.run_id == run_id,
+                    )
+                    .order_by(ApprovalRequest.created_at, ApprovalRequest.id)
+                )
+            ]
+
+        return service.read(token, query)
+
+    @app.get("/v1/approvals/{approval_id}", tags=["Approvals"])
+    def approval_get(approval_id: str, token: Token):
+        from .plans import approval_view
+
+        return service.read(
+            token,
+            lambda s, a: approval_view(owned(s, ApprovalRequest, approval_id, a.workspace_id)),
+        )
+
+    @app.post("/v1/approvals/{approval_id}/decisions", tags=["Approvals"])
+    def approval_decide(approval_id: str, data: ApprovalSubmission, token: Token, key: Key = None):
+        return service.write(
+            token,
+            "USER",
+            f"approval:{approval_id}:decision",
+            key,
+            data.model_dump(),
+            lambda s, a: service.plans.decide(s, a, approval_id, data),
+        )
+
+    @app.post("/v1/runs/{run_id}/replan", status_code=202, tags=["Runs"])
+    def run_replan(
+        run_id: str, data: ReplanRequest, token: Token, response: Response, key: Key = None
+    ):
+        result = service.write(
+            token,
+            "USER",
+            f"runs:{run_id}:replan",
+            key,
+            data.model_dump(),
+            lambda s, a: service.plans.replan(s, a, run_id, data),
+        )
+        response.headers["Location"] = f"/v1/runs/{run_id}"
+        return result
 
     @app.get("/v1/runs/{run_id}/candidates", tags=["Candidates"])
     def candidates_get(run_id: str, token: Token):

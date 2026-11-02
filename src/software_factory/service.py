@@ -7,7 +7,6 @@ from collections.abc import Callable
 from contextvars import ContextVar
 from typing import TypeVar
 
-from pydantic import ValidationError
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
@@ -15,7 +14,6 @@ from .contracts import (
     Cancel,
     Complete,
     Fail,
-    Plan,
     ProjectCreate,
     ProjectPolicy,
     RepositoryCreate,
@@ -23,7 +21,6 @@ from .contracts import (
     TaskSpec,
     WorkerEventBatch,
     digest,
-    validate_plan,
 )
 from .db import Database, db_now
 from .domain import TERMINAL, DomainEvent, RunSnapshot, RunStatus, decide
@@ -175,7 +172,14 @@ def enqueue(
 
 
 def transition(
-    session: Session, run: Run, kind: str, reason: str | None = None, *, payload=None, step_key=None
+    session: Session,
+    run: Run,
+    kind: str,
+    reason: str | None = None,
+    *,
+    payload=None,
+    step_key=None,
+    depends_on=None,
 ) -> None:
     previous_phase = run.phase
     decision = decide(
@@ -198,7 +202,7 @@ def transition(
             session,
             run,
             decision.next_job,
-            depends_on=(previous,) if previous else (),
+            depends_on=depends_on if depends_on is not None else ((previous,) if previous else ()),
             payload=payload,
             step_key=step_key,
         )
@@ -228,6 +232,9 @@ class Service:
         from .gates import GateCommands
 
         self.gates = GateCommands(self)
+        from .plans import PlanCommands
+
+        self.plans = PlanCommands(self)
 
     def principal(self, session: Session, token: str, role: str) -> Principal:
         actor = session.scalar(select(Principal).where(Principal.token_hash == token_hash(token)))
@@ -768,15 +775,23 @@ class Service:
                 )
                 session.flush()
                 self.checkpoint("claim.event")
-                plan = session.scalar(
+                plan_query = (
                     select(PlanVersion)
                     .where(
                         PlanVersion.workspace_id == run.workspace_id,
                         PlanVersion.run_id == run.id,
                     )
                     .order_by(PlanVersion.version.desc())
-                    .limit(1)
                 )
+                if job.payload.get("plan_id"):
+                    plan_query = plan_query.where(PlanVersion.id == job.payload["plan_id"])
+                plan = session.scalar(plan_query.limit(1))
+                if job.payload.get("plan_id") and (
+                    plan is None
+                    or plan.validation_error is not None
+                    or plan.body_hash != job.payload.get("plan_hash", plan.body_hash)
+                ):
+                    raise DomainError(409, "JOB_PLAN_CONTEXT_INVALID")
                 attempt.input_digest = digest(
                     {
                         "snapshot": run.snapshot,
@@ -931,33 +946,7 @@ class Service:
             if run.spent_microusd > run.budget_microusd:
                 transition(session, run, "BLOCKED", "BUDGET_EXCEEDED")
             elif job.kind == "PLAN":
-                try:
-                    plan = Plan.model_validate(clean_result)
-                    error = validate_plan(
-                        plan,
-                        TaskSpec.model_validate(run.snapshot["task_spec"]),
-                        ProjectPolicy.model_validate(run.snapshot["policy"]).model_copy(
-                            update={
-                                "symlink_paths": run.snapshot["policy"].get("symlink_paths", [])
-                                + run.snapshot.get("source", {}).get("symlink_paths", [])
-                            }
-                        ),
-                    )
-                except ValidationError:
-                    error = "PLAN_SCHEMA_INVALID"
-                session.add(
-                    PlanVersion(
-                        workspace_id=run.workspace_id,
-                        run_id=run.id,
-                        version=1,
-                        body=clean_result,
-                        validation_error=error,
-                    )
-                )
-                if error:
-                    transition(session, run, "BLOCKED", error)
-                else:
-                    transition(session, run, "PLAN_ACCEPTED")
+                self.plans.complete(session, actor, attempt, job, run, clean_result)
             elif job.kind in {"IMPLEMENT", "REPAIR"}:
                 patches = [artifact for artifact in artifacts if artifact.kind == "PATCH"]
                 if len(patches) > 1:
@@ -973,6 +962,8 @@ class Service:
                         "input_artifact_ids": [patches[0].id],
                         "parent_sha": run.base_sha,
                     }
+                    if job.payload.get("plan_id"):
+                        payload["plan_id"] = job.payload["plan_id"]
                     if job.kind == "REPAIR":
                         payload |= {
                             key: job.payload[key]
@@ -1084,6 +1075,7 @@ class Service:
 
     def reconcile_workspace(self, session: Session, workspace_id: str) -> int:
         self.artifacts.collect(session, workspace_id)
+        self.plans.expire(session, workspace_id)
         now = db_now(session)
         attempts = list(
             session.scalars(

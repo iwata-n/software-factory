@@ -19,6 +19,11 @@ TRANSITIONS = [
     ("CANCELLING", "PLAN", "EXECUTION_RIGHT_ENDED", "CANCELLED", "PLAN", None),
     ("CANCELLING", "PLAN", "PLAN_ACCEPTED", "CANCELLING", "PLAN", None),
     ("RUNNING", "PLAN", "PLAN_ACCEPTED", "QUEUED", "IMPLEMENT", "IMPLEMENT"),
+    ("RUNNING", "PLAN", "PLAN_APPROVAL_REQUIRED", "WAITING_EXTERNAL", "WAIT_PLAN_APPROVAL", None),
+    ("WAITING_EXTERNAL", "WAIT_PLAN_APPROVAL", "PLAN_APPROVED", "QUEUED", "IMPLEMENT", "IMPLEMENT"),
+    ("RUNNING", "PLAN", "PLAN_REPLAN_REQUESTED", "QUEUED", "PLAN", "PLAN"),
+    ("BLOCKED", "PLAN", "PLAN_REPLAN_REQUESTED", "QUEUED", "PLAN", "PLAN"),
+    ("RUNNING", "IMPLEMENT", "SPEC_CHANGE_REQUESTED", "CANCELLING", "IMPLEMENT", None),
     ("RUNNING", "IMPLEMENT", "IMPLEMENT_EXECUTED", "BLOCKED", "ASSEMBLE_CANDIDATE", None),
     (
         "RUNNING",
@@ -129,7 +134,10 @@ def test_invalid_plan_envelopes_and_results_never_adopt(world, evidence, name, p
     invalid_outer = completion(assignment) | {"untrusted_plan": plan}
     assert submit(world, assignment, body=invalid_outer).status_code == 422
     response = submit(world, assignment, body=completion(assignment) | {"result": plan})
-    assert response.status_code == 200 and world.run()["status"] == "BLOCKED"
+    replannable = name not in {"unknown-step", "budget-escalation"}
+    assert response.status_code == 200
+    assert world.run()["status"] == ("QUEUED" if replannable else "BLOCKED")
+    assert len([j for j in jobs(world) if j.kind == "PLAN"]) == (2 if replannable else 1)
     assert not any(job.kind == "IMPLEMENT" for job in jobs(world))
     assert world.get(f"/v1/runs/{world.run_id}/plan").json()["plans"][0]["validation_error"]
     evidence(

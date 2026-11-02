@@ -200,3 +200,14 @@ RepairはRunあたり最大2 Jobです。同じRepairのインフラ障害はAtt
 失敗集合は必須check/test ID、criterion、安定error code、severity、相対path、symbolから作り、行番号や自由文・Finding行IDは同一性に使いません。新集合が旧集合の真部分集合なら進展、同一/新規失敗追加は `NO_PROGRESS`、比較不能は `REPAIR_COMPARISON_INCONCLUSIVE` で停止します。同じコードの再提出は `NO_CODE_CHANGE`、2回後は `REPAIR_LIMIT_REACHED` です。Agentの進展・制約変更の申告は判定に使いません。
 
 必須検証を変えるpatchは引き続き保護されます。新Specが必要な構造化Findingは `SPEC_CHANGE_REQUIRED` で停止します。Final Gateから始めたRepairは、Local PASS後も進展判定を保留し、新しい対象のFinal証拠で比較します。実CI結果はSF-18/19で取り込みます。
+
+
+## Plan版と承認
+
+構造・AC網羅に不備のあるPlanは、TaskSpecの `max_replans` の範囲で最大1回だけ別Jobから再生成します。各版のbody/hashと生成Jobを保存し、採用したPlan ID/hashをIMPLEMENT/Assembler/Candidate/Repairへ引き継ぎます。質問待ちや保護pathの問題は自動で再生成しません。Plan本文はDBでも不変です。
+
+Project Policyの `require_plan_approval=true` では、妥当なPlanの後に `WAITING_EXTERNAL / WAIT_PLAN_APPROVAL` で待ちます。実行Job・Lease・予約を持ちません。User認証で `GET /v1/runs/{id}/approvals` と `GET /v1/approvals/{id}` から対象を確認し、`POST /v1/approvals/{id}/decisions` へ `expected_run_revision`、`target_hash`、`decision`（approve/deny）、reasonをIdempotency-Key付きで提出します。
+
+承認はPlan/hash、Spec、base SHA、Profile、Policy、Run revision、現Candidate/証拠（未作成ならnull）と24時間の期限へ固定します。古い対象は409で具体的なstale理由を返し、denyは `PLAN_REJECTED` で停止します。一般のPlan承認で予算・権限・検証・merge/deployを変更できません。
+
+`POST /v1/runs/{id}/replan` は現在のrevisionとreasonで同じSpecの再計画を要求します。目的/必須AC/Repositoryを変える `requested_task` は既存snapshotを更新せず `SPEC_CHANGE_REQUIRED` にします。稼働中なら停止を要求して実行権終了後にBLOCKEDへ移り、変更仕様は新Spec・新Runから実行します。
