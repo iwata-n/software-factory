@@ -107,7 +107,12 @@ def audit(directory: Path, *, allow_ci_pending: bool = False) -> dict:
             raise ValueError(
                 "publication evidence does not match this implementation and real evaluation"
             )
-        if "publication-files/database.json" not in certificate["evidence_files"]:
+        if certificate.get("evidence_scope") not in {"LOCAL_FULL", "PUBLIC_GITHUB"}:
+            raise ValueError("publication evidence scope is missing")
+        if (
+            certificate["evidence_scope"] == "LOCAL_FULL"
+            and "publication-files/database.json" not in certificate["evidence_files"]
+        ):
             raise ValueError("publication DB evidence is missing")
         for relative, fingerprint in certificate["evidence_files"].items():
             if (

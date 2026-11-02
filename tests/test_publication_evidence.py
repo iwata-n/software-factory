@@ -103,3 +103,57 @@ def test_external_certificate_cannot_promote_mismatched_or_unsafe_observations(
         )
     with pytest.raises(ValueError):
         collector.verify("owner/repo", report)
+
+
+def test_public_projection_uses_only_public_api_fields(publication_certificate, monkeypatch):
+    collector, _, actual = publication_certificate
+    public = importlib.import_module("public_publication_evidence")
+    original = collector.api
+    actual["body"] = "Simulation / transport fixture."
+    actual["base"]["ref"] = "main"
+    first, second, human = (letter * 40 for letter in ("a", "d", "e"))
+
+    def api(repository, suffix):
+        if not suffix:
+            return {"private": False}
+        if suffix == "pulls/1/commits":
+            return [{"sha": value} for value in (first, second, human)]
+        result = original(repository, suffix)
+        if suffix.startswith("git/commits/"):
+            head = suffix.rsplit("/", 1)[1]
+            result |= {
+                "sha": head,
+                "author": {
+                    "name": "Human concurrency fixture" if head == human else "Software Factory"
+                },
+            }
+        return result
+
+    monkeypatch.setattr(public, "api", api)
+    monkeypatch.setattr(public, "source_manifest", collector.source_manifest)
+    value = public.project("owner/repo", 1)
+    assert value["evidence_scope"] == "PUBLIC_GITHUB" and value["head_sha"] == human
+    assert (
+        not {"database", "artifact_manifest", "workspace_id", "final_run", "provider_requests"}
+        & value.keys()
+    )
+    monkeypatch.setattr(public, "api", lambda *args: {"private": True})
+    with pytest.raises(ValueError, match="already-public"):
+        public.project("owner/repo", 1)
+
+
+def test_public_uploader_refuses_additional_private_fields(tmp_path, monkeypatch):
+    import json
+    import sys
+
+    monkeypatch.syspath_prepend(str(Path(__file__).resolve().parents[1] / "scripts"))
+    uploader = importlib.import_module("upload_publication_evidence")
+    approved = {"evidence_scope": "PUBLIC_GITHUB", "pull_request_number": 1}
+    monkeypatch.setattr(uploader, "project", lambda *args: approved)
+    payload = tmp_path / "public.json"
+    payload.write_text(json.dumps(approved | {"database": "private payload"}))
+    monkeypatch.setattr(
+        sys, "argv", ["upload", "--public-file", str(payload), "--repository", "owner/repo"]
+    )
+    with pytest.raises(SystemExit, match="exactly equal"):
+        uploader.main()

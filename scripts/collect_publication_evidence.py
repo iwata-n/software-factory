@@ -14,7 +14,9 @@ from acceptance_support import sha, source_manifest
 
 def api(repository, suffix):
     return json.loads(
-        subprocess.check_output(["gh", "api", "repos/" + repository + "/" + suffix], text=True)
+        subprocess.check_output(
+            ["gh", "api", "repos/" + repository + ("/" + suffix if suffix else "")], text=True
+        )
     )
 
 
@@ -167,20 +169,32 @@ def main():
         if oid != args.evaluation_blob or len(raw) != blob["size"]:
             raise SystemExit("GitHub evidence blob identity mismatch")
     parsed = json.loads(raw)
-    packaged = parsed.get("schema_version") == 1 and "evaluation" in parsed and "files" in parsed
-    report = parsed["evaluation"] if packaged else parsed
-    expected = evidence_files(report)
     files = {}
-    for name, fingerprint in expected.items():
-        value = (
-            base64.b64decode(parsed["files"][name], validate=True)
-            if packaged
-            else (args.evaluation.parent / name).read_bytes()
-        )
-        if sha(value) != fingerprint:
-            raise ValueError("evaluation DB/Artifact evidence digest mismatch")
-        files[name] = value
-    certificate = verify(args.repository, report)
+    report = parsed
+    if parsed.get("evidence_scope") == "PUBLIC_GITHUB":
+        from public_publication_evidence import project
+
+        public = project(args.repository, parsed["pull_request_number"])
+        if public != parsed:
+            raise ValueError("public evidence differs from current public GitHub facts")
+        certificate = {
+            "result": "PASS",
+            "code_digest": public["code_digest"],
+            "implementation_sha": public["implementation_sha"],
+            "evidence_scope": "PUBLIC_GITHUB",
+            "criteria": ["SF-17-AC01", "SF-17-AC02", "SF-17-AC03"],
+            "external_urls": [public["pull_request_url"]],
+            "remote_head": public["head_sha"],
+        }
+    else:
+        if not args.evaluation:
+            raise ValueError("CI accepts only public GitHub facts; private DB/Artifacts stay local")
+        for name, fingerprint in evidence_files(report).items():
+            value = (args.evaluation.parent / name).read_bytes()
+            if sha(value) != fingerprint:
+                raise ValueError("evaluation DB/Artifact evidence digest mismatch")
+            files[name] = value
+        certificate = verify(args.repository, report) | {"evidence_scope": "LOCAL_FULL"}
     args.output.mkdir(parents=True, exist_ok=True)
     destination = args.output / "publication-evaluation.json"
     encoded = json.dumps(report, sort_keys=True, ensure_ascii=False).encode()

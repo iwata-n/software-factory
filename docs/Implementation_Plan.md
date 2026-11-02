@@ -708,7 +708,9 @@ SF-16追加90ケースは、両承認経路の共通認可・対象変異・再�
 
 PublisherはCandidateのarchive/digest/tree/raw commit/親chain/保護差分を再照合する。Git objectだけを再構成して既知remote headへの明示的なlease条件でpushし、想定外commitを上書きしない。GitHub書込は対象RepositoryのDraft PR作成だけを許す。モデル・checkout・build・merge/deployは呼ばない。個別・共有journalを送信前後に永続化し、同じ認証の異なる作業dirでの起動・応答消失・再起動も二重公開を防ぐ。
 
-先行44ケース（API/DB 7、実bare GitとGitHub契約12、journal/応答消失/20回同時起動25）が通過した。さらに全ACの条件別54ケースと外部証拠照合の6ケースを追加した。空DB upgrade/downgrade後のモデル差分0も確認した。全回帰/実CI、実GitHubの作成・同PR更新・人間のcommit競合はこれからであり、受け入れ済みではない。SF-17-AC01〜03は契約試験だけでPASSにせず、対象commitの実GitHub照合証明を必須とした。実サービス評価をDB/Artifact付きのGit blobへ保存し、実装PRの対象SHA付き参照からCIが取得・再照合してArtifactへ保存する。参照がなければ未検証のまま残す。
+先行44ケース（API/DB 7、実bare GitとGitHub契約12、journal/応答消失/20回同時起動25）が通過した。さらに全ACの条件別54ケースと外部証拠照合を追加した。空DB upgrade/downgrade後のモデル差分0も確認した。`7d91dbec019d8b869d7c0ce7fca9ccd8cc75dbe6` のローカル全1,113件が通過し、実GitHubでDraft PR作成・同PR更新・人間commitの保護を確認した。PR head反映遅延を実検証で発見し、既知の旧headだけ読み取り再試行し、解消しなければUNKNOWNとする修正を加えた。SF-17全体は実CIと外部証拠の最終照合まで未判定である。
+
+SF-17-AC01〜03は契約試験だけでPASSにせず、対象commitの実GitHub照合証明を必須とした。詳細なDB/Artifact/API履歴はローカルに保持する。CIへ渡す対象は、既に公開されているPR/branch/commitの固定whitelist項目と公開実装のSHA/digestだけとし、private Repository・追加フィールドを拒否する。実装PRの対象SHA付き参照からCIが公開情報を取得・再照合し、証明をArtifactへ保存する。参照がなければ未検証のまま残す。DB/Artifact一式の公開Git blobへの転送は、公開範囲が未確認という自動承認審査の拒否を受け、実行せずpublic情報だけに縮小した。
 
 SF-24の固定評価用baseとgolden testを `examples/evaluation/` に追加し、ホスト上で対象10件の想定失敗・12件成功（非対象API含む）を確認した。実Runnerでのbase照合と実Agent評価は未実行である。SF-17の実GitHub試験はfixture Agent/Reviewerと契約CI入力を使うtransport評価であり、SF-24の実Agent評価batchには数えない。
 
