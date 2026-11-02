@@ -7,6 +7,12 @@ import subprocess
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
+EXTERNAL_CRITERIA = {
+    "SF-01-AC06": "github-verification.json",
+    "SF-17-AC01": "publication-verification.json",
+    "SF-17-AC02": "publication-verification.json",
+    "SF-17-AC03": "publication-verification.json",
+}
 
 
 def sha(value: bytes) -> str:
@@ -15,7 +21,16 @@ def sha(value: bytes) -> str:
 
 def source_manifest() -> dict:
     files = {}
-    for prefix in ("src", "tests", "scripts", "migrations", ".github", "runner", "config"):
+    for prefix in (
+        "src",
+        "tests",
+        "scripts",
+        "migrations",
+        ".github",
+        "runner",
+        "config",
+        "examples",
+    ):
         for path in sorted((ROOT / prefix).rglob("*")):
             if path.is_file() and "__pycache__" not in path.parts and path.suffix != ".pyc":
                 files[path.relative_to(ROOT).as_posix()] = sha(path.read_bytes())

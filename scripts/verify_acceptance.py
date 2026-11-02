@@ -6,7 +6,7 @@ import re
 import xml.etree.ElementTree as ET
 from pathlib import Path
 
-from acceptance_support import required_criteria, sha, source_manifest
+from acceptance_support import EXTERNAL_CRITERIA, required_criteria, sha, source_manifest
 
 
 def audit(directory: Path, *, allow_ci_pending: bool = False) -> dict:
@@ -92,9 +92,53 @@ def audit(directory: Path, *, allow_ci_pending: bool = False) -> dict:
         )
         records["SF-01-AC06"][0].write_text(json.dumps(ci, indent=2, ensure_ascii=False))
     pending = []
+    publication = directory / "publication-verification.json"
+    if publication.exists():
+        certificate = json.loads(publication.read_text())
+        report_path = directory / certificate["evaluation_file"]
+        if (
+            certificate["code_digest"] != manifest["code_digest"]
+            or certificate["implementation_sha"] != manifest["base_sha"]
+            or certificate["result"] != "PASS"
+            or certificate["evaluation_file"] != "publication-evaluation.json"
+            or certificate["evaluation_sha256"] != sha(report_path.read_bytes())
+            or set(certificate["criteria"]) != {"SF-17-AC01", "SF-17-AC02", "SF-17-AC03"}
+        ):
+            raise ValueError(
+                "publication evidence does not match this implementation and real evaluation"
+            )
+        if "publication-files/database.json" not in certificate["evidence_files"]:
+            raise ValueError("publication DB evidence is missing")
+        for relative, fingerprint in certificate["evidence_files"].items():
+            if (
+                not relative.startswith("publication-files/")
+                or ".." in relative.split("/")
+                or "\\" in relative
+                or sha((directory / relative).read_bytes()) != fingerprint
+            ):
+                raise ValueError("publication DB/Artifact evidence does not match its certificate")
+        for ac in certificate["criteria"]:
+            if ac not in records:
+                raise ValueError("external publication evidence has no matching acceptance record")
+            path, record = records[ac]
+            record.update(
+                result="PASS",
+                external_urls=certificate["external_urls"],
+                external_verification=certificate,
+            )
+            record["evidence_paths"] = list(
+                dict.fromkeys(
+                    record["evidence_paths"]
+                    + [
+                        "publication-verification.json",
+                        certificate["evaluation_file"],
+                    ]
+                )
+            )
+            path.write_text(json.dumps(record, indent=2, ensure_ascii=False))
     for ac, (_, record) in records.items():
         if record["result"] != "PASS":
-            if allow_ci_pending and ac == "SF-01-AC06" and record["result"] == "未検証":
+            if allow_ci_pending and ac in EXTERNAL_CRITERIA and record["result"] == "未検証":
                 pending.append(ac)
             else:
                 raise ValueError(f"{ac}: {record['result']}")

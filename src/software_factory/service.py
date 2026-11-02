@@ -248,6 +248,9 @@ class Service:
         from .interventions import InterventionCommands
 
         self.interventions = InterventionCommands(self)
+        from .publications import PublicationCommands
+
+        self.publications = PublicationCommands(self)
 
     def principal(self, session: Session, token: str, role: str) -> Principal:
         actor = session.scalar(select(Principal).where(Principal.token_hash == token_hash(token)))
@@ -263,9 +266,9 @@ class Service:
         # Replace it with finer locks only together with equivalent concurrency tests.
         session.scalar(select(Workspace).where(Workspace.id == workspace_id).with_for_update())
 
-    def read(self, token: str, fn: Callable[[Session, Principal], dict]) -> dict:
+    def read(self, token: str, fn: Callable[[Session, Principal], dict], *, role="USER") -> dict:
         with self.db.transaction() as session:
-            actor = self.principal(session, token, "USER")
+            actor = self.principal(session, token, role)
             return fn(session, actor)
 
     def write(
@@ -285,7 +288,7 @@ class Service:
             session.refresh(actor)  # Revocation wins even if it raced the initial lookup.
             if not actor.active:
                 raise DomainError(401, "UNAUTHENTICATED")
-            if role == "USER":
+            if role in {"USER", "PUBLISHER"}:
                 cleaned = (
                     scrub_project_body(body, (token,))
                     if operation.startswith("projects:")
@@ -712,6 +715,8 @@ class Service:
                 .with_for_update(skip_locked=True)
             )
             for job in jobs:
+                if job.kind == "PUBLISH_DRAFT":
+                    continue  # Dedicated Publisher credentials never belong to a Worker.
                 run = owned(session, Run, job.run_id, actor.workspace_id)
                 if run.status not in {RunStatus.QUEUED, RunStatus.RUNNING}:
                     continue

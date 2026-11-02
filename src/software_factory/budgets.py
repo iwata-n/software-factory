@@ -83,6 +83,17 @@ class BudgetCommands:
             raise DomainError(409, "RUN_TERMINAL")
         if run.status == "BLOCKED" and run.stop_reason not in BUDGET_REASONS:
             raise DomainError(409, "BUDGET_CANNOT_OVERRIDE_BLOCK")
+        if run.phase == "PUBLISH_DRAFT":
+            from .models import PublicationOperation
+
+            if session.scalar(
+                select(PublicationOperation.id).where(
+                    PublicationOperation.workspace_id == run.workspace_id,
+                    PublicationOperation.run_id == run.id,
+                    PublicationOperation.state == "IN_FLIGHT",
+                )
+            ):
+                raise DomainError(409, "PUBLICATION_ACTIVE")
         self.service.costs.require_balanced(session, run)
         if data.new_budget_microusd < run.spent_microusd + run.reserved_microusd:
             raise DomainError(422, "BUDGET_BELOW_OBLIGATIONS")

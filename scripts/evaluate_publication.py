@@ -1,0 +1,604 @@
+"""Real GitHub transport evaluation using fixture agents, not the real-agent MVP batch.
+
+Run through scripts/with_postgres.py after committing/pushing the evaluated branch.
+Only codex/factory/<run UUID> and one Draft PR are written; no merge or deployment.
+"""
+
+import argparse
+import base64
+import difflib
+import hashlib
+import json
+import os
+import socket
+import subprocess
+import sys
+import time
+from contextlib import ExitStack
+from pathlib import Path
+from uuid import uuid4
+
+import httpx
+from acceptance_support import source_manifest
+from alembic import command
+from alembic.config import Config
+from sqlalchemy import MetaData, select
+from sqlalchemy.engine import make_url
+
+from software_factory.adapters import AgentResult, Capabilities, FakeAgent, ProducedArtifact
+from software_factory.db import Database
+from software_factory.models import Run
+from software_factory.pipeline_worker import PipelineAdapter
+from software_factory.publisher_backend import GitHubDraftPublisher
+from software_factory.sandbox import DockerRunner
+from software_factory.service import Service
+from software_factory.source_runner import SourcePolicy
+from software_factory.worker import Supervisor
+
+ROOT = Path(__file__).resolve().parents[1]
+REMOTE = "https://github.com/iwata-n/software-factory.git"
+REPOSITORY = "iwata-n/software-factory"
+TARGET = "examples/evaluation/app.py"
+
+
+def process_json(argv, *, environment=None):
+    return json.loads(subprocess.check_output(argv, env=environment, text=True))
+
+
+def github(path):
+    return process_json(["gh", "api", "repos/" + REPOSITORY + "/" + path])
+
+
+def port():
+    with socket.socket() as connection:
+        connection.bind(("127.0.0.1", 0))
+        return connection.getsockname()[1]
+
+
+def wait_ready(url, process):
+    deadline = time.monotonic() + 60
+    with httpx.Client(timeout=1, trust_env=False) as client:
+        while time.monotonic() < deadline:
+            if process.poll() is not None:
+                raise RuntimeError("evaluation service stopped before becoming ready")
+            try:
+                if client.get(url).status_code == 200:
+                    return
+            except httpx.HTTPError:
+                pass
+            time.sleep(0.1)
+    raise RuntimeError("evaluation service startup timeout")
+
+
+def post(client, path, body):
+    response = client.post(path, json=body, headers={"Idempotency-Key": str(uuid4())})
+    response.raise_for_status()
+    return response.json()
+
+
+class FixtureAgent(FakeAgent):
+    capabilities = Capabilities(kinds=("PLAN", "IMPLEMENT", "REPAIR"))
+
+    def __init__(self, before, after):
+        super().__init__()
+        self.before, self.after = before, after
+
+    def start(self, job):
+        if job["kind"] == "PLAN":
+            self._result = AgentResult(
+                "EXECUTED",
+                {
+                    "units": [
+                        {
+                            "id": "unit-1",
+                            "objective": job["snapshot"]["task_spec"]["task"]["objective"],
+                            "acceptance_ids": ["AC-1", "AC-2"],
+                            "depends_on": [],
+                            "proposed_write_paths": [TARGET],
+                        }
+                    ],
+                    "assumptions": [],
+                    "open_questions": [],
+                },
+            )
+        else:
+            patch = "".join(
+                difflib.unified_diff(
+                    self.before.splitlines(True),
+                    self.after.splitlines(True),
+                    fromfile="a/" + TARGET,
+                    tofile="b/" + TARGET,
+                )
+            ).encode()
+            self._result = AgentResult(
+                "EXECUTED",
+                {"summary": "publication transport fixture", "simulation": True},
+                artifacts=(ProducedArtifact("patch", "PATCH", patch),),
+            )
+
+
+class FixtureReviewer:
+    def review(self, context, cancelled):
+        if cancelled.is_set():
+            raise RuntimeError("fixture review cancelled")
+        return {
+            "criteria": [
+                {
+                    "criterion_id": key,
+                    "status": "PASS",
+                    "explanation": "Transport fixture review with independent golden verification",
+                    "evidence_artifact_ids": [
+                        context["source_artifact_id"],
+                        "$artifact/review-log",
+                    ],
+                }
+                for key in ("AC-1", "AC-2")
+            ]
+        }
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--base-ref", required=True)
+    parser.add_argument("--output", type=Path, required=True)
+    args = parser.parse_args()
+    url = make_url(os.environ["FACTORY_DATABASE_URL"])
+    if not str(url.query.get("host", "")).startswith("/private/tmp/factory-pg-"):
+        raise SystemExit("use with_postgres.py and its disposable PostgreSQL")
+    if subprocess.check_output(["git", "status", "--porcelain"], cwd=ROOT, text=True).strip():
+        raise SystemExit("commit the evaluated implementation and fixtures before this evaluation")
+    identity = source_manifest()
+    remote_sha = github("git/ref/heads/" + args.base_ref)["object"]["sha"]
+    if remote_sha != identity["base_sha"]:
+        raise SystemExit("evaluation base ref must point at this exact implementation commit")
+    output = args.output.resolve()
+    output.mkdir(mode=0o700, parents=True, exist_ok=False)
+    command.upgrade(Config(str(ROOT / "alembic.ini")), "head")
+    source_port, cp_port = port(), port()
+    while cp_port == source_port:
+        cp_port = port()
+    cp_url = f"http://127.0.0.1:{cp_port}"
+    source_url = f"http://127.0.0.1:{source_port}"
+    source_secret = uuid4().hex + uuid4().hex
+    known_secrets = [source_secret]
+    base_environment = {
+        key: value
+        for key, value in os.environ.items()
+        if key
+        in {"PATH", "HOME", "LANG", "TMPDIR", "DOCKER_HOST", "DOCKER_CONTEXT", "DOCKER_CONFIG"}
+    }
+    source_environment = base_environment | {
+        "FACTORY_ALLOWED_REMOTES": REMOTE,
+        "FACTORY_SOURCE_RUNNER_TOKEN": source_secret,
+        "FACTORY_SOURCE_RUNNER_PORT": str(source_port),
+        "FACTORY_RUNNER_IMAGE_DIGEST": os.environ["FACTORY_RUNNER_IMAGE_DIGEST"],
+        "FACTORY_RUNNER_STATE_ROOT": str(output / "source-runner"),
+    }
+    cp_environment = base_environment | {
+        "FACTORY_DATABASE_URL": os.environ["FACTORY_DATABASE_URL"],
+        "FACTORY_PORT": str(cp_port),
+        "FACTORY_SOURCE_RUNNER_URL": source_url,
+        "FACTORY_SOURCE_RUNNER_TOKEN": source_secret,
+        "FACTORY_ALLOWED_REMOTES": REMOTE,
+        "FACTORY_ARTIFACT_ROOT": str(output / "artifacts"),
+    }
+    processes = []
+    credential_file = output / "publisher.token"
+    with ExitStack() as files:
+        try:
+            for module, environment, name in (
+                ("software_factory.source_runner", source_environment, "source"),
+                ("software_factory.cli", cp_environment, "control-plane"),
+            ):
+                log = files.enter_context((output / (name + ".log")).open("wb"))
+                argv = [sys.executable, "-m", module] + (
+                    ["serve"] if name == "control-plane" else []
+                )
+                processes.append(
+                    subprocess.Popen(argv, env=environment, cwd=ROOT, stdout=log, stderr=log)
+                )
+            wait_ready(source_url + "/openapi.json", processes[0])
+            wait_ready(cp_url + "/healthz", processes[1])
+            account = process_json(
+                [
+                    sys.executable,
+                    "-m",
+                    "software_factory.cli",
+                    "bootstrap",
+                    "--name",
+                    "SF-17 publication transport fixture",
+                ],
+                environment=cp_environment,
+            )
+            user = httpx.Client(
+                # Credentials are checked against exported evidence before any upload.
+                base_url=cp_url,
+                timeout=180,
+                trust_env=False,
+                headers={"Authorization": "Bearer " + account["user_token"]},
+            )
+            known_secrets.append(account["user_token"])
+            checks = ROOT / "examples/evaluation/checks"
+            protected = {
+                p.relative_to(ROOT).as_posix(): hashlib.sha256(p.read_bytes()).hexdigest()
+                for p in checks.glob("*.py")
+            }
+            policy = {
+                "allowed_write_paths": [TARGET],
+                "protected_paths": [
+                    ".github",
+                    "migrations",
+                    "auth",
+                    "billing",
+                    "examples/evaluation/checks",
+                ],
+                "protected_manifest": protected,
+                "verification": {
+                    "profile_id": "sf17-empty-state",
+                    "required_checks": ["unit_tests", "review"],
+                },
+                "execution_image_digest": os.environ["FACTORY_RUNNER_IMAGE_DIGEST"],
+                "run_budget_microusd": 1000000,
+                "job_reservation_microusd": 100000,
+                "require_plan_approval": True,
+                "verification_commands": [
+                    {
+                        "check_id": "unit_tests",
+                        "argv": [
+                            "python",
+                            "-m",
+                            "pytest",
+                            "/candidate/examples/evaluation/checks/check_empty.py",
+                            "/candidate/examples/evaluation/checks/check_compat.py",
+                            "--rootdir=/candidate",
+                            "-q",
+                            "-p",
+                            "no:cacheprovider",
+                            "--junitxml=.factory/unit.xml",
+                        ],
+                        "junit_path": ".factory/unit.xml",
+                        "timeout_seconds": 60,
+                        "expected_test_ids": [
+                            "examples.evaluation.checks.check_empty::" + name
+                            for name in ("test_empty", "test_one_item", "test_many_items")
+                        ]
+                        + ["examples.evaluation.checks.check_compat::test_existing_label_api"],
+                    }
+                ],
+                "required_ci_checks": [
+                    {"provider": "github", "app_id": 15368, "check_name": name}
+                    for name in ("publication-transport-a", "publication-transport-b")
+                ],
+            }
+            project = post(
+                user,
+                f"/v1/workspaces/{account['workspace_id']}/projects",
+                {"name": "SF17 real GitHub transport, fixture agents and CI", "policy": policy},
+            )
+            repository = post(
+                user,
+                f"/v1/projects/{project['project_id']}/repositories",
+                {
+                    "name": "Software Factory evaluation",
+                    "base_ref": args.base_ref,
+                    "base_sha": remote_sha,
+                    "remote_url": REMOTE,
+                },
+            )
+            spec = {
+                "schema_version": 1,
+                "task": {
+                    "title": "SF17 transport fixture: empty state",
+                    "repository_id": repository["repository_id"],
+                    "base_ref": args.base_ref,
+                    "objective": "Empty items: データがありません; keep nonempty behavior",
+                    "acceptance_criteria": [
+                        {"id": "AC-1", "description": "Empty input returns データがありません"},
+                        {
+                            "id": "AC-2",
+                            "description": "Nonempty and stable_label APIs retain behavior",
+                        },
+                    ],
+                    "constraints": ["Only app.py may change; golden checks are immutable"],
+                },
+                "verification": policy["verification"],
+            }
+            task = post(user, f"/v1/projects/{project['project_id']}/tasks", spec)
+            run = post(user, f"/v1/tasks/{task['task_id']}/runs", {"spec_version": 1})
+            run_id = run["run_id"]
+
+            def state():
+                reply = user.get(f"/v1/runs/{run_id}")
+                reply.raise_for_status()
+                return reply.json()
+
+            def worker(kinds, managed=False):
+                argv = [
+                    sys.executable,
+                    "-m",
+                    "software_factory.cli",
+                    "issue-enrollment",
+                    "--workspace-id",
+                    account["workspace_id"],
+                    "--kinds",
+                    *kinds,
+                ]
+                if managed:
+                    argv += ["--managed"]
+                enrollment = process_json(argv, environment=cp_environment)
+                result = httpx.post(
+                    cp_url + "/v1/worker/enroll",
+                    json={
+                        "token": enrollment["enrollment_token"],
+                        "name": "SF17 controlled fixture worker",
+                    },
+                ).json()
+                known_secrets.append(result["worker_token"])
+                return httpx.Client(
+                    base_url=cp_url,
+                    timeout=180,
+                    trust_env=False,
+                    headers={"Authorization": "Bearer " + result["worker_token"]},
+                )
+
+            agent_client = worker(["PLAN", "IMPLEMENT", "REPAIR"])
+            managed_client = worker(["ASSEMBLE_CANDIDATE", "VERIFY", "REVIEW"], managed=True)
+            os.environ["FACTORY_RUNNER_STATE_ROOT"] = str(output / "stage-runner")
+            runner = DockerRunner(os.environ["FACTORY_RUNNER_IMAGE_DIGEST"])
+            before = (ROOT / TARGET).read_text()
+            first = before.replace(
+                'return ", ".join(items)',
+                'return ", ".join(items) if items else "データがありません"',
+            )
+            fixture = FixtureAgent(before, first)
+            assert Supervisor(agent_client, fixture, heartbeat_interval=0.1).run_once()["accepted"]
+            approvals = user.get(f"/v1/runs/{run_id}/approvals").json()
+            request = approvals[0]
+            assert state()["phase"] == "WAIT_PLAN_APPROVAL" and state()["reserved_microusd"] == 0
+            post(
+                user,
+                f"/v1/approvals/{request['approval_id']}/decisions",
+                {
+                    "expected_run_revision": request["target"]["run_revision"],
+                    "target_hash": request["target_hash"],
+                    "decision": "approve",
+                    "reason": "Approve the fixed transport evaluation Plan",
+                },
+            )
+            publisher = process_json(
+                [
+                    sys.executable,
+                    "-m",
+                    "software_factory.cli",
+                    "issue-publisher",
+                    "--workspace-id",
+                    account["workspace_id"],
+                    "--repository-id",
+                    repository["repository_id"],
+                    "--name",
+                    "SF17 dedicated evaluation Publisher",
+                ],
+                environment=cp_environment,
+            )
+            credential_file.write_text(publisher["publisher_token"])
+            known_secrets.append(publisher["publisher_token"])
+            credential_file.chmod(0o600)
+
+            def managed_stages():
+                adapter = PipelineAdapter(runner, reviewer=FixtureReviewer())
+                for _ in range(3):
+                    result = Supervisor(managed_client, adapter, heartbeat_interval=0.1).run_once()
+                    if not result or not result.get("accepted"):
+                        raise RuntimeError("managed transport stage did not complete")
+                if state()["phase"] != "PUBLISH_DRAFT":
+                    raise RuntimeError(
+                        "transport candidate did not pass the actual local golden checks"
+                    )
+
+            def publish():
+                result = process_json(
+                    [
+                        sys.executable,
+                        "-m",
+                        "software_factory.publisher",
+                        "--control-plane-url",
+                        cp_url,
+                        "--publisher-token-file",
+                        str(credential_file),
+                        "--github-use-gh",
+                        "--allowed-remote",
+                        REMOTE,
+                        "--state-dir",
+                        str(output / "publisher"),
+                        "--once",
+                    ],
+                    environment=base_environment,
+                )
+                record = user.get(f"/v1/runs/{run_id}/publication").json()
+                return result, record
+
+            assert Supervisor(agent_client, fixture, heartbeat_interval=0.1).run_once()["accepted"]
+            managed_stages()
+            result, publication = publish()
+            assert result["state"] == "SUCCEEDED" and state()["phase"] == "WAIT_CI"
+            first_publication = publication
+            database = Database()
+            service = Service(database)
+
+            def fixture_ci(failures):
+                context = state()["wait_context"]
+                checks = []
+                for index, required in enumerate(context["required_ci"]):
+                    checks.append(
+                        {
+                            "id": f"contract-ci-{state()['current_candidate_id']}-{index}",
+                            **required,
+                            "origin_verified": True,
+                            "status": "FAIL" if index < failures else "PASS",
+                            "base_sha": context["target"]["base_sha"],
+                            "head_sha": context["target"]["head_sha"],
+                            "tested_sha": context["target"]["head_sha"],
+                            "merge_parents": [],
+                        }
+                    )
+                with database.transaction() as session:
+                    service.lock_workspace(session, account["workspace_id"])
+                    gate = service.gates.final(session, session.get(Run, run_id), checks)
+                    assert gate.status == "FAIL"
+                assert state()["phase"] == "REPAIR"
+
+            def repair(old, new):
+                assert Supervisor(
+                    agent_client, FixtureAgent(old, new), heartbeat_interval=0.1
+                ).run_once()["accepted"]
+                managed_stages()
+
+            fixture_ci(2)
+            second = first + "\n# Publication transport update fixture.\n"
+            repair(first, second)
+            result, publication = publish()
+            assert result["state"] == "SUCCEEDED"
+            second_publication = publication
+            assert (
+                publication["pull_request"]["number"] == first_publication["pull_request"]["number"]
+            )
+            assert (
+                publication["pull_request"]["head_sha"]
+                != first_publication["pull_request"]["head_sha"]
+            )
+            fixture_ci(1)
+            third = second + "# Publication transport competing-head fixture.\n"
+            repair(second, third)
+
+            operation = second_publication["operations"][-1]
+            sources, current = [], operation["candidate_id"]
+            while current:
+                candidate = user.get(f"/v1/candidates/{current}").json()
+                archive = user.get(f"/v1/artifacts/{candidate['source_artifact_id']}/content")
+                archive.raise_for_status()
+                sources.append(
+                    {"candidate": candidate, "archive": base64.b64encode(archive.content).decode()}
+                )
+                current = candidate["metadata_body"].get("parent_candidate_id")
+            provider_token = subprocess.check_output(
+                ["gh", "auth", "token", "--hostname", "github.com"],
+                stderr=subprocess.DEVNULL,
+                text=True,
+            ).strip()
+            backend = GitHubDraftPublisher(SourcePolicy((REMOTE,)), provider_token)
+            known_secrets.append(provider_token)
+            with backend.git.prepare(
+                {"operation": operation, "sources": list(reversed(sources))}
+            ) as root:
+                parent = operation["target"]["candidate"]
+                human_sha = (
+                    backend.git._git(
+                        root,
+                        "-c",
+                        "user.name=Human concurrency fixture",
+                        "-c",
+                        "user.email=human-fixture@localhost",
+                        "commit-tree",
+                        parent["tree_sha"],
+                        "-p",
+                        parent["head_sha"],
+                        body=b"Simulated human commit for publication race\n",
+                    )
+                    .decode()
+                    .strip()
+                )
+                ref = "refs/heads/" + operation["target"]["head_ref"]
+                backend.git._git(
+                    root,
+                    "push",
+                    "--porcelain",
+                    "--no-verify",
+                    "--force-with-lease=" + ref + ":" + parent["head_sha"],
+                    REMOTE,
+                    human_sha + ":" + ref,
+                    network=True,
+                )
+            result, publication = publish()
+            assert result["state"] == "BLOCKED" and state()["stop_reason"] == "REMOTE_HEAD_CONFLICT"
+            actual = github("pulls/" + str(publication["pull_request"]["number"]))
+            assert actual["head"]["sha"] == human_sha and actual["draft"] is True
+            records = {}
+            with database.engine.connect() as connection:
+                metadata = MetaData()
+                metadata.reflect(bind=connection)
+                for name, table in metadata.tables.items():
+                    records[name] = [
+                        dict(row) for row in connection.execute(select(table)).mappings()
+                    ]
+            (output / "database.json").write_text(json.dumps(records, indent=2, default=str))
+            artifact_manifest = {
+                p.relative_to(output).as_posix(): hashlib.sha256(p.read_bytes()).hexdigest()
+                for p in (output / "artifacts").rglob("*")
+                if p.is_file()
+            }
+            provider_requests = [
+                request
+                for item in records["publication_observations"]
+                for request in item["body"].get("provider_requests", [])
+            ]
+            report = {
+                "schema_version": 1,
+                "evaluation": "SF17_PUBLICATION_TRANSPORT",
+                "code_digest": identity["code_digest"],
+                "revision": identity["revision"],
+                "repository": REPOSITORY,
+                "base_sha": remote_sha,
+                "base_ref": args.base_ref,
+                "workspace_id": account["workspace_id"],
+                "run_id": run_id,
+                "agent_origin": "fixture",
+                "review_origin": "fixture",
+                "ci_input_origin": "contract_fixture",
+                "publication_origin": "actual_github",
+                "runner_image_digest": os.environ["FACTORY_RUNNER_IMAGE_DIGEST"],
+                "first_publication": first_publication,
+                "second_publication": second_publication,
+                "final_publication": publication,
+                "human_fixture_sha": human_sha,
+                "actual_pull_request": actual,
+                "artifact_manifest": artifact_manifest,
+                "database_sha256": hashlib.sha256(
+                    (output / "database.json").read_bytes()
+                ).hexdigest(),
+                "final_run": state(),
+                "provider_requests": provider_requests,
+                "merge_calls": sum(r["resource"].endswith("/merge") for r in provider_requests),
+                "deploy_calls": sum("/deployments" in r["resource"] for r in provider_requests),
+                "created_at": time.time(),
+            }
+            (output / "evaluation.json").write_text(
+                json.dumps(report, indent=2, ensure_ascii=False)
+            )
+            for name in list(artifact_manifest) + ["database.json", "evaluation.json"]:
+                content = (output / name).read_bytes()
+                if any(secret.encode() in content for secret in known_secrets):
+                    raise RuntimeError("live credential in evaluation evidence; upload denied")
+            print(
+                json.dumps(
+                    {
+                        "report": str(output / "evaluation.json"),
+                        "pull_request": actual["html_url"],
+                        "state": state()["status"],
+                        "preserved_human_sha": human_sha,
+                    }
+                ),
+                flush=True,
+            )
+        finally:
+            for process in reversed(processes):
+                process.terminate()
+                try:
+                    process.wait(timeout=10)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    process.wait(timeout=5)
+            credential_file.unlink(missing_ok=True)
+
+
+if __name__ == "__main__":
+    main()

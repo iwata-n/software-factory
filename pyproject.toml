@@ -16,6 +16,7 @@ dependencies = [
 factory = "software_factory.cli:main"
 factory-worker = "software_factory.worker:main"
 factory-source-runner = "software_factory.source_runner:main"
+factory-publisher = "software_factory.publisher:main"
 
 [dependency-groups]
 dev = ["pytest>=8,<10", "ruff>=0.11,<1"]

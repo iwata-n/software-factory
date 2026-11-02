@@ -41,7 +41,7 @@ class Principal(Tenant, Base):
     __tablename__ = "principals"
     __table_args__ = (
         UniqueConstraint("workspace_id", "id"),
-        CheckConstraint("role IN ('USER', 'WORKER')"),
+        CheckConstraint("role IN ('USER', 'WORKER', 'PUBLISHER')", name="ck_principals_role"),
     )
     role: Mapped[str] = mapped_column(String(20))
     token_hash: Mapped[str] = mapped_column(String(64), unique=True)
@@ -67,6 +67,30 @@ class Worker(Tenant, Base):
     capabilities: Mapped[list] = mapped_column(JSON)
     managed: Mapped[bool] = mapped_column(Boolean, default=False, server_default="false")
     # Exactly one slot in this first slice; worker row is the slot mutex.
+
+
+class Publisher(Tenant, Base):
+    __tablename__ = "publishers"
+    __table_args__ = (
+        UniqueConstraint("workspace_id", "id"),
+        ForeignKeyConstraint(["workspace_id", "id"], ["principals.workspace_id", "principals.id"]),
+    )
+    name: Mapped[str] = mapped_column(String(200))
+
+
+class PublisherGrant(Tenant, Base):
+    __tablename__ = "publisher_repository_grants"
+    __table_args__ = (
+        UniqueConstraint("workspace_id", "publisher_id", "repository_id"),
+        ForeignKeyConstraint(
+            ["workspace_id", "publisher_id"], ["publishers.workspace_id", "publishers.id"]
+        ),
+        ForeignKeyConstraint(
+            ["workspace_id", "repository_id"], ["repositories.workspace_id", "repositories.id"]
+        ),
+    )
+    publisher_id: Mapped[str] = mapped_column(String(36))
+    repository_id: Mapped[str] = mapped_column(String(36))
 
 
 class Project(Tenant, Base):
@@ -618,3 +642,107 @@ class BudgetVersion(Tenant, Base):
     approval_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
     reason: Mapped[str] = mapped_column(String(4000))
     created_at: Mapped[float] = mapped_column(Float)
+
+
+class PublicationOperation(Tenant, Base):
+    __tablename__ = "publication_operations"
+    __table_args__ = (
+        UniqueConstraint("workspace_id", "id"),
+        UniqueConstraint("workspace_id", "run_id", "id", name="uq_publication_operations_run"),
+        UniqueConstraint("workspace_id", "repository_id", "run_id", "candidate_id", "kind"),
+        UniqueConstraint("workspace_id", "operation_key"),
+        ForeignKeyConstraint(
+            ["workspace_id", "run_id", "candidate_id"],
+            ["candidates.workspace_id", "candidates.run_id", "candidates.id"],
+        ),
+        ForeignKeyConstraint(
+            ["workspace_id", "run_id", "job_id"], ["jobs.workspace_id", "jobs.run_id", "jobs.id"]
+        ),
+        ForeignKeyConstraint(
+            ["workspace_id", "repository_id"], ["repositories.workspace_id", "repositories.id"]
+        ),
+        ForeignKeyConstraint(["workspace_id", "gate_id"], ["gates.workspace_id", "gates.id"]),
+        ForeignKeyConstraint(
+            ["workspace_id", "publisher_id"], ["publishers.workspace_id", "publishers.id"]
+        ),
+        CheckConstraint("kind = 'PUBLISH_DRAFT'"),
+        CheckConstraint(
+            "state IN ('PENDING','IN_FLIGHT','UNKNOWN','SUCCEEDED','BLOCKED','CANCELLED')"
+        ),
+    )
+    repository_id: Mapped[str] = mapped_column(String(36))
+    run_id: Mapped[str] = mapped_column(String(36))
+    candidate_id: Mapped[str] = mapped_column(String(36))
+    job_id: Mapped[str] = mapped_column(String(36))
+    gate_id: Mapped[str] = mapped_column(String(36))
+    kind: Mapped[str] = mapped_column(String(30), default="PUBLISH_DRAFT")
+    operation_key: Mapped[str] = mapped_column(String(64))
+    target: Mapped[dict] = mapped_column(JSON)
+    target_hash: Mapped[str] = mapped_column(String(64))
+    state: Mapped[str] = mapped_column(String(20), default="PENDING")
+    publisher_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    dispatch_revision: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    started_at: Mapped[float | None] = mapped_column(Float, nullable=True)
+    completed_at: Mapped[float | None] = mapped_column(Float, nullable=True)
+    reason: Mapped[str | None] = mapped_column(String(200), nullable=True)
+    reconcile_attempts: Mapped[int] = mapped_column(Integer, default=0)
+    next_reconcile_at: Mapped[float | None] = mapped_column(Float, nullable=True)
+    created_at: Mapped[float] = mapped_column(Float)
+
+
+class PublicationObservation(Tenant, Base):
+    __tablename__ = "publication_observations"
+    __table_args__ = (
+        UniqueConstraint("workspace_id", "operation_id", "delivery_id"),
+        ForeignKeyConstraint(
+            ["workspace_id", "run_id", "operation_id"],
+            [
+                "publication_operations.workspace_id",
+                "publication_operations.run_id",
+                "publication_operations.id",
+            ],
+        ),
+        ForeignKeyConstraint(
+            ["workspace_id", "publisher_id"], ["publishers.workspace_id", "publishers.id"]
+        ),
+    )
+    run_id: Mapped[str] = mapped_column(String(36))
+    operation_id: Mapped[str] = mapped_column(String(36))
+    publisher_id: Mapped[str] = mapped_column(String(36))
+    delivery_id: Mapped[str] = mapped_column(String(200))
+    payload_hash: Mapped[str] = mapped_column(String(64))
+    body: Mapped[dict] = mapped_column(JSON)
+    created_at: Mapped[float] = mapped_column(Float)
+
+
+class DraftPullRequest(Tenant, Base):
+    __tablename__ = "draft_pull_requests"
+    __table_args__ = (
+        UniqueConstraint("workspace_id", "id"),
+        UniqueConstraint("workspace_id", "run_id"),
+        UniqueConstraint("workspace_id", "repository_id", "number"),
+        ForeignKeyConstraint(
+            ["workspace_id", "run_id", "candidate_id"],
+            ["candidates.workspace_id", "candidates.run_id", "candidates.id"],
+        ),
+        ForeignKeyConstraint(
+            ["workspace_id", "repository_id"], ["repositories.workspace_id", "repositories.id"]
+        ),
+        CheckConstraint("number > 0"),
+        CheckConstraint("state IN ('OPEN','CLOSED')"),
+    )
+    run_id: Mapped[str] = mapped_column(String(36))
+    repository_id: Mapped[str] = mapped_column(String(36))
+    candidate_id: Mapped[str] = mapped_column(String(36))
+    number: Mapped[int] = mapped_column(Integer)
+    external_id: Mapped[str] = mapped_column(String(200))
+    url: Mapped[str] = mapped_column(String(1000))
+    base_ref: Mapped[str] = mapped_column(String(200))
+    base_sha: Mapped[str] = mapped_column(String(64))
+    head_ref: Mapped[str] = mapped_column(String(200))
+    head_sha: Mapped[str] = mapped_column(String(64))
+    merge_sha: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    draft: Mapped[bool] = mapped_column(Boolean)
+    state: Mapped[str] = mapped_column(String(20))
+    metadata_body: Mapped[dict] = mapped_column(JSON)
+    observed_at: Mapped[float] = mapped_column(Float)

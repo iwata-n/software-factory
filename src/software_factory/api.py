@@ -25,6 +25,8 @@ from .contracts import (
     Heartbeat,
     Intervention,
     ProjectCreate,
+    PublicationBegin,
+    PublicationReport,
     ReplanRequest,
     RepositoryCreate,
     RunStart,
@@ -321,6 +323,85 @@ def create_app(
                             UsageReceipt.run_id == run.id,
                         )
                         .order_by(UsageReceipt.created_at, UsageReceipt.id)
+                    )
+                ],
+            }
+
+        return service.read(token, query)
+
+    @app.get("/v1/publisher/queue", tags=["Publisher"])
+    def publisher_queue(token: Token):
+        return service.read(token, service.publications.queue, role="PUBLISHER")
+
+    @app.post("/v1/publisher/jobs/{job_id}/begin", tags=["Publisher"])
+    def publication_begin(job_id: str, data: PublicationBegin, token: Token, key: Key = None):
+        return service.write(
+            token,
+            "PUBLISHER",
+            f"publication:{job_id}:begin",
+            key,
+            data.model_dump(),
+            lambda s, a: service.publications.begin(s, a, job_id, data),
+        )
+
+    @app.get("/v1/publisher/operations/{operation_id}/inputs", tags=["Publisher"])
+    def publication_inputs(operation_id: str, token: Token):
+        return service.read(
+            token, lambda s, a: service.publications.inputs(s, a, operation_id), role="PUBLISHER"
+        )
+
+    @app.post("/v1/publisher/operations/{operation_id}/reports", tags=["Publisher"])
+    def publication_report(
+        operation_id: str, data: PublicationReport, token: Token, key: Key = None
+    ):
+        return service.write(
+            token,
+            "PUBLISHER",
+            f"publication:{operation_id}:report",
+            key,
+            data.model_dump(),
+            lambda s, a: service.publications.report(s, a, operation_id, data),
+        )
+
+    @app.get("/v1/runs/{run_id}/publication", tags=["Runs"])
+    def publication_get(run_id: str, token: Token):
+        from .models import DraftPullRequest, PublicationObservation, PublicationOperation
+        from .publications import draft_view, operation_view
+
+        def query(session, actor):
+            run = owned(session, Run, run_id, actor.workspace_id)
+            operations = session.scalars(
+                select(PublicationOperation)
+                .where(
+                    PublicationOperation.workspace_id == actor.workspace_id,
+                    PublicationOperation.run_id == run.id,
+                )
+                .order_by(PublicationOperation.created_at, PublicationOperation.id)
+            )
+            draft = session.scalar(
+                select(DraftPullRequest).where(
+                    DraftPullRequest.workspace_id == actor.workspace_id,
+                    DraftPullRequest.run_id == run.id,
+                )
+            )
+            return {
+                "operations": [operation_view(item) for item in operations],
+                "pull_request": draft_view(draft) if draft else None,
+                "observations": [
+                    {
+                        "observation_id": item.id,
+                        "operation_id": item.operation_id,
+                        "publisher_id": item.publisher_id,
+                        "body": item.body,
+                        "created_at": item.created_at,
+                    }
+                    for item in session.scalars(
+                        select(PublicationObservation)
+                        .where(
+                            PublicationObservation.workspace_id == actor.workspace_id,
+                            PublicationObservation.run_id == run.id,
+                        )
+                        .order_by(PublicationObservation.created_at, PublicationObservation.id)
                     )
                 ],
             }

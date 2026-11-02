@@ -6,7 +6,16 @@ import json
 from sqlalchemy import select
 
 from .db import Database, db_now
-from .models import AuditEvent, Enrollment, Principal, Repository, Workspace
+from .models import (
+    AuditEvent,
+    Enrollment,
+    Principal,
+    Publisher,
+    PublisherGrant,
+    Repository,
+    Workspace,
+    new_id,
+)
 from .service import Service, issue_token, token_hash
 
 
@@ -15,6 +24,12 @@ def main():
     sub = parser.add_subparsers(dest="command", required=True)
     bootstrap = sub.add_parser("bootstrap", help="Create a workspace and a local user credential")
     bootstrap.add_argument("--name", required=True)
+    publisher = sub.add_parser(
+        "issue-publisher", help="Issue a dedicated trusted Publisher credential"
+    )
+    publisher.add_argument("--workspace-id", required=True)
+    publisher.add_argument("--name", required=True)
+    publisher.add_argument("--repository-id", action="append", required=True)
     enrollment = sub.add_parser("issue-enrollment", help="Issue a single-use worker enrollment")
     enrollment.add_argument("--workspace-id", required=True)
     enrollment.add_argument("--ttl-seconds", type=int, default=600)
@@ -67,6 +82,47 @@ def main():
                 "principal_id": principal.id,
                 "user_token": secret,
             }
+        elif args.command == "issue-publisher":
+            workspace = session.get(Workspace, args.workspace_id)
+            if workspace is None:
+                parser.error("workspace not found")
+            service.lock_workspace(session, workspace.id)
+            repositories = [session.get(Repository, rid) for rid in set(args.repository_id)]
+            if any(repo is None or repo.workspace_id != workspace.id for repo in repositories):
+                parser.error("repository is not in this workspace")
+            secret, identity = issue_token(), new_id()
+            session.add(
+                Principal(
+                    id=identity,
+                    workspace_id=workspace.id,
+                    role="PUBLISHER",
+                    token_hash=token_hash(secret),
+                )
+            )
+            session.flush()
+            session.add(Publisher(id=identity, workspace_id=workspace.id, name=args.name))
+            session.flush()
+            for repository in repositories:
+                session.add(
+                    PublisherGrant(
+                        workspace_id=workspace.id,
+                        publisher_id=identity,
+                        repository_id=repository.id,
+                    )
+                )
+            session.add(
+                AuditEvent(
+                    workspace_id=workspace.id,
+                    actor_id="local-admin",
+                    operation="publisher.issued",
+                    body={
+                        "publisher_id": identity,
+                        "repository_ids": sorted(set(args.repository_id)),
+                    },
+                    created_at=db_now(session),
+                )
+            )
+            result = {"publisher_id": identity, "publisher_token": secret}
         elif args.command == "issue-enrollment":
             kinds = args.kinds or ["PLAN", "IMPLEMENT"]
             if args.usage_authority and not args.managed:
