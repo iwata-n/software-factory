@@ -138,6 +138,9 @@ class CandidateCommands:
             metadata_body={
                 "commit_object": report.commit_object,
                 "parent_sha": report.parent_sha or report.base_sha,
+                "parent_candidate_id": job.payload.get("source_candidate_id"),
+                "repair_job_id": job.payload.get("repair_job_id"),
+                "repair_round": job.payload.get("repair_round", 0),
                 "file_manifest": report.file_manifest,
                 "changed_paths": report.changed_paths,
                 "isolation": report.isolation,

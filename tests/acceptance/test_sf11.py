@@ -94,8 +94,15 @@ def source_bundle(tmp_path, monkeypatch, request):
         "protected_manifest": {"checks/test_golden.py": hashlib.sha256(golden).hexdigest()},
         "verification_commands": [command],
         "required_ci_checks": (
-            [{"provider": "github", "app_id": 123, "check_name": "factory-tests"}]
-            if scenario == "ci"
+            [
+                {"provider": "github", "app_id": 123, "check_name": name}
+                for name in (
+                    ["factory-tests", "factory-lint", "factory-format"]
+                    if scenario == "ci_three"
+                    else ["factory-tests"]
+                )
+            ]
+            if scenario in {"ci", "ci_three"}
             else []
         ),
     }

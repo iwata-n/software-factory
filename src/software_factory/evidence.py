@@ -28,6 +28,7 @@ def classify_junit(body, expected_ids, execution_state, exit_code):
         "reason": "REPORT_MISSING",
         "test_ids": [],
         "counts": {"tests": 0, "failed": 0, "errors": 0, "skipped": 0},
+        "failed_test_ids": [],
     }
     if execution_state in {"TIMEOUT", "START_FAILED"}:
         return result | {"status": "ERROR", "reason": execution_state}
@@ -49,7 +50,15 @@ def classify_junit(body, expected_ids, execution_state, exit_code):
             "errors": sum(c.find("error") is not None for c in cases),
             "skipped": sum(c.find("skipped") is not None for c in cases),
         }
-        result |= {"test_ids": ids, "counts": counts}
+        result |= {
+            "test_ids": ids,
+            "counts": counts,
+            "failed_test_ids": [
+                name
+                for name, case in zip(ids, cases, strict=True)
+                if case.find("failure") is not None or case.find("error") is not None
+            ],
+        }
         skipped = {
             name for name, case in zip(ids, cases, strict=True) if case.find("skipped") is not None
         }
@@ -108,6 +117,8 @@ def finding_view(item):
                 "finding_key",
                 "criterion_id",
                 "severity",
+                "category",
+                "stable_code",
                 "location",
                 "description",
                 "artifact_ids",
@@ -273,6 +284,7 @@ class EvidenceCommands:
                         ),
                         metadata_body={
                             "reason": verdict["reason"],
+                            "failed_test_ids": verdict["failed_test_ids"],
                             "command": command,
                             "isolation": isolation,
                         },
@@ -313,6 +325,8 @@ class EvidenceCommands:
                         finding_key=finding.id,
                         criterion_id=finding.criterion_id,
                         severity=finding.severity,
+                        category=finding.category,
+                        stable_code=finding.stable_code,
                         location=finding.location.model_dump(),
                         description=finding.description,
                         artifact_ids=finding.evidence_artifact_ids,

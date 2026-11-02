@@ -186,8 +186,17 @@ User認証付きの `GET /v1/candidates/{id}/checks` と `/findings` で結果�
 
 Gateは必須Jobの完了を待ち、対象/出所不一致→INCONCLUSIVE、基盤ERROR→ERROR、確定FAIL/critical・high Finding→FAIL、証拠不足/判断不能→INCONCLUSIVE、全必須条件PASS→PASSの順で判定します。任意チェック未提出や古いAttemptの失敗を必須証拠に混ぜません。採用する証拠ID集合/hash、対象tuple、Policy版を不変のGate行へ保存し、費用・次Job・Outboxと同じTXで確定します。
 
-PASSは `PUBLISH_DRAFT`、FAILは上限内の `REPAIR` へ進み、ERRORは同じ検証Job/inputをインフラ上限内で再試行します。INCONCLUSIVEはBLOCKEDです。Repairの進展判定はSF-13、実PublisherはSF-17で接続します。現時点で公開Job作成は公開要求の保存を意味します。
+PASSは `PUBLISH_DRAFT`、FAILは上限内の `REPAIR` へ進み、ERRORは同じ検証Job/inputをインフラ上限内で再試行します。INCONCLUSIVEはBLOCKEDです。Repairは正規化した失敗集合の厳密な減少を確認します。実PublisherはSF-17で接続します。現時点で公開Job作成は公開要求の保存を意味します。
 
 Project Policyの `required_ci_checks` でprovider/app ID/check名を固定できます。最終Gateの契約はLocal PASS・Draft PR・CIの対象を照合し、headそのもの、または固定したmerge SHAとbase/head parentsを確認します。待機deadlineはDBへ一度だけ保存し、再起動/再試行で延長しません。CI基盤ERRORは同じ対象のretry要求をOutboxへ保存し、期限中もWorker slotや費用予約を持ちません。実GitHubの公開・CI取得はSF-17〜19で受け入れます。
 
 `GET /v1/candidates/{id}/verification` は証拠とGate、`GET /v1/gates/{id}` は判定を返します。User/AgentによるGate変更は拒否し、所有Workspace内の変更要求を監査に記録します。過去のPASSを別Candidate/Profile/Policy/証拠集合へ流用できません。
+
+
+## 修正上限と進展
+
+RepairはRunあたり最大2 Jobです。同じRepairのインフラ障害はAttemptだけを増やし、round、親Candidate、採用証拠、制約digestを保持します。patchは親Candidateの確定Archiveへ適用し、元Runのbase SHAを残したまま新しいhead/世代を作ります。旧Candidateと証拠は変更しません。
+
+失敗集合は必須check/test ID、criterion、安定error code、severity、相対path、symbolから作り、行番号や自由文・Finding行IDは同一性に使いません。新集合が旧集合の真部分集合なら進展、同一/新規失敗追加は `NO_PROGRESS`、比較不能は `REPAIR_COMPARISON_INCONCLUSIVE` で停止します。同じコードの再提出は `NO_CODE_CHANGE`、2回後は `REPAIR_LIMIT_REACHED` です。Agentの進展・制約変更の申告は判定に使いません。
+
+必須検証を変えるpatchは引き続き保護されます。新Specが必要な構造化Findingは `SPEC_CHANGE_REQUIRED` で停止します。Final Gateから始めたRepairは、Local PASS後も進展判定を保留し、新しい対象のFinal証拠で比較します。実CI結果はSF-18/19で取り込みます。

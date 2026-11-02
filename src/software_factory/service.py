@@ -175,7 +175,7 @@ def enqueue(
 
 
 def transition(
-    session: Session, run: Run, kind: str, reason: str | None = None, *, payload=None
+    session: Session, run: Run, kind: str, reason: str | None = None, *, payload=None, step_key=None
 ) -> None:
     previous_phase = run.phase
     decision = decide(
@@ -200,6 +200,7 @@ def transition(
             decision.next_job,
             depends_on=(previous,) if previous else (),
             payload=payload,
+            step_key=step_key,
         )
     event(session, run, kind, {"reason": decision.reason, "phase": run.phase})
 
@@ -962,21 +963,50 @@ class Service:
                 if len(patches) > 1:
                     raise DomainError(409, "SINGLE_PATCH_REQUIRED")
                 if not patches:
-                    transition(session, run, "IMPLEMENT_EXECUTED")
+                    if job.kind == "REPAIR":
+                        transition(session, run, "BLOCKED", "CHANGE_ARTIFACT_MISSING")
+                    else:
+                        transition(session, run, "IMPLEMENT_EXECUTED")
                 else:
+                    payload = {
+                        "patch_artifact_id": patches[0].id,
+                        "input_artifact_ids": [patches[0].id],
+                        "parent_sha": run.base_sha,
+                    }
+                    if job.kind == "REPAIR":
+                        payload |= {
+                            key: job.payload[key]
+                            for key in (
+                                "candidate_id",
+                                "candidate",
+                                "source_candidate_id",
+                                "source_artifact_id",
+                                "parent_sha",
+                                "repair_round",
+                            )
+                        }
+                        payload["repair_job_id"] = job.id
+                        payload["input_artifact_ids"].append(job.payload["source_artifact_id"])
                     transition(
                         session,
                         run,
                         "CHANGE_ARTIFACT_READY",
-                        payload={
-                            "patch_artifact_id": patches[0].id,
-                            "input_artifact_ids": [patches[0].id],
-                            "parent_sha": run.base_sha,
-                        },
+                        payload=payload,
+                        step_key=(
+                            f"assemble_candidate:{job.payload['repair_round']}"
+                            if job.kind == "REPAIR"
+                            else None
+                        ),
                     )
             elif job.kind == "ASSEMBLE_CANDIDATE":
-                transition(session, run, "CANDIDATE_ASSEMBLED")
-                self.candidates.create(session, actor, attempt, job, run, report)
+                if (
+                    job.payload.get("source_candidate_id")
+                    and report.source_digest == job.payload["candidate"]["source_digest"]
+                ):
+                    transition(session, run, "BLOCKED", "NO_CODE_CHANGE")
+                else:
+                    transition(session, run, "CANDIDATE_ASSEMBLED")
+                    self.candidates.create(session, actor, attempt, job, run, report)
             elif job.kind in {"VERIFY", "REVIEW"}:
                 self.evidence.save(session, actor, attempt, job, run, report)
             else:

@@ -1,5 +1,7 @@
 """Control-plane gates: only immutable trusted evidence can advance a Candidate."""
 
+from dataclasses import replace
+
 from sqlalchemy import select
 
 from .candidates import candidate_view
@@ -8,6 +10,7 @@ from .db import db_now
 from .evidence import check_view, finding_view, target_of
 from .models import Attempt, Candidate, Check, Finding, Gate, Job, new_id
 from .quality import local_gate
+from .repair import ci_failure_set, compare_failures, constraint_digest, failure_set
 
 
 def gate_view(item):
@@ -95,8 +98,6 @@ class GateCommands:
             or digest(run.snapshot["verification_profile"]) != candidate.profile_hash
             or digest(run.snapshot["policy"]) != run.snapshot["policy_hash"]
         ):
-            from dataclasses import replace
-
             decision = replace(decision, status="INCONCLUSIVE", reason="CURRENT_TARGET_CHANGED")
         return candidate, target, jobs, checks, findings, decision
 
@@ -107,6 +108,16 @@ class GateCommands:
         if decision.status == "WAIT":
             run.status = "RUNNING" if any(job.state == "LEASED" for job in jobs) else "QUEUED"
             return None
+        defects = failure_set(checks, findings, decision.evidence_ids)
+        progress, stop = self.progress(session, run, candidate, "LOCAL", defects, decision.status)
+        if any(
+            f.get("category") == "SPEC_CHANGE_REQUIRED" and f["id"] in decision.evidence_ids
+            for f in findings
+        ):
+            stop = "SPEC_CHANGE_REQUIRED"
+            decision = replace(decision, status="INCONCLUSIVE", reason=stop)
+        if stop == "REPAIR_COMPARISON_INCONCLUSIVE":
+            decision = replace(decision, status="INCONCLUSIVE", reason=stop)
         existing = session.scalar(
             select(Gate).where(
                 Gate.workspace_id == run.workspace_id,
@@ -129,7 +140,12 @@ class GateCommands:
             evidence_ids=list(decision.evidence_ids),
             evidence_digest=decision.evidence_digest,
             policy_version=run.snapshot["policy"]["version"],
-            metadata_body={"job_ids": sorted(j.id for j in jobs)},
+            metadata_body={
+                "job_ids": sorted(j.id for j in jobs),
+                "failure_set": defects,
+                "failure_set_version": 1,
+                "repair_progress": progress,
+            },
             created_at=db_now(session),
         )
         session.add(gate)
@@ -155,7 +171,9 @@ class GateCommands:
             "evidence_digest": gate.evidence_digest,
             "policy_hash": target["policy_hash"],
         }
-        if decision.status == "PASS":
+        if stop:
+            transition(session, run, "BLOCKED", stop)
+        elif decision.status == "PASS":
             run.status, run.phase, run.stop_reason = "QUEUED", "PUBLISH_DRAFT", None
             enqueue(
                 session,
@@ -175,30 +193,100 @@ class GateCommands:
                 if job.id in bad_jobs:
                     self.service.retry_or_fail(session, job, run)
         elif decision.status == "FAIL":
-            repairs = list(
-                session.scalars(select(Job).where(Job.run_id == run.id, Job.kind == "REPAIR"))
+            self.queue_repair(
+                session, run, candidate, gate, jobs, checks, findings, defects, payload
             )
-            if len(repairs) >= run.snapshot["execution"]["max_repair_rounds"]:
-                transition(session, run, "BLOCKED", "REPAIR_LIMIT_REACHED")
-            else:
-                run.status, run.phase, run.stop_reason = "QUEUED", "REPAIR", None
-                payload |= {
-                    "repair_round": len(repairs) + 1,
-                    "finding_ids": [f["id"] for f in findings],
-                    "parent_sha": candidate.head_sha,
-                    "source_candidate_id": candidate.id,
-                }
-                enqueue(
-                    session,
-                    run,
-                    "REPAIR",
-                    depends_on=tuple(j.id for j in jobs),
-                    step_key=f"repair:{candidate.generation}",
-                    payload=payload,
-                )
         else:
             transition(session, run, "BLOCKED", decision.reason)
         return gate
+
+    def progress(self, session, run, candidate, stage, defects, status):
+        repair_id = candidate.metadata_body.get("repair_job_id")
+        if not repair_id:
+            return {"status": "INITIAL", "after": defects}, None
+        repair = session.get(Job, repair_id)
+        previous = repair.payload.get("failure_set") if repair else None
+        if status == "ERROR":
+            return {"status": "RETRY_INFRASTRUCTURE"}, None
+        if (
+            repair
+            and repair.payload.get("repair_stage") == "FINAL"
+            and stage == "LOCAL"
+            and status == "PASS"
+        ):
+            return {"status": "PENDING_FINAL_VALIDATION"}, None
+        comparison = (
+            compare_failures(previous, defects)
+            if repair
+            and (repair.payload.get("constraints_digest") == constraint_digest(run.snapshot))
+            else "INCONCLUSIVE"
+        )
+        if status == "INCONCLUSIVE":
+            comparison = "INCONCLUSIVE"
+        stop = {"NO_PROGRESS": "NO_PROGRESS", "INCONCLUSIVE": "REPAIR_COMPARISON_INCONCLUSIVE"}.get(
+            comparison
+        )
+        return {
+            "status": comparison,
+            "before": previous,
+            "after": defects,
+            "repair_job_id": repair_id,
+        }, stop
+
+    def queue_repair(self, session, run, candidate, gate, jobs, checks, findings, defects, payload):
+        from .service import enqueue, transition
+
+        adopted = [f for f in findings if f["id"] in gate.evidence_ids]
+        if any(f.get("category") == "SPEC_CHANGE_REQUIRED" for f in adopted):
+            transition(session, run, "BLOCKED", "SPEC_CHANGE_REQUIRED")
+            return
+        if defects is None or not defects:
+            transition(session, run, "BLOCKED", "REPAIR_COMPARISON_INCONCLUSIVE")
+            return
+        repairs = list(
+            session.scalars(
+                select(Job).where(
+                    Job.workspace_id == run.workspace_id, Job.run_id == run.id, Job.kind == "REPAIR"
+                )
+            )
+        )
+        if len(repairs) >= run.snapshot["execution"]["max_repair_rounds"]:
+            transition(session, run, "BLOCKED", "REPAIR_LIMIT_REACHED")
+            return
+        for job in session.scalars(
+            select(Job).where(
+                Job.run_id == run.id,
+                Job.kind == "PUBLISH_DRAFT",
+                Job.state.in_(["READY", "PENDING", "RETRY_WAIT"]),
+            )
+        ):
+            job.state = "CANCELLED"
+        run.status, run.phase, run.stop_reason, run.wait_context = "QUEUED", "REPAIR", None, None
+        artifacts = set(payload["input_artifact_ids"])
+        for check in checks:
+            if check["id"] in gate.evidence_ids:
+                artifacts.update(check["artifact_ids"])
+        for finding in adopted:
+            artifacts.update(finding["artifact_ids"])
+        payload |= {
+            "repair_round": len(repairs) + 1,
+            "finding_ids": [f["id"] for f in adopted],
+            "parent_sha": candidate.head_sha,
+            "source_candidate_id": candidate.id,
+            "failure_set": defects,
+            "failure_set_version": 1,
+            "repair_stage": gate.stage,
+            "constraints_digest": constraint_digest(run.snapshot),
+            "input_artifact_ids": sorted(artifacts),
+        }
+        enqueue(
+            session,
+            run,
+            "REPAIR",
+            depends_on=tuple(j.id for j in jobs),
+            step_key=f"repair:{candidate.generation}",
+            payload=payload,
+        )
 
     def require_publication(self, session, run, candidate_id, gate_id, evidence_digest):
         from .service import DomainError, owned
@@ -293,6 +381,19 @@ class GateCommands:
         )
         if decision.status == "WAIT":
             return None
+        candidate, _, jobs, local_checks, findings, _ = self.inputs(session, run)
+        local_defects = failure_set(local_checks, findings, local.evidence_ids)
+        ci_defects = ci_failure_set(
+            [c for c in context["checks"] if c["id"] in decision.evidence_ids]
+        )
+        defects = (
+            local_defects + ci_defects
+            if local_defects is not None and ci_defects is not None
+            else None
+        )
+        progress, stop = self.progress(session, run, candidate, "FINAL", defects, decision.status)
+        if stop == "REPAIR_COMPARISON_INCONCLUSIVE":
+            decision = replace(decision, status="INCONCLUSIVE", reason=stop)
         existing = session.scalar(
             select(Gate).where(
                 Gate.workspace_id == run.workspace_id,
@@ -319,6 +420,9 @@ class GateCommands:
                 "draft": context["draft"],
                 "checks": context["checks"],
                 "deadline_at": context["deadline_at"],
+                "failure_set": defects,
+                "failure_set_version": 1,
+                "repair_progress": progress,
             },
             created_at=db_now(session),
         )
@@ -326,7 +430,9 @@ class GateCommands:
         session.flush()
         self.service.checkpoint("gate.created")
         event(session, run, "FINAL_GATE_DECIDED", {"gate_id": gate.id, "status": gate.status})
-        if decision.status == "PASS":
+        if stop:
+            transition(session, run, "BLOCKED", stop)
+        elif decision.status == "PASS":
             # SF-19 verifies publication reconciliation before assigning Run SUCCEEDED.
             run.phase = "FINAL_GATE_READY"
         elif decision.status == "ERROR":
@@ -350,6 +456,19 @@ class GateCommands:
                         "not_before": run.wait_context["next_reconcile_at"],
                     },
                 )
+        elif decision.status == "FAIL":
+            payload = {
+                "candidate_id": candidate.id,
+                "candidate": candidate_view(candidate),
+                "source_artifact_id": candidate.source_artifact_id,
+                "input_artifact_ids": [candidate.source_artifact_id],
+                "gate_id": gate.id,
+                "evidence_digest": gate.evidence_digest,
+                "policy_hash": gate.target["policy_hash"],
+            }
+            self.queue_repair(
+                session, run, candidate, gate, jobs, local_checks, findings, defects, payload
+            )
         else:
             transition(session, run, "BLOCKED", decision.reason)
         return gate

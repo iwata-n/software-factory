@@ -442,6 +442,10 @@ class Finding(Tenant, Base):
     finding_key: Mapped[str] = mapped_column(String(200))
     criterion_id: Mapped[str] = mapped_column(String(200))
     severity: Mapped[str] = mapped_column(String(20))
+    category: Mapped[str] = mapped_column(String(40), default="CODE", server_default="CODE")
+    stable_code: Mapped[str] = mapped_column(
+        String(200), default="REVIEW_FINDING", server_default="REVIEW_FINDING"
+    )
     location: Mapped[dict] = mapped_column(JSON)
     description: Mapped[str] = mapped_column(String(4000))
     artifact_ids: Mapped[list] = mapped_column(JSON)

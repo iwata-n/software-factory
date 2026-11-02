@@ -144,6 +144,7 @@ class FindingLocation(Contract):
     path: Name
     start_line: int = Field(ge=1, le=1000000)
     end_line: int = Field(ge=1, le=1000000)
+    symbol: Name | None = None
 
     @model_validator(mode="after")
     def valid_location(self):
@@ -157,6 +158,8 @@ class FindingObservation(Contract):
     candidate_id: Name
     criterion_id: Name
     severity: Literal["critical", "high", "medium", "low", "info"]
+    category: Literal["CODE", "SPEC_CHANGE_REQUIRED"] = "CODE"
+    stable_code: Name = "REVIEW_FINDING"
     location: FindingLocation
     description: Annotated[str, Field(min_length=1, max_length=4000)]
     evidence_artifact_ids: list[Name] = Field(min_length=1, max_length=100)

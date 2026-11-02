@@ -20,7 +20,7 @@ from .test_sf11 import Reviewer, checks
 from .test_sf11 import source_bundle as source_bundle
 
 
-def prepared(pipeline, kind="VERIFY", reviewer=None):
+def prepared(pipeline, kind="VERIFY", reviewer=None, adapter=None):
     with pipeline.world.database.transaction() as s:
         s.get(Worker, pipeline.managed.worker_id).capabilities = [kind, "adapter:fake"]
     downstream, _ = worker_client(pipeline.managed)
@@ -38,7 +38,9 @@ def prepared(pipeline, kind="VERIFY", reviewer=None):
 
     client = httpx.Client(base_url="http://127.0.0.1", transport=httpx.MockTransport(intercept))
     assert Supervisor(
-        client, PipelineAdapter(pipeline.runner, reviewer=reviewer), heartbeat_interval=0.1
+        client,
+        adapter or PipelineAdapter(pipeline.runner, reviewer=reviewer),
+        heartbeat_interval=0.1,
     ).run_once() == {"prepared_without_delivery": True}
     assert captured
     return captured

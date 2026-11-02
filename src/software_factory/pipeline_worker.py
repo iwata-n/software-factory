@@ -71,7 +71,20 @@ class PipelineAdapter:
                 patch_id = job["input"]["patch_artifact_id"]
                 patch = self.input_bytes(patch_id, transport)
                 source = job.get("source")
-                if not source or source["sha"] != job["base_sha"]:
+                parent_sha = job["base_sha"]
+                if job["input"].get("source_candidate_id"):
+                    parent = job["input"]["candidate"]
+                    source = {
+                        "sha": parent["head_sha"],
+                        "tree": parent["tree_sha"],
+                        "source_digest": parent["source_digest"],
+                        "commit_object": parent["metadata_body"]["commit_object"],
+                        "archive": base64.b64encode(
+                            self.input_bytes(parent["source_artifact_id"], transport)
+                        ).decode(),
+                    }
+                    parent_sha = job["input"]["parent_sha"]
+                if not source or source["sha"] != parent_sha:
                     raise RunnerError("FIXED_SOURCE_REQUIRED", "POLICY")
                 result = self.runner.execute(
                     {
