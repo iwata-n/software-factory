@@ -15,6 +15,7 @@ dependencies = [
 [project.scripts]
 factory = "software_factory.cli:main"
 factory-worker = "software_factory.worker:main"
+factory-source-runner = "software_factory.source_runner:main"
 
 [dependency-groups]
 dev = ["pytest>=8,<10", "ruff>=0.11,<1"]

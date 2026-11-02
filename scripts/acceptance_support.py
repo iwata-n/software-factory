@@ -15,19 +15,28 @@ def sha(value: bytes) -> str:
 
 def source_manifest() -> dict:
     files = {}
-    for prefix in ("src", "tests", "scripts", "migrations", ".github"):
+    for prefix in ("src", "tests", "scripts", "migrations", ".github", "runner", "config"):
         for path in sorted((ROOT / prefix).rglob("*")):
             if path.is_file() and "__pycache__" not in path.parts and path.suffix != ".pyc":
                 files[path.relative_to(ROOT).as_posix()] = sha(path.read_bytes())
-    for name in ("pyproject.toml", "uv.lock", "README.md", "alembic.ini", "compose.yaml"):
+    for name in (
+        "pyproject.toml",
+        "uv.lock",
+        "README.md",
+        "alembic.ini",
+        "compose.yaml",
+        ".python-version",
+        ".env.example",
+        ".gitignore",
+    ):
         files[name] = sha((ROOT / name).read_bytes())
     plan = (ROOT / "docs/Implementation_Plan.md").read_text()
     criteria = [
-        line for line in plan.splitlines() if re.match(r"^\| (SF-0[1-7]-AC\d{2}|C-0[1-6]) \|", line)
+        line for line in plan.splitlines() if re.match(r"^\| (SF-\d{2}-AC\d{2}|C-0[1-6]) \|", line)
     ]
     settings = plan.split("### MVPの固定試験設定", 1)[1].split("\nSF-10は", 1)[0]
     criteria.append(settings)
-    files["docs/Implementation_Plan.md#SF01-07-criteria"] = sha("\n".join(criteria).encode())
+    files["docs/Implementation_Plan.md#criteria"] = sha("\n".join(criteria).encode())
     fingerprint = sha(json.dumps(files, sort_keys=True).encode())
     base = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=ROOT, text=True).strip()
     return {
@@ -39,8 +48,13 @@ def source_manifest() -> dict:
 
 
 def required_criteria() -> list[str]:
-    return [
-        f"SF-{task:02d}-AC{number:02d}"
-        for task in range(1, 8)
-        for number in range(1, (7 if task == 5 else 6) + 1)
-    ]
+    # A task enters the executed ledger only when its acceptance module exists.
+    # The implementation plan retains unimplemented/unverified tasks separately.
+    implemented = {
+        int(path.stem.removeprefix("test_sf"))
+        for path in (ROOT / "tests/acceptance").glob("test_sf[0-9][0-9].py")
+    }
+    criteria = re.findall(
+        r"^\| (SF-(\d{2})-AC\d{2}) \|", (ROOT / "docs/Implementation_Plan.md").read_text(), re.M
+    )
+    return [ac for ac, task in criteria if int(task) in implemented]

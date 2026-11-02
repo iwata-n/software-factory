@@ -1,0 +1,19 @@
+{
+  "schema_version": 1,
+  "github_repository": "iwata-n/software-factory",
+  "jira": {
+    "site": "https://pokeca-chips.atlassian.net",
+    "project_key": "SWF",
+    "board_id": 34
+  },
+  "slack": {
+    "workspace": "iwata-home",
+    "channel_id": "C0B4FJX81TM"
+  },
+  "agent": {
+    "engine": "codex-cli",
+    "authentication": "existing_chatgpt_cli",
+    "version": "0.166.0-alpha.5.1"
+  },
+  "acceptance_state": "IN_PROGRESS"
+}

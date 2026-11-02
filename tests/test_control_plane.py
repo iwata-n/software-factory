@@ -462,8 +462,26 @@ def test_heartbeat_cannot_extend_job_deadline_or_accept_wrong_fence(world):
 
 
 def test_incomplete_artifact_reference_is_not_accepted(world):
+    from software_factory.storage import content_hash
+
     assignment = world.claim().json()
     reply = submit(world, assignment, body=completion(assignment) | {"artifact_ids": ["unknown"]})
+    assert reply.status_code == 404
+    assert world.run()["reserved_microusd"] == 100_000
+    reserved = world.post(
+        f"/v1/worker/leases/{assignment['lease']['id']}/artifacts",
+        {
+            "fence": assignment["lease"]["fence"],
+            "kind": "LOG",
+            "size_bytes": 0,
+            "sha256": content_hash(b""),
+        },
+        token=world.worker_token,
+    )
+    assert reserved.status_code == 201
+    reply = submit(
+        world, assignment, body=completion(assignment) | {"artifact_ids": [reserved.json()["id"]]}
+    )
     assert reply.status_code == 409
     assert world.run()["reserved_microusd"] == 100_000
 

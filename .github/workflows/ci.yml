@@ -32,6 +32,11 @@ jobs:
         with:
           enable-cache: true
       - run: uv sync --locked --python 3.11
+      - name: Build managed Linux runner
+        run: |
+          docker build -t software-factory-runner:dev runner
+          factory_runner_image=$(docker image inspect software-factory-runner:dev --format '{{.Id}}')
+          echo "FACTORY_RUNNER_IMAGE_DIGEST=${factory_runner_image}" >> "$GITHUB_ENV"
       - run: uv run ruff check .
       - run: uv run ruff format --check .
       - run: uv run alembic upgrade head
@@ -42,7 +47,7 @@ jobs:
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: sf01-07-acceptance
+          name: factory-acceptance
           path: .local/acceptance/current/
           include-hidden-files: true
           retention-days: 30

@@ -13,6 +13,8 @@ from sqlalchemy.exc import SQLAlchemyError
 from starlette.concurrency import run_in_threadpool
 
 from .contracts import (
+    ArtifactFinalize,
+    ArtifactReserve,
     Cancel,
     Claim,
     Complete,
@@ -27,6 +29,7 @@ from .contracts import (
 )
 from .db import Database
 from .models import (
+    Artifact,
     Attempt,
     Job,
     JobDependency,
@@ -59,8 +62,11 @@ def create_app(
     reconcile_interval: float = 5,
     resolver: SourceResolver | None = None,
     checkpoint=None,
+    storage=None,
 ) -> FastAPI:
-    service = Service(database or Database(), resolver=resolver, checkpoint=checkpoint)
+    service = Service(
+        database or Database(), resolver=resolver, checkpoint=checkpoint, storage=storage
+    )
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
@@ -367,6 +373,132 @@ def create_app(
     @app.post("/v1/worker/leases/{lease_id}/heartbeat", tags=["Worker"])
     def heartbeat(lease_id: str, data: Heartbeat, token: Token):
         return service.heartbeat(token, lease_id, data.fence)
+
+    @app.get("/v1/worker/leases/{lease_id}/source", tags=["Worker"])
+    def source_get(lease_id: str, fence: int, token: Token):
+        return service.fetch_source(token, lease_id, fence)
+
+    @app.post("/v1/worker/leases/{lease_id}/artifacts", status_code=201, tags=["Artifacts"])
+    def artifact_reserve(lease_id: str, data: ArtifactReserve, token: Token, key: Key = None):
+        return service.write(
+            token,
+            "WORKER",
+            f"artifact.reserve:{lease_id}",
+            key,
+            data.model_dump(),
+            lambda s, a: service.artifacts.reserve(s, a, lease_id, data),
+        )
+
+    @app.put("/v1/worker/leases/{lease_id}/artifacts/{artifact_id}/content", tags=["Artifacts"])
+    async def artifact_upload(
+        lease_id: str, artifact_id: str, fence: int, request: Request, token: Token, key: Key = None
+    ):
+        from .artifacts import MAX_ARTIFACT_BYTES
+        from .storage import content_hash
+
+        # Authenticate and validate ownership before receiving a possibly large body.
+        def authorize():
+            with service.db.transaction() as s:
+                actor = service.principal(s, token, "WORKER")
+                item = owned(s, Artifact, artifact_id, actor.workspace_id)
+                attempt = s.scalar(
+                    select(Attempt).where(
+                        Attempt.workspace_id == actor.workspace_id,
+                        Attempt.id == item.attempt_id,
+                        Attempt.worker_id == actor.id,
+                        Attempt.lease_id == lease_id,
+                    )
+                )
+                if attempt is None:
+                    raise DomainError(404, "NOT_FOUND")
+                if not key:
+                    raise DomainError(422, "IDEMPOTENCY_KEY_REQUIRED")
+
+        await run_in_threadpool(authorize)
+        body = bytearray()
+        async for chunk in request.stream():
+            if len(body) + len(chunk) > MAX_ARTIFACT_BYTES:
+                raise DomainError(413, "ARTIFACT_TOO_LARGE")
+            body.extend(chunk)
+        data = bytes(body)
+        return await run_in_threadpool(
+            service.write,
+            token,
+            "WORKER",
+            f"artifact.upload:{artifact_id}",
+            key,
+            {"fence": fence, "size_bytes": len(data), "sha256": content_hash(data)},
+            lambda s, a: service.artifacts.upload(s, a, lease_id, artifact_id, fence, data),
+        )
+
+    @app.post("/v1/worker/leases/{lease_id}/artifacts/{artifact_id}/finalize", tags=["Artifacts"])
+    def artifact_finalize(
+        lease_id: str, artifact_id: str, data: ArtifactFinalize, token: Token, key: Key = None
+    ):
+        return service.write(
+            token,
+            "WORKER",
+            f"artifact.finalize:{artifact_id}",
+            key,
+            data.model_dump(),
+            lambda s, a: service.artifacts.finalize(s, a, lease_id, artifact_id, data),
+        )
+
+    @app.get("/v1/runs/{run_id}/artifacts", tags=["Artifacts"])
+    def artifact_list(run_id: str, token: Token):
+        from .artifacts import view
+
+        def query(s, a):
+            owned(s, Run, run_id, a.workspace_id)
+            return {
+                "artifacts": [
+                    view(item)
+                    for item in s.scalars(
+                        select(Artifact)
+                        .where(
+                            Artifact.workspace_id == a.workspace_id,
+                            Artifact.run_id == run_id,
+                            Artifact.status != "DELETED",
+                        )
+                        .order_by(Artifact.created_at, Artifact.id)
+                    )
+                ]
+            }
+
+        return service.read(token, query)
+
+    @app.get("/v1/artifacts/{artifact_id}", tags=["Artifacts"])
+    def artifact_get(artifact_id: str, token: Token):
+        from .artifacts import view
+
+        def query(s, a):
+            item = owned(s, Artifact, artifact_id, a.workspace_id)
+            if item.status == "DELETED":
+                raise DomainError(404, "NOT_FOUND")
+            return view(item)
+
+        return service.read(token, query)
+
+    @app.get("/v1/artifacts/{artifact_id}/content", tags=["Artifacts"])
+    def artifact_content(artifact_id: str, token: Token):
+        body = service.read(token, lambda s, a: service.artifacts.content(s, a, artifact_id))
+        return Response(
+            content=body,
+            media_type="application/octet-stream",
+            headers={"X-Content-Type-Options": "nosniff"},
+        )
+
+    @app.get("/v1/worker/leases/{lease_id}/artifacts/{artifact_id}/content", tags=["Artifacts"])
+    def worker_artifact_content(lease_id: str, artifact_id: str, fence: int, token: Token):
+        with service.db.transaction() as s:
+            actor = service.principal(s, token, "WORKER")
+            service.artifacts.owned(s, actor, lease_id, artifact_id, fence)
+            body = service.artifacts.content(s, actor, artifact_id)
+        return Response(
+            content=body,
+            media_type="application/octet-stream",
+            headers={"X-Content-Type-Options": "nosniff"},
+        )
 
     @app.post("/v1/worker/leases/{lease_id}/complete", tags=["Worker"])
     def complete(lease_id: str, data: Complete, token: Token, key: Key = None):

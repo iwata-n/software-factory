@@ -88,6 +88,7 @@ class Repository(Tenant, Base):
     base_ref: Mapped[str] = mapped_column(String(200))
     base_sha: Mapped[str] = mapped_column(String(64))
     active: Mapped[bool] = mapped_column(Boolean, default=True, server_default="true")
+    remote_url: Mapped[str | None] = mapped_column(String(1000), nullable=True)
 
 
 class Task(Tenant, Base):
@@ -211,6 +212,7 @@ class Attempt(Tenant, Base):
     __table_args__ = (
         UniqueConstraint("workspace_id", "job_id", "attempt_no"),
         UniqueConstraint("workspace_id", "id", name="uq_attempts_workspace_id"),
+        UniqueConstraint("workspace_id", "job_id", "id", name="uq_attempts_workspace_job_id"),
         ForeignKeyConstraint(["workspace_id", "job_id"], ["jobs.workspace_id", "jobs.id"]),
         ForeignKeyConstraint(["workspace_id", "worker_id"], ["workers.workspace_id", "workers.id"]),
         Index("ix_attempts_expiry", "state", "expires_at"),
@@ -294,3 +296,32 @@ class AuditEvent(Tenant, Base):
     operation: Mapped[str] = mapped_column(String(200))
     body: Mapped[dict] = mapped_column(JSON)
     created_at: Mapped[float] = mapped_column(Float)
+
+
+class Artifact(Tenant, Base):
+    __tablename__ = "artifacts"
+    __table_args__ = (
+        UniqueConstraint("workspace_id", "id"),
+        ForeignKeyConstraint(
+            ["workspace_id", "run_id", "job_id"], ["jobs.workspace_id", "jobs.run_id", "jobs.id"]
+        ),
+        ForeignKeyConstraint(
+            ["workspace_id", "job_id", "attempt_id"],
+            ["job_attempts.workspace_id", "job_attempts.job_id", "job_attempts.id"],
+        ),
+        CheckConstraint("size_bytes >= 0 AND size_bytes <= 16777216"),
+        CheckConstraint("status IN ('RESERVED', 'UPLOADED', 'AVAILABLE', 'DELETED')"),
+    )
+    run_id: Mapped[str] = mapped_column(String(36))
+    job_id: Mapped[str] = mapped_column(String(36))
+    attempt_id: Mapped[str] = mapped_column(String(36))
+    fence: Mapped[int] = mapped_column(Integer)
+    kind: Mapped[str] = mapped_column(String(30))
+    status: Mapped[str] = mapped_column(String(30), default="RESERVED")
+    size_bytes: Mapped[int] = mapped_column(BigInteger)
+    sha256: Mapped[str] = mapped_column(String(64))
+    stored_size_bytes: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    stored_sha256: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    created_at: Mapped[float] = mapped_column(Float)
+    expires_at: Mapped[float] = mapped_column(Float)
+    finalized_at: Mapped[float | None] = mapped_column(Float, nullable=True)

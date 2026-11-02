@@ -6,6 +6,8 @@
 
 SF-01〜07を再評価し、不足する基盤実装とAC付き試験を追加した。ローカルと実GitHub CIのPostgreSQL 17で各327ケースが成功し、取得済みArtifactと対象SHAを照合した。全43 ACと共通6条件の証拠49件がPASSとなり、SF-01〜07を受け入れ済みとする。SF-08以降は未判定。現在の実行は `PLAN → VALIDATE → IMPLEMENT` を模擬し、`ASSEMBLE_CANDIDATE` で `BLOCKED / CANDIDATE_PIPELINE_NOT_IMPLEMENTED` に停止する。
 
+残り17タスクの実装を継続中。以下のSF-01〜07の受入は末尾に示す基準revisionの判定であり、追加実装後の現行revisionは全回帰・証拠・CIを再評価して確定する。SF-08/09のAPI・DB移行と試験、SF-10の隔離Assemblerエンジンを追加している。未検証条件を実装済みの部分だけで合格へ変更しない。
+
 ## マイルストーンと依存関係
 
 | 段階 | 到達点 | 含むタスク | 次段階へ進む条件 |
@@ -31,9 +33,9 @@ M1は全ACと共通条件を満たし受け入れ済み。設計書17章の「�
 | [SF-05](#sf-05-jobとleaseの永続制御) | Job・Attempt・Lease・Scheduler・Reconciler | SF-04 | SF-05-AC01〜07 | 実装済み | 受け入れ済み |
 | [SF-06](#sf-06-http-workerとfake-agent) | HTTP Worker・Agent契約・Fake Agent | SF-05 | SF-06-AC01〜06 | 実装済み | 受け入れ済み |
 | [SF-07](#sf-07-キャンセルと永続イベント) | 取消・Graph・イベント・Outbox | SF-05、SF-06 | SF-07-AC01〜06 | 実装済み | 受け入れ済み |
-| [SF-08](#sf-08-repository接続とsha解決) | Repository接続・実SHA解決 | SF-03 | SF-08-AC01〜06 | 未着手 | 未判定 |
-| [SF-09](#sf-09-artifactのライフサイクル) | Artifact予約・確定・取得・回収 | SF-02、SF-05 | SF-09-AC01〜07 | 未着手 | 未判定 |
-| [SF-10](#sf-10-隔離assemblerとcandidate) | 隔離Assembler・不変Candidate | SF-08、SF-09 | SF-10-AC01〜07 | 未着手 | 未判定 |
+| [SF-08](#sf-08-repository接続とsha解決) | Repository接続・実SHA解決 | SF-03 | SF-08-AC01〜06 | 実装中 | 未判定 |
+| [SF-09](#sf-09-artifactのライフサイクル) | Artifact予約・確定・取得・回収 | SF-02、SF-05 | SF-09-AC01〜07 | 実装中 | 未判定 |
+| [SF-10](#sf-10-隔離assemblerとcandidate) | 隔離Assembler・不変Candidate | SF-08、SF-09 | SF-10-AC01〜07 | 実装中 | 未判定 |
 | [SF-11](#sf-11-独立検証とレビュー証拠) | Verifier・Reviewer・Check・Finding | SF-10 | SF-11-AC01〜06 | 未着手 | 未判定 |
 | [SF-12](#sf-12-決定論的な品質gate) | Local Gate・最終Gate | SF-11 | SF-12-AC01〜07 | 未着手 | 未判定 |
 | [SF-13](#sf-13-修正上限と進展の判定) | Repair・Candidate世代・早期打切り | SF-12 | SF-13-AC01〜06 | 未着手 | 未判定 |
@@ -576,3 +578,17 @@ uv run python scripts/verify_acceptance.py \
 警告はテストでStarlette TestClientのhttpx利用非推奨が1件、ActionsでNode 20対象actionのNode 24強制実行とubuntu-latest移行の通知がある。いずれも実行成功を確認した。依存/action/runnerの更新は別変更としてlock・環境を記録して再評価する。
 
 SF-03の公開認可とSF-07の承認/CI待機の復旧は境界Fakeの契約試験。実Repository取得、Candidate、実Agent、OS隔離、公開・外部CI同期の受け入れはSF-08以降に残る。今回のGitHub Actions成功はこの基盤コードのCI検証であり、SF-18の製品機能を実装済みにしたものではない。
+
+## SF-08以降の作業記録
+
+評価先は `config/evaluation.json` に保存する。ユーザー指定の既存Codex CLI認証、Jira `https://pokeca-chips.atlassian.net` のSWF、Slack `C0B4FJX81TM` を使用する。JiraサイトとSlackチャンネルの読取接続、Codex CLI 0.166.0-alpha.5.1のChatGPTログイン状態を確認済み。モデル/料金/実Agent image等の未確定manifestを架空の値で埋めて受け入れない。
+
+- SF-08：Source RunnerをCPとは別のHTTPサービスとして追加。Gitを実Docker内で実行し、HTTPS allowlist、固定SHA、tree/code digest、submodule/LFS/hook/外部設定/pathの拒否、取得前後の権限確認を実装。実HTTPS branch/tag/full SHA、移動/消失するbare ref、2つの実TLSサーバーでredirect先接続0・認証拒否・転送中断・timeoutを検証した。実別PIDとCPのprocess起動禁止、同Jobの3試行・2/4秒待機・入力固定、POLICY拒否時BLOCKEDも確認した。固定評価先は公開HTTPSであり、未接続の非公開Repositoryまで検証済みとはしない。現行revisionの全回帰と実CI照合を継続する。
+- SF-09：0004でLease/Workspace/Run/Job/Attemptに結び付いたArtifactを追加。16 MiB、1時間予約、予約→upload→finalize、認証付き取得、immutable bytes、symlink/hardlink対策、未確定GC、LOGの秘密マスクを実装。20回競合、サイズ・期限境界、取消、受理済み再送を含む追加試験を実行中。現行revisionの全回帰と実CIまで未判定を維持する。
+- SF-10：通信なし、non-root/read-only root、host mountなしの実Assemblerを追加。base commit/tree/digest照合、UTF-8 patch、実差分の保護manifest/許可path照合、脱出拒否、固定parentの再現可能commitとcode digestを8件の実コンテナ試験で確認した。Candidateモデル/API、不変制約、Attempt fence、工程接続、kill復旧を引き続き実装する。
+
+新たな証拠台帳は実装済みの受入試験モジュールを対象とし、未実装タスクはこの計画上で未判定のまま残す。入力digestにはRunnerコード・Dockerfile・評価設定と全AC定義も含める。試験が成功しても、対象ACが要求する実接続・競合・故障点を満たす証拠がなければ受け入れ済みにしない。
+
+2026年11月2日の現行変更のローカル一括検証は477件PASS（92.53秒）、skip/xfail 0。Python 3.11.15・PostgreSQL 17.11・Runner実digest `sha256:e8d309533f5803ab87488789adbae97ae0a14b888d6a3d524015e88947ae27b6` を使用した。入力digestは `cf0ec21260e1904d24950e3c81afdb3ffec48b8250ce6ed7349b43970cfdc71b`。SF-01〜09の56 ACと共通6条件の62件を照合し、実CI証拠を要するSF-01-AC06だけを未検証で保持している。CI Artifact名は対象拡張に合わせ `factory-acceptance` とした。
+
+追加確認は、実SupervisorのSource取得→起動・失敗時start 0・連続Job、取得中の期限監視、取得時に固定したsymlink metadataのPlan検証、新設8 API×6主体の認可matrix、実TCPの部分upload切断、保存bytesの改ざん検出、別AttemptのAVAILABLE成果物拒否を含む。Candidate API等の未完了部分をこの477件で受け入れたことにはしない。

@@ -11,6 +11,7 @@ import httpx
 import pytest
 from alembic import command
 from alembic.config import Config
+from alembic.script import ScriptDirectory
 from fastapi.testclient import TestClient
 from sqlalchemy import MetaData, text
 
@@ -76,9 +77,12 @@ def test_empty_upgrade_is_scoped_and_matches_models(database, evidence):
     with schema_database(database) as fresh:
         command.check(Config("alembic.ini"))
         with fresh.engine.connect() as connection:
-            assert connection.scalar(text("SELECT version_num FROM alembic_version")) == "0002"
+            assert (
+                connection.scalar(text("SELECT version_num FROM alembic_version"))
+                == ScriptDirectory.from_config(Config("alembic.ini")).get_current_head()
+            )
         assert dump(database) == before
-        evidence("head=0002, model diff=0, parent schema unchanged", sorted(dump(fresh)))
+        evidence("current head, model diff=0, parent schema unchanged", sorted(dump(fresh)))
 
 
 @pytest.mark.ac("SF-01-AC03")

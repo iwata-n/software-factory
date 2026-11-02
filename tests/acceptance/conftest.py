@@ -62,6 +62,7 @@ class Reporter:
                 "python": platform.python_version(),
                 "platform": platform.platform(),
                 "postgresql": self.postgres_version,
+                "runner_image_digest": os.environ.get("FACTORY_RUNNER_IMAGE_DIGEST"),
             },
             "github_sha": os.environ.get("GITHUB_SHA"),
             "github_run_url": (
@@ -116,7 +117,7 @@ class Reporter:
                         sort_keys=True,
                     ).encode()
                 ),
-                "configuration_version": "foundation-acceptance-1",
+                "configuration_version": "factory-acceptance-2",
                 "test_case_ids": names,
                 "expected": "all collected cases and the criterion's documented assertions pass",
                 "observed": redact(cases),

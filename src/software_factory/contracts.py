@@ -182,6 +182,7 @@ class RepositoryCreate(Contract):
     # First slice pins a trusted revision in the registry; no git/network execution in the CP.
     base_ref: Name = "main"
     base_sha: Sha
+    remote_url: str | None = Field(default=None, max_length=1000)
 
 
 class RunStart(Contract):
@@ -233,3 +234,14 @@ class WorkerEventInput(Contract):
 class WorkerEventBatch(Contract):
     fence: int = Field(ge=1)
     events: list[WorkerEventInput] = Field(min_length=1, max_length=100)
+
+
+class ArtifactReserve(Contract):
+    fence: int = Field(ge=1)
+    kind: Literal["PATCH", "LOG", "RESULT", "EVIDENCE"]
+    size_bytes: int = Field(ge=0, le=10**12, strict=True)
+    sha256: Annotated[str, Field(pattern=r"^[0-9a-f]{64}$")]
+
+
+class ArtifactFinalize(Contract):
+    fence: int = Field(ge=1)

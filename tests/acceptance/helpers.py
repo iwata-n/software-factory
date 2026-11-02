@@ -86,7 +86,7 @@ def worker_client(world, *, lose_completion=False, after_claim=None, completion_
             return httpx.Response(transient_statuses.pop(0), json={"code": "TRANSIENT"})
         response = world.client.request(
             request.method,
-            request.url.path,
+            request.url.path + ("?" + request.url.query.decode() if request.url.query else ""),
             content=request.content,
             headers={
                 "Authorization": f"Bearer {world.worker_token}",

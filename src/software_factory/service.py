@@ -1,6 +1,7 @@
 """Transactional application commands; external execution never occurs under DB locks."""
 
 import hashlib
+import os
 import secrets
 from collections.abc import Callable
 from contextvars import ContextVar
@@ -49,10 +50,10 @@ from .models import (
 )
 from .resolver import (
     ReferenceNotFound,
-    RegisteredSourceResolver,
     ResolutionUnavailable,
     SourceReference,
     SourceResolver,
+    configured_resolver,
     valid_sha,
 )
 from .security import redact
@@ -179,11 +180,19 @@ def transition(session: Session, run: Run, kind: str, reason: str | None = None)
 
 class Service:
     def __init__(
-        self, database: Database, *, resolver: SourceResolver | None = None, checkpoint=None
+        self,
+        database: Database,
+        *,
+        resolver: SourceResolver | None = None,
+        checkpoint=None,
+        storage=None,
     ):
+        from .artifacts import ArtifactCommands
+
         self.db = database
-        self.resolver = resolver or RegisteredSourceResolver()
+        self.resolver = resolver or configured_resolver()
         self.checkpoint = checkpoint or (lambda name: None)
+        self.artifacts = ArtifactCommands(self, storage)
 
     def principal(self, session: Session, token: str, role: str) -> Principal:
         actor = session.scalar(select(Principal).where(Principal.token_hash == token_hash(token)))
@@ -280,6 +289,15 @@ class Service:
         data: RepositoryCreate,
     ) -> dict:
         owned(session, Project, project_id, actor.workspace_id)
+        if data.remote_url:
+            from .source_runner import SourcePolicy, SourcePolicyDenied
+
+            try:
+                SourcePolicy(
+                    tuple(filter(None, os.environ.get("FACTORY_ALLOWED_REMOTES", "").split(",")))
+                ).authorize(data.remote_url)
+            except SourcePolicyDenied:
+                raise DomainError(422, "SOURCE_REPOSITORY_NOT_ALLOWED") from None
         repo = Repository(
             workspace_id=actor.workspace_id, project_id=project_id, **data.model_dump()
         )
@@ -387,11 +405,17 @@ class Service:
                 spec.body["task"]["base_ref"],
                 repo.base_ref,
                 repo.base_sha,
+                repo.remote_url,
             )
             workspace_id, actor_id = actor.workspace_id, actor.id
         # No connection, transaction, or lock survives source resolution.
         try:
-            resolved_sha = self.resolver.resolve(reference)
+            source_details = None
+            if reference.remote_url and hasattr(self.resolver, "resolve_details"):
+                source_details = self.resolver.resolve_details(reference)
+                resolved_sha = source_details["sha"]
+            else:
+                resolved_sha = self.resolver.resolve(reference)
             if not valid_sha(resolved_sha):
                 raise DomainError(422, "INVALID_BASE_SHA")
         except (ReferenceNotFound, ResolutionUnavailable, DomainError) as error:
@@ -399,7 +423,7 @@ class Service:
                 error.code
                 if isinstance(error, DomainError)
                 else (
-                    "BASE_REF_NOT_REGISTERED"
+                    getattr(error, "code", "BASE_REF_NOT_REGISTERED")
                     if isinstance(error, ReferenceNotFound)
                     else "SOURCE_RESOLUTION_UNAVAILABLE"
                 )
@@ -424,7 +448,9 @@ class Service:
             operation,
             key,
             body,
-            lambda session, actor: self.start_run(session, actor, task_id, data, resolved_sha),
+            lambda session, actor: self.start_run(
+                session, actor, task_id, data, resolved_sha, source_details
+            ),
         )
 
     def start_run(
@@ -434,6 +460,7 @@ class Service:
         task_id: str,
         data: RunStart,
         resolved_sha: str | None = None,
+        source_details: dict | None = None,
     ) -> dict:
         task = owned(session, Task, task_id, actor.workspace_id)
         version = session.scalar(
@@ -450,7 +477,7 @@ class Service:
         repo = owned(session, Repository, task.repository_id, actor.workspace_id)
         if not repo.active:
             raise DomainError(403, "REPOSITORY_ACCESS_REVOKED")
-        if repo.base_ref != spec.task.base_ref:
+        if not repo.remote_url and repo.base_ref != spec.task.base_ref:
             raise DomainError(422, "BASE_REF_NOT_REGISTERED")
         project = owned(session, Project, task.project_id, actor.workspace_id)
         policy = ProjectPolicy.model_validate(project.policy)
@@ -477,6 +504,16 @@ class Service:
             "execution_image_digest": policy.execution_image_digest,
             "simulation": True,
         }
+        if repo.remote_url:
+            snapshot["source"] = {"remote_url": repo.remote_url, "base_sha": base_sha}
+            if source_details:
+                snapshot["source"].update(
+                    {
+                        name: source_details[name]
+                        for name in ("tree", "source_digest", "symlink_paths", "image_digest")
+                        if name in source_details
+                    }
+                )
         run = Run(
             workspace_id=actor.workspace_id,
             task_id=task.id,
@@ -753,6 +790,33 @@ class Service:
                 "cancel_requested": cancelling,
             }
 
+    def fetch_source(self, token: str, lease_id: str, fence: int) -> dict:
+        def authorize():
+            with self.db.transaction() as session:
+                actor = self.principal(session, token, "WORKER")
+                _, _, run = self.artifacts.active(session, actor, lease_id, fence)
+                source = run.snapshot.get("source")
+                if not source:
+                    raise DomainError(409, "SOURCE_NOT_CONFIGURED")
+                return dict(source)
+
+        source = authorize()
+        if not hasattr(self.resolver, "fetch"):
+            raise DomainError(503, "SOURCE_RUNNER_UNAVAILABLE")
+        try:
+            result = self.resolver.fetch(source["remote_url"], source["base_sha"])
+        except ReferenceNotFound as error:
+            raise DomainError(409, getattr(error, "code", "SOURCE_FETCH_REJECTED")) from None
+        except ResolutionUnavailable:
+            raise DomainError(503, "SOURCE_FETCH_UNAVAILABLE") from None
+        # Revocation, cancellation, generation and deadline are checked after the remote wait too.
+        authorize()
+        if result.get("sha") != source["base_sha"]:
+            raise DomainError(409, "SOURCE_SHA_MISMATCH")
+        if source.get("source_digest") and result.get("source_digest") != source["source_digest"]:
+            raise DomainError(409, "SOURCE_DIGEST_MISMATCH")
+        return result
+
     def settle(self, run: Run, attempt: Attempt, usage: int, *, uncertain: bool = False) -> None:
         run.reserved_microusd -= attempt.reservation_microusd
         # Lost workers may have consumed their whole reservation. Do not silently refund it.
@@ -777,8 +841,7 @@ class Service:
             return {"accepted": True, "attempt_id": attempt.id, "run": run_view(run)}
         if run.status not in {RunStatus.RUNNING, RunStatus.CANCELLING}:
             raise DomainError(409, "INVALID_RUN_STATE")
-        if data.artifact_ids:
-            raise DomainError(409, "ARTIFACT_PIPELINE_NOT_IMPLEMENTED")
+        self.artifacts.validate_completion(session, actor, attempt, data.artifact_ids)
         if data.outcome == "CANCELLED" and run.status != RunStatus.CANCELLING:
             raise DomainError(409, "CANCELLATION_NOT_REQUESTED")
         self.settle(run, attempt, data.usage_microusd)
@@ -798,7 +861,12 @@ class Service:
                     error = validate_plan(
                         plan,
                         TaskSpec.model_validate(run.snapshot["task_spec"]),
-                        ProjectPolicy.model_validate(run.snapshot["policy"]),
+                        ProjectPolicy.model_validate(run.snapshot["policy"]).model_copy(
+                            update={
+                                "symlink_paths": run.snapshot["policy"].get("symlink_paths", [])
+                                + run.snapshot.get("source", {}).get("symlink_paths", [])
+                            }
+                        ),
                     )
                 except ValidationError:
                     error = "PLAN_SCHEMA_INVALID"
@@ -881,6 +949,7 @@ class Service:
         return run_view(run)
 
     def reconcile_workspace(self, session: Session, workspace_id: str) -> int:
+        self.artifacts.collect(session, workspace_id)
         now = db_now(session)
         attempts = list(
             session.scalars(

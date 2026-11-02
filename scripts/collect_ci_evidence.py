@@ -24,7 +24,7 @@ def main():
     if run["status"] != "completed" or run["conclusion"] != "success":
         raise SystemExit("GitHub run is not completed successfully; evidence not accepted")
     artifacts = api(f"repos/{args.repository}/actions/runs/{args.run_id}/artifacts")["artifacts"]
-    matches = [a for a in artifacts if a["name"] == "sf01-07-acceptance" and not a["expired"]]
+    matches = [a for a in artifacts if a["name"] == "factory-acceptance" and not a["expired"]]
     if len(matches) != 1:
         raise SystemExit("expected exactly one unexpired acceptance artifact")
     artifact = matches[0]

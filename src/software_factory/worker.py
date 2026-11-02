@@ -10,7 +10,7 @@ from urllib.parse import urlparse
 
 import httpx
 
-from .adapters import AgentAdapter, FakeAgent
+from .adapters import AgentAdapter, AgentResult, FakeAgent
 
 
 def validate_api_url(url: str) -> None:
@@ -84,30 +84,83 @@ class Supervisor:
         started = False
         try:
             deadline, cancelled = heartbeat()
+            preparation = None
+            preparation_error = None
             if not cancelled and time.monotonic() < deadline:
-                started = True
-                self.adapter.start(job)
+                if job["snapshot"].get("source"):
+                    preparation = Future()
+
+                    def fetch_source():
+                        try:
+                            reply = self.client.get(
+                                lease_path + "/source",
+                                params={"fence": lease["fence"]},
+                                timeout=max(0.1, min(60, deadline - time.monotonic())),
+                            )
+                            reply.raise_for_status()
+                            preparation.set_result(reply.json())
+                        except BaseException as error:
+                            preparation.set_exception(error)
+
+                    Thread(target=fetch_source, daemon=True, name="factory-source-fetch").start()
+                else:
+                    started = True
+                    self.adapter.start(job)
             else:
                 self.adapter.cancel()
             next_heartbeat = time.monotonic() + self.heartbeat_interval
             pending_heartbeat = None
             buffered_events = []
-            while self.adapter.result() is None:
+            while preparation_error is None and (
+                (preparation is not None and not cancelled) or self.adapter.result() is None
+            ):
                 now = time.monotonic()
                 if now >= deadline:
                     self.adapter.cancel()
                     raise TimeoutError("confirmed lease deadline reached; Agent cancelled")
-                buffered_events.extend(self.adapter.events())
                 if pending_heartbeat is not None and pending_heartbeat.done():
                     deadline, cancelled = pending_heartbeat.result()
                     pending_heartbeat = None
                     if cancelled:
                         self.adapter.cancel()
                     next_heartbeat = time.monotonic() + self.heartbeat_interval
+                if (
+                    preparation is not None
+                    and preparation.done()
+                    and not cancelled
+                    and time.monotonic() < deadline
+                ):
+                    try:
+                        source = preparation.result()
+                        if not isinstance(source, dict) or source.get("sha") != job["base_sha"]:
+                            preparation_error = AgentResult(
+                                "FAILED", {}, category="POLICY", reason="SOURCE_SHA_MISMATCH"
+                            )
+                    except httpx.HTTPStatusError as error:
+                        if error.response.status_code in {401, 403}:
+                            raise
+                        category = (
+                            "INFRASTRUCTURE" if error.response.status_code >= 500 else "POLICY"
+                        )
+                        preparation_error = AgentResult(
+                            "FAILED", {}, category=category, reason="SOURCE_FETCH_REJECTED"
+                        )
+                    except (httpx.TransportError, ValueError):
+                        preparation_error = AgentResult(
+                            "FAILED",
+                            {},
+                            category="INFRASTRUCTURE",
+                            reason="SOURCE_FETCH_UNAVAILABLE",
+                        )
+                    preparation = None
+                    if preparation_error is None:
+                        started = True
+                        self.adapter.start(job | {"source": source})
+                buffered_events.extend(self.adapter.events())
                 if now >= next_heartbeat and pending_heartbeat is None:
                     pending_heartbeat = background_heartbeat()
                 time.sleep(min(0.1, max(0, deadline - time.monotonic())))
-            result = self.adapter.result()
+            result = preparation_error or self.adapter.result()
             if time.monotonic() >= deadline:
                 self.adapter.cancel()
                 raise TimeoutError("confirmed lease deadline reached before submission")
