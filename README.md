@@ -227,3 +227,17 @@ Lease失効時は予約額を保守的に計上し、後日の確定usageで調�
 `GET /v1/runs/{id}/interventions` は停止解除用の現対象/hashを返します。`resolve_blocked` はそのhashを固定し、台帳・現Spec/Policy/Profile・稼働Lease・停止原因を再確認します。費用が確定し残額が十分なら同じJobを上限内で再試行します。証拠不足は現Candidateの信頼済み証拠からGateを再計算し、解消を確認できる場合にだけ再開します。CIの金融停止を解除しても元の待機期限を保持します。
 
 一般の介入では、不変候補・無進展・修正/試行上限・保護差分・Spec変更・CI期限切れを解除できません。許可された介入はactor、action、固定対象、前後revision、reason、時刻を状態と同じTXで監査します。
+
+## 専用Publisher（SF-17検証中）
+
+PublisherはUser/Workerと別の認証主体です。ローカル管理者が `factory issue-publisher --workspace-id <id> --repository-id <id> --name <name>` で発行し、許可Repositoryを固定します。発行JSONの `publisher_token` だけを所有者のみ読める0600のファイルへ保存します。GitHub資格情報はPublisherプロセスだけに渡します。
+
+```sh
+factory-publisher --publisher-token-file .local/publisher.token \
+  --github-use-gh --allowed-remote https://github.com/iwata-n/software-factory.git \
+  --control-plane-url http://127.0.0.1:8000 --once
+```
+
+`--github-token-file` で同様の0600ファイルを使う方法もあります。Publisherは固定Candidateのarchive/tree/raw commit/保護差分を再照合し、コードのcheckout・build・LLM実行を行いません。書込先は `codex/factory/<run_id>` とDraft PR作成だけです。既知のremote headに固定したpush条件が一致しなければ止まります。
+
+`GET /v1/runs/{id}/publication` で操作台帳と外部PRを確認できます。公開開始前の取消は送信を止め、開始後の外部結果は取消Runとは別に履歴へ残します。Publisherは送信前後を永続化し、同じ認証の別起動とも共有します。開始後に結果を確認できなければ `UNKNOWN` とし、盲目的に再公開しません。UNKNOWNの定期照合はSF-19で実装します。現在は契約・ローカルbare Git試験までで、SF-17の実GitHub受け入れは未完了です。

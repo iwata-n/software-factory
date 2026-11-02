@@ -7,7 +7,7 @@ from pathlib import Path
 import pytest
 from sqlalchemy import text
 
-from scripts.acceptance_support import required_criteria, sha, source_manifest
+from scripts.acceptance_support import EXTERNAL_CRITERIA, required_criteria, sha, source_manifest
 from software_factory.security import redact
 
 
@@ -90,10 +90,9 @@ class Reporter:
                 if cases and all(c["result"] == "PASS" for c in cases)
                 else "未検証"
             )
-            if ac == "SF-01-AC06" and status == "PASS":
-                status = (
-                    "未検証"  # A completed external run + downloaded artifact must also be audited.
-                )
+            if ac in EXTERNAL_CRITERIA and status == "PASS":
+                # Real service evidence is verified separately from contract cases.
+                status = "未検証"
             if ac == "C-01":
                 legacy = [case for name, case in self.cases.items() if not self.expected.get(name)]
                 if not legacy or any(c["result"] != "PASS" for c in legacy):

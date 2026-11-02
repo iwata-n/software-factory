@@ -396,6 +396,61 @@ class Intervention(Contract):
         return self
 
 
+class PublicationBegin(Contract):
+    expected_run_revision: int = Field(ge=1, strict=True)
+    target_hash: Annotated[str, Field(pattern=r"^[0-9a-f]{64}$")]
+
+
+class PublishedDraft(Contract):
+    repository: Annotated[str, Field(pattern=r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")]
+    number: int = Field(gt=0, strict=True)
+    external_id: Name
+    url: Annotated[str, Field(max_length=1000)]
+    base_ref: Name
+    base_sha: Sha
+    head_ref: Name
+    head_sha: Sha
+    merge_sha: Sha | None = None
+    draft: Literal[True]
+    state: Literal["OPEN"]
+
+
+class ProviderRequest(Contract):
+    method: Literal["GET", "POST"]
+    resource: Annotated[str, Field(min_length=1, max_length=1000)]
+    status_code: int | None = Field(default=None, ge=100, le=599, strict=True)
+
+
+class PublicationReport(Contract):
+    delivery_id: Name
+    target_hash: Annotated[str, Field(pattern=r"^[0-9a-f]{64}$")]
+    status: Literal["SUCCEEDED", "UNKNOWN", "CONFLICT"]
+    pull_request: PublishedDraft | None = None
+    observed_head_sha: Sha | None = None
+    provider_requests: list[ProviderRequest] = Field(default_factory=list, max_length=1000)
+    reason: (
+        Literal[
+            "REMOTE_HEAD_CONFLICT",
+            "BASE_CHANGED",
+            "PR_CONFLICT",
+            "SOURCE_MISMATCH",
+            "PUBLISH_POLICY_DENIED",
+            "PUBLISH_UNKNOWN",
+            "PROVIDER_UNAVAILABLE",
+            "PUSH_REJECTED",
+        ]
+        | None
+    ) = None
+
+    @model_validator(mode="after")
+    def outcome(self):
+        if (self.status == "SUCCEEDED") != (self.pull_request is not None):
+            raise ValueError("only success includes a verified Draft PR")
+        if self.status != "SUCCEEDED" and self.reason is None:
+            raise ValueError("a non-success result requires a classified reason")
+        return self
+
+
 class Claim(Contract):
     protocol_version: Literal[1] = 1
     wait_seconds: int = Field(default=0, ge=0, le=20)

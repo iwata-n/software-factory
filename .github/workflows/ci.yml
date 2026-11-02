@@ -2,9 +2,16 @@ name: control-plane
 on:
   push:
   pull_request:
+  workflow_dispatch:
+    inputs:
+      publication_evidence_blob:
+        description: Git blob SHA of the real publication evaluation for this exact implementation
+        required: false
+        type: string
 
 permissions:
   contents: read
+  pull-requests: read
 
 jobs:
   test:
@@ -43,6 +50,16 @@ jobs:
       - run: uv run alembic check
       - run: mkdir -p .local/acceptance/current
       - run: uv run pytest -q --junitxml=.local/acceptance/current/junit.xml
+      - name: Verify real publication evidence when supplied
+        env:
+          GH_TOKEN: ${{ github.token }}
+          FACTORY_PUBLICATION_EVIDENCE_BLOB: ${{ inputs.publication_evidence_blob }}
+        run: |
+          if [ -n "$FACTORY_PUBLICATION_EVIDENCE_BLOB" ]; then
+            uv run python scripts/collect_publication_evidence.py --repository "$GITHUB_REPOSITORY" --evaluation-blob "$FACTORY_PUBLICATION_EVIDENCE_BLOB" --output .local/acceptance/current
+          else
+            uv run python scripts/collect_publication_evidence.py --repository "$GITHUB_REPOSITORY" --discover --output .local/acceptance/current
+          fi
       - run: uv run python scripts/verify_acceptance.py .local/acceptance/current --allow-ci-pending
       - uses: actions/upload-artifact@v4
         if: always()
