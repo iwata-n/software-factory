@@ -1,0 +1,215 @@
+"""Outbound HTTP-only worker. No DB module, user token, git token, or Agent secrets."""
+
+import argparse
+import json
+import os
+import time
+from concurrent.futures import Future
+from threading import Thread
+from urllib.parse import urlparse
+
+import httpx
+
+from .adapters import AgentAdapter, FakeAgent
+
+
+def validate_api_url(url: str) -> None:
+    parsed = urlparse(url)
+    if parsed.username or parsed.password or parsed.query or parsed.fragment:
+        raise ValueError("API URL must not contain credentials, a query, or a fragment")
+    if not parsed.hostname or parsed.scheme not in {"http", "https"}:
+        raise ValueError("API URL must use HTTP(S)")
+    if parsed.scheme == "http" and parsed.hostname not in {"localhost", "127.0.0.1", "::1"}:
+        raise ValueError("HTTP is permitted only on loopback; use HTTPS for remote Control Planes")
+
+
+class Supervisor:
+    def __init__(
+        self, client: httpx.Client, adapter: AgentAdapter, *, heartbeat_interval: float = 15
+    ):
+        self.client = client
+        self.adapter = adapter
+        self.heartbeat_interval = heartbeat_interval
+
+    def run_once(self, *, wait_seconds: int = 0) -> dict | None:
+        response = self.client.post(
+            "/v1/worker/claims",
+            json={"protocol_version": 1, "wait_seconds": wait_seconds},
+            timeout=wait_seconds + 10,
+        )
+        if response.status_code == 204:
+            return None
+        response.raise_for_status()
+        assignment = response.json()
+        if assignment.get("protocol_version", 1) != 1:
+            raise RuntimeError("Worker received an unsupported protocol")
+        job, lease = assignment["job"], assignment["lease"]
+        if (
+            job["snapshot"]["agent_adapter"] != "fake"
+            or job["kind"] not in self.adapter.capabilities.kinds
+        ):
+            raise RuntimeError("Worker received an unsupported adapter or job kind")
+        lease_path = f"/v1/worker/leases/{lease['id']}"
+        # Confirm the lease before starting. Round-trip time consumes the returned allowance.
+        deadline = 0.0
+
+        def heartbeat() -> tuple[float, bool]:
+            sent_at = time.monotonic()
+            remaining = max(0.1, deadline - sent_at) if deadline else 10
+            reply = self.client.post(
+                lease_path + "/heartbeat",
+                json={"fence": lease["fence"]},
+                timeout=min(10, remaining),
+            )
+            reply.raise_for_status()
+            payload = reply.json()
+            allowance = payload["lease_expires_in_seconds"]
+            # A proportionate margin also works with short test/job deadlines.
+            confirmed_until = sent_at + max(0, allowance - min(5, allowance / 4))
+            return confirmed_until, payload["cancel_requested"]
+
+        def background_heartbeat() -> Future:
+            future = Future()
+
+            def invoke():
+                try:
+                    future.set_result(heartbeat())
+                except BaseException as error:
+                    future.set_exception(error)
+
+            # A stalled HTTP request must never block the supervisor's stop deadline.
+            Thread(target=invoke, daemon=True, name="factory-heartbeat").start()
+            return future
+
+        started = False
+        try:
+            deadline, cancelled = heartbeat()
+            if not cancelled and time.monotonic() < deadline:
+                started = True
+                self.adapter.start(job)
+            else:
+                self.adapter.cancel()
+            next_heartbeat = time.monotonic() + self.heartbeat_interval
+            pending_heartbeat = None
+            buffered_events = []
+            while self.adapter.result() is None:
+                now = time.monotonic()
+                if now >= deadline:
+                    self.adapter.cancel()
+                    raise TimeoutError("confirmed lease deadline reached; Agent cancelled")
+                buffered_events.extend(self.adapter.events())
+                if pending_heartbeat is not None and pending_heartbeat.done():
+                    deadline, cancelled = pending_heartbeat.result()
+                    pending_heartbeat = None
+                    if cancelled:
+                        self.adapter.cancel()
+                    next_heartbeat = time.monotonic() + self.heartbeat_interval
+                if now >= next_heartbeat and pending_heartbeat is None:
+                    pending_heartbeat = background_heartbeat()
+                time.sleep(min(0.1, max(0, deadline - time.monotonic())))
+            result = self.adapter.result()
+            if time.monotonic() >= deadline:
+                self.adapter.cancel()
+                raise TimeoutError("confirmed lease deadline reached before submission")
+            buffered_events.extend(self.adapter.events())
+            for offset in range(0, len(buffered_events), 100):
+                if time.monotonic() >= deadline:
+                    raise TimeoutError("confirmed lease deadline reached before event submission")
+                batch = [
+                    {**entry, "sequence": offset + number + 1}
+                    for number, entry in enumerate(buffered_events[offset : offset + 100])
+                ]
+                report = self.client.post(
+                    lease_path + "/events",
+                    json={"fence": lease["fence"], "events": batch},
+                    timeout=min(10, max(0.1, deadline - time.monotonic())),
+                )
+                report.raise_for_status()
+            if result.category:
+                endpoint = "fail"
+                body = {
+                    "fence": lease["fence"],
+                    "category": result.category,
+                    "reason": result.reason,
+                    "usage_microusd": result.usage_microusd,
+                }
+            else:
+                endpoint = "complete"
+                body = {
+                    "fence": lease["fence"],
+                    "outcome": result.outcome,
+                    "artifact_ids": [],
+                    "result": result.result,
+                    "usage_microusd": result.usage_microusd,
+                }
+            # Identical key and body across retries, including a lost completion response.
+            for retry in range(3):
+                try:
+                    if retry == 0 and time.monotonic() >= deadline:
+                        raise TimeoutError("confirmed lease deadline reached before completion")
+                    reply = self.client.post(
+                        lease_path + "/" + endpoint,
+                        json=body,
+                        headers={"Idempotency-Key": f"{endpoint}:{job['attempt_id']}"},
+                        timeout=10,
+                    )
+                    if reply.status_code == 429 or reply.status_code >= 500:
+                        reply.raise_for_status()
+                    else:
+                        reply.raise_for_status()
+                        return reply.json()
+                except (httpx.TransportError, httpx.HTTPStatusError) as error:
+                    transient = not isinstance(error, httpx.HTTPStatusError) or (
+                        error.response.status_code == 429 or error.response.status_code >= 500
+                    )
+                    if not transient or retry == 2:
+                        raise
+                    time.sleep(0.2 * (retry + 1))
+        except BaseException:
+            # Real adapters must make cancel() a bounded process-group stop (future sandbox task).
+            if started:
+                self.adapter.cancel()
+            raise
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Software Factory Fake Agent worker")
+    parser.add_argument(
+        "--api-url", default=os.environ.get("FACTORY_API_URL", "http://127.0.0.1:8000")
+    )
+    parser.add_argument("--once", action="store_true", help="Execute at most one job")
+    parser.add_argument(
+        "--drain", action="store_true", help="Exit when no job is immediately ready"
+    )
+    parser.add_argument(
+        "--scenario", choices=["success", "infra-fail", "inconclusive"], default="success"
+    )
+    args = parser.parse_args()
+    validate_api_url(args.api_url)
+    token = os.environ.get("FACTORY_WORKER_TOKEN")
+    if not token:
+        parser.error("FACTORY_WORKER_TOKEN is required")
+    with httpx.Client(
+        base_url=args.api_url, headers={"Authorization": f"Bearer {token}"}
+    ) as client:
+        supervisor = Supervisor(client, FakeAgent(args.scenario))
+        while True:
+            try:
+                result = supervisor.run_once(wait_seconds=0 if args.once or args.drain else 20)
+                if result:
+                    print(json.dumps(result, ensure_ascii=False))
+                if args.once or (args.drain and result is None):
+                    return
+            except (httpx.HTTPError, TimeoutError) as error:
+                # Never log tokens, request bodies, or arbitrary Agent output here.
+                print(json.dumps({"worker_error": type(error).__name__}))
+                permanent = isinstance(error, httpx.HTTPStatusError) and (
+                    error.response.status_code < 500 and error.response.status_code != 429
+                )
+                if args.once or args.drain or permanent:
+                    raise SystemExit(1) from None
+                time.sleep(1)
+
+
+if __name__ == "__main__":
+    main()
