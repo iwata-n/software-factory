@@ -2,9 +2,9 @@
 
 [設計書 v0.4](docs/Software_Factory_Design_v0.4.md) に基づくソフトウェアファクトリーの初期実装です。[実装計画](docs/Implementation_Plan.md) にタスク、依存関係、完了条件、受け入れ試験の対応を記載しています。
 
-FastAPIのControl Plane、PostgreSQL、Leaseで接続する別プロセスWorker、Source Runner、Artifact、不変Candidateと管理対象Assemblerを実装しています。既定のFake Agentは `PLAN → 計画検証 → IMPLEMENT` を模擬実行し、変更patchを作らないため `BLOCKED / CHANGE_ARTIFACT_MISSING` で停止します。独立Verifierと構造化レビュー証拠を実装しています。実Agent、Gate、PR作成、MVP全体の成功判定は後続です。
+FastAPIのControl Plane、PostgreSQL、Leaseで接続する別プロセスWorker、Source Runner、Artifact、不変Candidateと管理対象Assemblerを実装しています。既定のFake Agentは `PLAN → 計画検証 → IMPLEMENT` を模擬実行し、変更patchを作らないため `BLOCKED / CHANGE_ARTIFACT_MISSING` で停止します。独立Verifierと構造化レビュー証拠を実装しています。決定論的品質Gateまで実装しています。実Agent、PR作成、MVP全体の成功判定は後続です。
 
-有効な変更patchを受理したRunは、管理対象Assemblerでbase/tree/digestを照合し、不変CandidateとVERIFY/REVIEWの入力Jobを作成します。Verifierは固定Profileで実行し、ReviewerはAC別証拠を提出します。Gate接続前はRun成功を返しません。タスク全体の受入判定は実装計画に従います。
+有効な変更patchを受理したRunは、管理対象Assemblerでbase/tree/digestを照合し、不変CandidateとVERIFY/REVIEWの入力Jobを作成します。Verifierは固定Profileで実行し、ReviewerはAC別証拠を提出します。Local GateのPASSは公開Jobを作成します。Run成功は実公開・CI同期・最終照合を実装してから判定します。タスク全体の受入判定は実装計画に従います。
 
 ## ローカル起動
 
@@ -179,4 +179,15 @@ Project Policyの `verification_commands` にチェックID、argv、`expected_t
 
 `REVIEW` は同じ固定候補を読取専用で検査し、AC別判定と位置/証拠付きFindingを保存します。実モデルbackendはSF-20で接続します。backend未設定、AC欠落、具体的な証拠参照のない判定はINCONCLUSIVEとして保存し、合格にはしません。originはWorkerの管理区分とJob種別からCPが付与し、自己申告は拒否します。古い候補・別Profile/head/image等の証拠は出所付き履歴へ保存し、`eligible=false` にします。
 
-User認証付きの `GET /v1/candidates/{id}/checks` と `/findings` で結果を取得できます。Check/FindingはDBでも追記後の変更を禁止します。VERIFY/REVIEWが両方完了した現在の停止理由は `QUALITY_GATE_NOT_IMPLEMENTED` です。SF-12で決定論的Gateへ接続します。
+User認証付きの `GET /v1/candidates/{id}/checks` と `/findings` で結果を取得できます。Check/FindingはDBでも追記後の変更を禁止します。VERIFY/REVIEWの両方が完了すると、CPがLocal Gateを評価します。
+
+
+## 決定論的品質Gate
+
+Gateは必須Jobの完了を待ち、対象/出所不一致→INCONCLUSIVE、基盤ERROR→ERROR、確定FAIL/critical・high Finding→FAIL、証拠不足/判断不能→INCONCLUSIVE、全必須条件PASS→PASSの順で判定します。任意チェック未提出や古いAttemptの失敗を必須証拠に混ぜません。採用する証拠ID集合/hash、対象tuple、Policy版を不変のGate行へ保存し、費用・次Job・Outboxと同じTXで確定します。
+
+PASSは `PUBLISH_DRAFT`、FAILは上限内の `REPAIR` へ進み、ERRORは同じ検証Job/inputをインフラ上限内で再試行します。INCONCLUSIVEはBLOCKEDです。Repairの進展判定はSF-13、実PublisherはSF-17で接続します。現時点で公開Job作成は公開要求の保存を意味します。
+
+Project Policyの `required_ci_checks` でprovider/app ID/check名を固定できます。最終Gateの契約はLocal PASS・Draft PR・CIの対象を照合し、headそのもの、または固定したmerge SHAとbase/head parentsを確認します。待機deadlineはDBへ一度だけ保存し、再起動/再試行で延長しません。CI基盤ERRORは同じ対象のretry要求をOutboxへ保存し、期限中もWorker slotや費用予約を持ちません。実GitHubの公開・CI取得はSF-17〜19で受け入れます。
+
+`GET /v1/candidates/{id}/verification` は証拠とGate、`GET /v1/gates/{id}` は判定を返します。User/AgentによるGate変更は拒否し、所有Workspace内の変更要求を監査に記録します。過去のPASSを別Candidate/Profile/Policy/証拠集合へ流用できません。

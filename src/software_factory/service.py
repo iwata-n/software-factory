@@ -224,6 +224,9 @@ class Service:
         from .evidence import EvidenceCommands
 
         self.evidence = EvidenceCommands(self)
+        from .gates import GateCommands
+
+        self.gates = GateCommands(self)
 
     def principal(self, session: Session, token: str, role: str) -> Principal:
         actor = session.scalar(select(Principal).where(Principal.token_hash == token_hash(token)))
@@ -543,12 +546,13 @@ class Service:
             "execution_image_digest": policy.execution_image_digest,
             "simulation": policy.agent_adapter == "fake",
         }
-        if policy.verification_commands:
+        if policy.verification_commands or policy.required_ci_checks:
             snapshot["verification_profile"] = {
                 **spec.verification.model_dump(),
                 "schema_version": 1,
                 "commands": [command.model_dump() for command in policy.verification_commands],
                 "protected_manifest": policy.protected_manifest,
+                "required_ci_checks": [check.model_dump() for check in policy.required_ci_checks],
                 "review_check_ids": [
                     name
                     for name in spec.verification.required_checks
@@ -1082,6 +1086,24 @@ class Service:
                 self.retry_or_fail(session, job, run)
             else:
                 job.state = "CANCELLED"
+        for run in session.scalars(
+            select(Run).where(
+                Run.workspace_id == workspace_id,
+                Run.phase == "VERIFY_REVIEW",
+                Run.status.in_(["QUEUED", "RUNNING"]),
+                Run.current_candidate_id.is_not(None),
+            )
+        ):
+            self.gates.local(session, run)
+        for run in session.scalars(
+            select(Run).where(
+                Run.workspace_id == workspace_id,
+                Run.phase == "WAIT_CI",
+                Run.status == "WAITING_EXTERNAL",
+            )
+        ):
+            if (run.wait_context or {}).get("quality_gate"):
+                self.gates.final(session, run)
         return len(attempts)
 
     def worker_events(self, token: str, lease_id: str, data: WorkerEventBatch) -> dict:

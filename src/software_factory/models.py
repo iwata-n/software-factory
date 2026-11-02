@@ -447,3 +447,27 @@ class Finding(Tenant, Base):
     artifact_ids: Mapped[list] = mapped_column(JSON)
     origin: Mapped[str] = mapped_column(String(40))
     eligible: Mapped[bool] = mapped_column(Boolean)
+
+
+class Gate(Tenant, Base):
+    __tablename__ = "gates"
+    __table_args__ = (
+        UniqueConstraint("workspace_id", "id"),
+        UniqueConstraint("workspace_id", "candidate_id", "stage", "evidence_digest"),
+        ForeignKeyConstraint(
+            ["workspace_id", "run_id", "candidate_id"],
+            ["candidates.workspace_id", "candidates.run_id", "candidates.id"],
+        ),
+        CheckConstraint("status IN ('PASS','FAIL','ERROR','INCONCLUSIVE')"),
+    )
+    run_id: Mapped[str] = mapped_column(String(36))
+    candidate_id: Mapped[str] = mapped_column(String(36))
+    stage: Mapped[str] = mapped_column(String(20))
+    status: Mapped[str] = mapped_column(String(20))
+    reason: Mapped[str] = mapped_column(String(200))
+    target: Mapped[dict] = mapped_column(JSON)
+    evidence_ids: Mapped[list] = mapped_column(JSON)
+    evidence_digest: Mapped[str] = mapped_column(String(64))
+    policy_version: Mapped[int] = mapped_column(Integer)
+    metadata_body: Mapped[dict] = mapped_column(JSON)
+    created_at: Mapped[float] = mapped_column(Float)

@@ -53,6 +53,7 @@ def pipeline(world, source_bundle, runner, tmp_path):
             }
             | source.get("protected_manifest", {}),
             "verification_commands": source.get("verification_commands", []),
+            "required_ci_checks": source.get("required_ci_checks", []),
         }
         s.get(Repository, world.repository_id).remote_url = "https://fixture.example/owner/repo.git"
         s.add(

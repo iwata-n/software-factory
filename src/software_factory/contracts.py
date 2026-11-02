@@ -181,6 +181,12 @@ class EvidenceReport(Contract):
         return self
 
 
+class RequiredCICheck(Contract):
+    provider: Literal["github"] = "github"
+    app_id: int = Field(gt=0)
+    check_name: Name
+
+
 class ProjectPolicy(Contract):
     version: Literal[1] = 1
     allowed_write_paths: list[Name] = Field(min_length=1, max_length=100)
@@ -193,6 +199,7 @@ class ProjectPolicy(Contract):
     execution_image_digest: Annotated[str, Field(pattern=r"^sha256:[0-9a-f]{64}$")]
     agent_adapter: Literal["fake", "codex_cli"] = "fake"
     verification_commands: list[VerificationCommand] = Field(default_factory=list, max_length=100)
+    required_ci_checks: list[RequiredCICheck] = Field(default_factory=list, max_length=100)
     protected_manifest: dict[str, str] = Field(default_factory=dict, max_length=10000)
     allow_external_model: bool = False
     run_budget_microusd: int = Field(gt=0, le=10**12)
@@ -217,6 +224,9 @@ class ProjectPolicy(Contract):
         ids = [command.check_id for command in self.verification_commands]
         if len(ids) != len(set(ids)) or not set(ids).issubset(self.verification.required_checks):
             raise ValueError("verification command IDs must be unique required checks")
+        identities = [(c.provider, c.app_id, c.check_name) for c in self.required_ci_checks]
+        if len(identities) != len(set(identities)):
+            raise ValueError("required CI identities must be unique")
         return self
 
 

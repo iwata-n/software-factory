@@ -93,6 +93,11 @@ def source_bundle(tmp_path, monkeypatch, request):
         "commit_object": base64.b64encode(entry.git("cat-file", "commit", sha)).decode(),
         "protected_manifest": {"checks/test_golden.py": hashlib.sha256(golden).hexdigest()},
         "verification_commands": [command],
+        "required_ci_checks": (
+            [{"provider": "github", "app_id": 123, "check_name": "factory-tests"}]
+            if scenario == "ci"
+            else []
+        ),
     }
 
 

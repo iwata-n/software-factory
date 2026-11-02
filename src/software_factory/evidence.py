@@ -5,11 +5,10 @@ import tarfile
 from xml.etree import ElementTree
 
 from pydantic import ValidationError
-from sqlalchemy import select
 
 from .contracts import EvidenceReport
 from .db import db_now
-from .models import Artifact, Candidate, Check, Finding, Job, Worker
+from .models import Artifact, Candidate, Check, Finding, Worker
 
 
 def target_of(candidate):
@@ -192,7 +191,7 @@ class EvidenceCommands:
         return report
 
     def save(self, session, actor, attempt, job, run, report):
-        from .service import event, owned, transition
+        from .service import event, owned
 
         candidate = owned(session, Candidate, report.target.candidate_id, actor.workspace_id)
         isolation = report.isolation
@@ -332,17 +331,8 @@ class EvidenceCommands:
                 "eligible": eligible,
             },
         )
-        active = session.scalar(
-            select(Job.id)
-            .where(
-                Job.run_id == run.id,
-                Job.kind.in_(["VERIFY", "REVIEW"]),
-                Job.payload["candidate_id"].as_string() == job.payload["candidate_id"],
-                Job.state.in_(["READY", "PENDING", "LEASED", "RETRY_WAIT"]),
-            )
-            .limit(1)
-        )
-        if active:
+        # Retired results remain history; they cannot advance the current Candidate.
+        if run.current_candidate_id != job.payload["candidate_id"]:
             run.status = "QUEUED"
         else:
-            transition(session, run, "BLOCKED", "QUALITY_GATE_NOT_IMPLEMENTED")
+            self.service.gates.local(session, run)

@@ -34,6 +34,7 @@ from .models import (
     Candidate,
     Check,
     Finding,
+    Gate,
     Job,
     JobDependency,
     PlanVersion,
@@ -99,7 +100,7 @@ def create_app(
         lifespan=lifespan,
         description=(
             "Local control plane with immutable Candidates and independent evidence. "
-            "Default Fake Agent produces no patch. Verification, publication and real-agent "
+            "Default Fake Agent produces no patch. Publication and real-agent "
             "integration are tracked by the implementation plan."
         ),
     )
@@ -303,6 +304,46 @@ def create_app(
             ]
 
         return service.read(token, query)
+
+    @app.get("/v1/candidates/{candidate_id}/verification", tags=["Candidates"])
+    def verification_get(candidate_id: str, token: Token):
+        from .evidence import check_view, finding_view
+        from .gates import gate_view
+
+        def query(s, a):
+            owned(s, Candidate, candidate_id, a.workspace_id)
+            result = {}
+            for model, name, view in (
+                (Check, "checks", check_view),
+                (Finding, "findings", finding_view),
+                (Gate, "gates", gate_view),
+            ):
+                result[name] = [
+                    view(row)
+                    for row in s.scalars(
+                        select(model)
+                        .where(
+                            model.workspace_id == a.workspace_id, model.candidate_id == candidate_id
+                        )
+                        .order_by(model.id)
+                    )
+                ]
+            return result
+
+        return service.read(token, query)
+
+    @app.get("/v1/gates/{gate_id}", tags=["Candidates"])
+    def gate_get(gate_id: str, token: Token):
+        from .gates import gate_view
+
+        return service.read(token, lambda s, a: gate_view(owned(s, Gate, gate_id, a.workspace_id)))
+
+    @app.post("/v1/gates/{gate_id}/override", tags=["Candidates"])
+    @app.put("/v1/gates/{gate_id}", tags=["Candidates"])
+    @app.patch("/v1/gates/{gate_id}", tags=["Candidates"])
+    @app.delete("/v1/gates/{gate_id}", tags=["Candidates"])
+    def gate_mutation(gate_id: str, token: Token):
+        return service.gates.deny_mutation(token, gate_id)
 
     @app.put("/v1/candidates/{candidate_id}", tags=["Candidates"])
     @app.patch("/v1/candidates/{candidate_id}", tags=["Candidates"])
