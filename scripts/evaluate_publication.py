@@ -76,6 +76,19 @@ def post(client, path, body):
     return response.json()
 
 
+def save_database(output):
+    records = {}
+    database = Database()
+    with database.engine.connect() as connection:
+        metadata = MetaData()
+        metadata.reflect(bind=connection)
+        for name, table in metadata.tables.items():
+            records[name] = [dict(row) for row in connection.execute(select(table)).mappings()]
+    (output / "database.json").write_text(json.dumps(records, indent=2, default=str))
+    database.engine.dispose()
+    return records
+
+
 class FixtureAgent(FakeAgent):
     capabilities = Capabilities(kinds=("PLAN", "IMPLEMENT", "REPAIR"))
 
@@ -415,6 +428,9 @@ def main():
                     environment=base_environment,
                 )
                 record = user.get(f"/v1/runs/{run_id}/publication").json()
+                (output / f"publication-{len(record['operations'])}.json").write_text(
+                    json.dumps(record, indent=2, ensure_ascii=False)
+                )
                 return result, record
 
             assert Supervisor(agent_client, fixture, heartbeat_interval=0.1).run_once()["accepted"]
@@ -457,7 +473,10 @@ def main():
             second = first + "\n# Publication transport update fixture.\n"
             repair(first, second)
             result, publication = publish()
-            assert result["state"] == "SUCCEEDED"
+            assert result["state"] == "SUCCEEDED", {
+                "state": result["state"],
+                "reason": publication["operations"][-1]["reason"],
+            }
             second_publication = publication
             assert (
                 publication["pull_request"]["number"] == first_publication["pull_request"]["number"]
@@ -522,15 +541,7 @@ def main():
             assert result["state"] == "BLOCKED" and state()["stop_reason"] == "REMOTE_HEAD_CONFLICT"
             actual = github("pulls/" + str(publication["pull_request"]["number"]))
             assert actual["head"]["sha"] == human_sha and actual["draft"] is True
-            records = {}
-            with database.engine.connect() as connection:
-                metadata = MetaData()
-                metadata.reflect(bind=connection)
-                for name, table in metadata.tables.items():
-                    records[name] = [
-                        dict(row) for row in connection.execute(select(table)).mappings()
-                    ]
-            (output / "database.json").write_text(json.dumps(records, indent=2, default=str))
+            records = save_database(output)
             artifact_manifest = {
                 p.relative_to(output).as_posix(): hashlib.sha256(p.read_bytes()).hexdigest()
                 for p in (output / "artifacts").rglob("*")
@@ -590,6 +601,24 @@ def main():
                 flush=True,
             )
         finally:
+            if not (output / "evaluation.json").exists():
+                try:
+                    save_database(output)
+                    (output / "evaluation-error.json").write_text(
+                        json.dumps(
+                            {
+                                "evaluation": "SF17_PUBLICATION_TRANSPORT",
+                                "result": "INCOMPLETE",
+                                "revision": identity["revision"],
+                                "code_digest": identity["code_digest"],
+                                "created_at": time.time(),
+                                "base_ref": args.base_ref,
+                            },
+                            indent=2,
+                        )
+                    )
+                except Exception:
+                    (output / "export-error.txt").write_text("failed to preserve the disposable DB")
             for process in reversed(processes):
                 process.terminate()
                 try:

@@ -6,6 +6,7 @@ import io
 import subprocess
 import tarfile
 import tempfile
+import time
 from contextlib import contextmanager
 from pathlib import Path
 from urllib.parse import quote, urlsplit
@@ -353,6 +354,37 @@ class GitHubDraftPublisher:
             state="OPEN",
         ).model_dump()
 
+    def _wait_head(self, target):
+        observed = None
+        for attempt in range(4):
+            observed = self.ref(target, target["head_ref"])
+            if observed == target["candidate"]["head_sha"]:
+                return
+            if observed != target["expected_remote_head"]:
+                raise PublicationError("REMOTE_HEAD_CONFLICT", observed_head=observed)
+            if attempt < 3:
+                time.sleep(2**attempt)
+        raise PublicationError("PUBLISH_UNKNOWN", unknown=True, observed_head=observed)
+
+    def _wait_draft(self, target, number):
+        for attempt in range(4):
+            self._wait_head(target)
+            try:
+                return self._normalize(
+                    self._request("GET", target, "/pulls/" + str(number)), target
+                )
+            except PublicationError as error:
+                if (
+                    error.reason != "PR_CONFLICT"
+                    or error.observed_head != target["expected_remote_head"]
+                ):
+                    raise
+                if attempt == 3:
+                    raise PublicationError(
+                        "PUBLISH_UNKNOWN", unknown=True, observed_head=error.observed_head
+                    ) from None
+            time.sleep(2**attempt)
+
     def publish(self, inputs):
         self.trace.clear()
         operation = inputs["operation"]
@@ -386,9 +418,7 @@ class GitHubDraftPublisher:
         with self.git.prepare(inputs) as root:
             if head != target["candidate"]["head_sha"]:
                 self.git.push(root, operation)
-        observed = self.ref(target, target["head_ref"])
-        if observed != target["candidate"]["head_sha"]:
-            raise PublicationError("REMOTE_HEAD_CONFLICT", observed_head=observed)
+        self._wait_head(target)
         if self.ref(target, target["base_ref"]) != target["candidate"]["base_sha"]:
             raise PublicationError("BASE_CHANGED")
         if not pulls:
@@ -416,4 +446,4 @@ class GitHubDraftPublisher:
             number = result["number"]
         else:
             number = pulls[0]["number"]
-        return self._normalize(self._request("GET", target, "/pulls/" + str(number)), target)
+        return self._wait_draft(target, number)

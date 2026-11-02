@@ -34,7 +34,7 @@ def backend(publication, tmp_path):
         capture_output=True,
     )
     policy = SourcePolicy((operation["target"]["remote_url"],))
-    state = {"http": [], "pushes": 0, "pulls": [], "race": False, "roots": []}
+    state = {"http": [], "pushes": 0, "pulls": [], "race": False, "roots": [], "lag_reads": 0}
 
     def remote_head():
         result = subprocess.run(
@@ -131,7 +131,11 @@ def backend(publication, tmp_path):
                 return httpx.Response(201, json=pull(123))
             return httpx.Response(200, json=[pull(n) for n in state["pulls"]])
         if request.url.path == prefix + "/pulls/123":
-            return httpx.Response(200, json=pull(123))
+            value = pull(123)
+            if state["lag_reads"]:
+                state["lag_reads"] -= 1
+                value["head"]["sha"] = operation["target"]["expected_remote_head"]
+            return httpx.Response(200, json=value)
         raise AssertionError("unexpected provider route")
 
     client = httpx.Client(base_url="https://api.github.com", transport=httpx.MockTransport(handler))
@@ -168,6 +172,34 @@ def test_human_commit_racing_after_preflight_is_preserved_by_explicit_lease(back
     assert state["pulls"] == []
     assert not [item for item in state["http"] if item[0] == "POST"]
     assert all(not root.exists() for root in state["roots"])
+
+
+@pytest.mark.parametrize("lag,expected", [(2, "SUCCEEDED"), (10, "UNKNOWN")])
+def test_stale_pr_view_retries_reads_without_repeating_push_or_creation(
+    backend, monkeypatch, lag, expected
+):
+    pub, api, inputs, state, head = backend
+    monkeypatch.setattr("software_factory.publisher_backend.time.sleep", lambda seconds: None)
+    state["lag_reads"] = lag
+    if expected == "SUCCEEDED":
+        result = api.publish(inputs)
+        assert result["head_sha"] == head()
+    else:
+        with pytest.raises(PublicationError) as unknown:
+            api.publish(inputs)
+        assert unknown.value.reason == "PUBLISH_UNKNOWN" and unknown.value.unknown is True
+        response = pub.report(
+            inputs["operation"],
+            {
+                "delivery_id": "stale-view",
+                "target_hash": inputs["operation"]["target_hash"],
+                "status": "UNKNOWN",
+                "reason": "PUBLISH_UNKNOWN",
+            },
+        )
+        assert response.status_code == 200 and pub.world.run()["phase"] == "PUBLISH_UNKNOWN"
+    assert state["pushes"] == 1 and state["pulls"] == [123]
+    assert sum(method == "POST" for method, _ in state["http"]) == 1
 
 
 @pytest.mark.parametrize("change", ["archive", "manifest", "tree", "commit", "write_policy"])
