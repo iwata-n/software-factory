@@ -4,7 +4,7 @@
 
 2026年11月2日更新。全24タスクを151件の受け入れ条件と共通6条件に具体化し、前提・操作・期待結果・検証方法を定義した。以下の数値と選択肢は個人用MVPの受け入れ基準であり、現行コードの動作保証や外部提供のSLAではない。実行設定や実データの保持期間は、この文書の更新だけでは変更しない。
 
-SF-01〜07を再評価し、不足する基盤実装とAC付き試験を追加した。PostgreSQL 17で327ケースが成功し、49件の条件別証拠を生成した。現時点では実GitHub CIとArtifact照合のSF-01-AC06だけが未検証で、受入確定を待つ。SF-08以降は未判定。現在の実行は `PLAN → VALIDATE → IMPLEMENT` を模擬し、`ASSEMBLE_CANDIDATE` で `BLOCKED / CANDIDATE_PIPELINE_NOT_IMPLEMENTED` に停止する。
+SF-01〜07を再評価し、不足する基盤実装とAC付き試験を追加した。ローカルと実GitHub CIのPostgreSQL 17で各327ケースが成功し、取得済みArtifactと対象SHAを照合した。全43 ACと共通6条件の証拠49件がPASSとなり、SF-01〜07を受け入れ済みとする。SF-08以降は未判定。現在の実行は `PLAN → VALIDATE → IMPLEMENT` を模擬し、`ASSEMBLE_CANDIDATE` で `BLOCKED / CANDIDATE_PIPELINE_NOT_IMPLEMENTED` に停止する。
 
 ## マイルストーンと依存関係
 
@@ -16,21 +16,21 @@ SF-01〜07を再評価し、不足する基盤実装とAC付き試験を追加�
 | M4 外部公開 | Draft PRとCIを冪等に照合する | SF-17〜SF-19 | 応答消失、古いCI、キャンセル競合で誤公開・誤合格しない |
 | M5 実タスク | 実AgentとSandboxを接続し、小タスクを完走する | SF-20〜SF-24 | 必須受け入れ試験と運用手順を満たし、実Draft PRを引き渡す |
 
-M1には基盤実装がある。設計書17章の「成功分岐」はM2〜M4の証拠・公開契約と合わせて完成させる。各マイルストーンは対象タスクの全ACがPASSになったときに受け入れる。Fake AgentだけでMVP受け入れ完了とはしない。
+M1は全ACと共通条件を満たし受け入れ済み。設計書17章の「成功分岐」はM2〜M4の証拠・公開契約と合わせて完成させる。各マイルストーンは対象タスクの全ACがPASSになったときに受け入れる。Fake AgentだけでMVP受け入れ完了とはしない。
 
 ## タスク一覧
 
-各タスクはコード、必要なマイグレーション、API契約、失敗系テスト、起動・運用手順を含む。実装状態と受け入れ状態は別に記録する。SF-01〜07はローカル再評価まで完了し、実CI証拠を待つ。
+各タスクはコード、必要なマイグレーション、API契約、失敗系テスト、起動・運用手順を含む。実装状態と受け入れ状態は別に記録する。SF-01〜07は実CIとArtifact照合まで完了した。対象revisionと証拠は末尾の再評価結果に記載する。
 
 | ID | タスクと成果物 | 依存 | 受け入れ条件 | 実装状態 | 受入状態 |
 |---|---|---|---|---|---|
-| [SF-01](#sf-01-開発環境とマイグレーション) | 開発環境・DB移行・CI・起動手順 | なし | SF-01-AC01〜06 | 基盤実装あり | 未判定 |
-| [SF-02](#sf-02-workspaceとtaskspec版の境界) | Workspace・Task・仕様版・認証境界 | SF-01 | SF-02-AC01〜06 | 基盤実装あり | 未判定 |
-| [SF-03](#sf-03-run-compilerと固定スナップショット) | Run Compiler・固定snapshot | SF-02 | SF-03-AC01〜06 | 基盤実装あり | 未判定 |
-| [SF-04](#sf-04-純粋な遷移とplan検証) | 純粋な遷移・Plan Validator | SF-03 | SF-04-AC01〜06 | 基盤実装あり | 未判定 |
-| [SF-05](#sf-05-jobとleaseの永続制御) | Job・Attempt・Lease・Scheduler・Reconciler | SF-04 | SF-05-AC01〜07 | 基盤実装あり | 未判定 |
-| [SF-06](#sf-06-http-workerとfake-agent) | HTTP Worker・Agent契約・Fake Agent | SF-05 | SF-06-AC01〜06 | 基盤実装あり | 未判定 |
-| [SF-07](#sf-07-キャンセルと永続イベント) | 取消・Graph・イベント・Outbox | SF-05、SF-06 | SF-07-AC01〜06 | 基盤実装あり | 未判定 |
+| [SF-01](#sf-01-開発環境とマイグレーション) | 開発環境・DB移行・CI・起動手順 | なし | SF-01-AC01〜06 | 実装済み | 受け入れ済み |
+| [SF-02](#sf-02-workspaceとtaskspec版の境界) | Workspace・Task・仕様版・認証境界 | SF-01 | SF-02-AC01〜06 | 実装済み | 受け入れ済み |
+| [SF-03](#sf-03-run-compilerと固定スナップショット) | Run Compiler・固定snapshot | SF-02 | SF-03-AC01〜06 | 実装済み | 受け入れ済み |
+| [SF-04](#sf-04-純粋な遷移とplan検証) | 純粋な遷移・Plan Validator | SF-03 | SF-04-AC01〜06 | 実装済み | 受け入れ済み |
+| [SF-05](#sf-05-jobとleaseの永続制御) | Job・Attempt・Lease・Scheduler・Reconciler | SF-04 | SF-05-AC01〜07 | 実装済み | 受け入れ済み |
+| [SF-06](#sf-06-http-workerとfake-agent) | HTTP Worker・Agent契約・Fake Agent | SF-05 | SF-06-AC01〜06 | 実装済み | 受け入れ済み |
+| [SF-07](#sf-07-キャンセルと永続イベント) | 取消・Graph・イベント・Outbox | SF-05、SF-06 | SF-07-AC01〜06 | 実装済み | 受け入れ済み |
 | [SF-08](#sf-08-repository接続とsha解決) | Repository接続・実SHA解決 | SF-03 | SF-08-AC01〜06 | 未着手 | 未判定 |
 | [SF-09](#sf-09-artifactのライフサイクル) | Artifact予約・確定・取得・回収 | SF-02、SF-05 | SF-09-AC01〜07 | 未着手 | 未判定 |
 | [SF-10](#sf-10-隔離assemblerとcandidate) | 隔離Assembler・不変Candidate | SF-08、SF-09 | SF-10-AC01〜07 | 未着手 | 未判定 |
@@ -509,7 +509,7 @@ uv run ruff format --check .
 
 ## 次の実装単位
 
-SF-01〜07のローカル再評価は完了した。実CIとArtifactを照合して受入を確定した後、次の機能実装単位SF-08〜10へ進む。固定SHA取得、Artifact確定、最小隔離AssemblerによるCandidate作成をつなぎ、これらの全AC合格後にSF-11/12へ進む。
+SF-01〜07は実CIとArtifact照合まで完了した。次の機能実装単位はSF-08〜10とする。固定SHA取得、Artifact確定、最小隔離AssemblerによるCandidate作成をつなぎ、これらの全AC合格後にSF-11/12へ進む。
 
 受け入れ設定は上記の値で固定する。実環境の設定manifestとして、評価用HTTPS Repository/Integration ID、実Agentのengine/model/料金版、image digest、許可接続先、検証command/AC対応、通知先、backup保存先を担当タスクの開始時に記入する。未設定や資格情報不足は該当ACを未検証とし、代替Fakeで合格扱いにしない。値の変更はPolicy/manifestの新版と影響ACの再検証を必要とする。
 
@@ -517,26 +517,28 @@ SF-01〜07のローカル再評価は完了した。実CIとArtifactを照合し
 
 2026年11月2日、Python 3.11.15と一時PostgreSQL 16.2で全58テストが通過した。Lease失効・完了再送・越境拒否・同時Claimに加え、管理CLIの発行と失効、デモ登録、DB資格情報を持たない別プロセスWorker、Control Planeのプロセス再起動を含む。Ruffのlint・format検査、依存ロックとの一致、マイグレーションとモデルの一致も確認した。
 
-StarletteのTestClientからhttpx利用に対する非推奨警告が1件出る。アプリWorkerのHTTP通信はhttpxを使用する。CIはPostgreSQL 17向けのworkflowを追加済みで、GitHub上での実行はまだ行っていない。
+この初回検証ではStarletteのTestClientからhttpx利用に対する非推奨警告が1件出た。アプリWorkerのHTTP通信はhttpxを使用する。この時点ではPostgreSQL 17向けworkflowの追加までで、GitHub上の実行は未実施だった。今回の実行結果は以下に記録する。
 
 この58件は初回実装時の記録であり、新ACの受け入れ結果とは分けて保持する。受け入れ条件を具体化した段階では文書だけを変更し、今回の再評価で以下の実装・試験を追加した。既存の実データに対する削除や本番設定変更は行っていない。
 
-今回の文書検証では、24タスク/151 AC/共通6条件/AT 12件の網羅、IDの一意性と連番、一覧のAC範囲、全参照の解決、タスク依存の非循環、表の列数、節リンク、既存試験名、実行例のshell構文を確認した。追加ACの実行・実サービス接続試験は含めていない。
+受け入れ条件を具体化した時点の文書検証では、24タスク/151 AC/共通6条件/AT 12件の網羅、IDの一意性と連番、一覧のAC範囲、全参照の解決、タスク依存の非循環、表の列数、節リンク、既存試験名、実行例のshell構文を確認した。この文書検証自体には追加ACの実行・実サービス接続試験を含めていなかった。
 
-## SF01から07の再評価結果
+## SF-01〜07の再評価結果
 
-2026年11月2日、Python 3.11.15・実PostgreSQL 17.11で追加269ケースと既存58ケース、合計327ケースが成功した。skip/xfailは0。Ruffのlint/formatも成功した。条件別証拠は43 AC＋共通6条件の49件で、独立した証拠検査により入力コード/設定digest、JUnit case、fixture digest、環境、期待/実測の記録を照合した。実CI証拠が必要なSF-01-AC06はまだ未検証として維持する。
+2026年11月2日、ローカルのPython 3.11.15・実PostgreSQL 17.11で追加269ケースと既存58ケース、合計327ケースが成功した（53.75秒）。実GitHub ActionsでもPython 3.11.18・PostgreSQL 17.11で同じ327ケースが成功した（94.95秒）。両環境ともskip/xfailは0。Ruffのlint/format、空schema/0001からのupgrade、モデル差分0も成功した。
 
-| 対象 | 補完した実装と主な検証 | ローカル結果 |
+条件別証拠は43 AC＋共通6条件の49件。取得した実CI Artifactに対して、入力コード/設定digest、JUnit case、fixture digest、環境、期待/実測、GitHub実runのhead SHAを独立した証拠検査で照合し、49件すべてPASS・未検証0を確認した。SF-01-AC06も実CI成功とREADMEの新規環境再現を満たした。
+
+| 対象 | 補完した実装と主な検証 | 最終受け入れ結果 |
 |---|---|---|
-| SF-01 | 0001→0002のデータ保持、空schemaの移行、health 503、空venvのlocked installとREADMEの別プロセス再現、証拠Artifact用CI | AC01〜05 PASS、AC06のREADME再現PASS・実CI待ち |
+| SF-01 | 0001→0002のデータ保持、空schemaの移行、health 503、空venvのlocked installとREADMEの別プロセス再現、実CI Artifact取得 | AC01〜06 PASS |
 | SF-02 | 全Public/Worker APIの401/403/404 matrix、別Workspace/ProjectのFK、並行仕様版、Enrollment 20回競合と期限境界、100回pool切替 | 6 AC PASS |
 | SF-03 | DB TX外のresolver境界、解決失敗時のRun/Job作成0と監査、全snapshot項目、現在のRepository/Worker権限優先、同時開始20回と応答再送 | 6 AC PASS |
 | SF-04 | 決定論的遷移のI/O禁止と100回反復、重複AC/依存/未知工程拒否、保護pathと実symlink調査、終端/待機からの進行拒否 | 6 AC PASS |
 | SF-05 | 永続Job依存・priority順、Worker/Run slot競合を各20回、Lease期限境界、実Supervisor kill→再割当、2/4秒再試行、20秒PollのTXなし、各commit前障害 | 7 AC PASS |
 | SF-06 | HTTP-onlyプロセス、Fakeの3分岐、受理後応答消失の同一再送、期限監視と非同期Heartbeat、非対応/恒久エラー停止、Adapter eventsと429/503再送 | 6 AC PASS |
 | SF-07 | queued/retry/active取消、40回のHeartbeat/完了競合、論理失効と物理停止の区別、5状態の実CP再起動、sequence 1/3/2/2と競合rollback、再起動後再送 | 6 AC PASS |
-| 共通 | 変更API全種のキー必須/同内容再送/別内容409、監査/Outbox/費用の同TX、入力一致と証拠検査、秘密値/秘密を含むキー/エラー応答のマスク | C-01〜06 PASS、実CIの最終照合はAC06で追跡 |
+| 共通 | 変更API全種のキー必須/同内容再送/別内容409、監査/Outbox/費用の同TX、入力一致と証拠検査、秘密値/秘密を含むキー/エラー応答のマスク | C-01〜06 PASS |
 
 証拠生成の実行コマンドは次のとおり。`FACTORY_POSTGRES_BIN` はPostgreSQL 17の実binを指定する。CIではPostgreSQL 17 serviceとTEST_DATABASE_URLを使って同じpytestを実行する。
 
@@ -547,4 +549,30 @@ FACTORY_POSTGRES_BIN='/path/to/postgresql17/bin' \
 uv run python scripts/verify_acceptance.py .local/acceptance/current --allow-ci-pending
 ```
 
-`current` は検証中の保存先とし、実CIの証拠は入力revisionを識別できる別ディレクトリへ確定保存する。`--allow-ci-pending` はSF-01-AC06だけを未検証のまま許し、それ以外の失敗/欠落を合格にはしない。GitHubの成功runとArtifactの取得後に最終受入状態を更新する。
+`current` はローカル検証中の保存先とし、実CIの証拠は以下の入力revision別ディレクトリへ確定保存した。`--allow-ci-pending` はCI実行中にSF-01-AC06だけを未検証として許すオプション。最終検査はこのオプションなしで実行し、未検証を残さない。
+
+| 証拠の識別子 | 確認した値 |
+|---|---|
+| 実装・試験のcommit SHA | `e4fe06835e424d8e2a3c84ffe4c60ead23b5eeb5` |
+| コード・試験・設定・AC定義のSHA-256 | `4df51eb3d448fde8dfa799cfc3486150b7b2ea79d8297d745f337d9727ac9243` |
+| 実CI | [control-plane / run 41371266984](https://github.com/iwata-n/software-factory/actions/runs/41371266984)、push起動、対象head一致、conclusion=success |
+| 実CI Artifact | [sf01-07-acceptance / 13108974860](https://github.com/iwata-n/software-factory/actions/runs/41371266984/artifacts/13108974860)、取得時非失効、保存期間30日 |
+| 取得ZIPのSHA-256 | `683587266e07f8459cb6cce366e16abf0b660cbf99e281dcc8f205348241cecc`。GitHub APIのArtifact digestと実ファイルdigestが一致 |
+| 確定保存先 | `.local/acceptance/e4fe06835e424d8e2a3c84ffe4c60ead23b5eeb5+inputs-4df51eb3d448fde8/` |
+| 条件別結果 | 上記保存先の `SF-01/`〜`SF-07/` と `common/` に49件のJSON。全ACをpytest `ac` markerと実JUnit caseへ対応付けた |
+| 全体結果 | `summary.json` は49件PASS、`external_pending=[]`。`manifest.json` に環境/時刻/入力一覧、`junit.xml` に327件、`github-verification.json` に実run/Artifact照合結果 |
+
+```sh
+uv run python scripts/collect_ci_evidence.py \
+  --repository iwata-n/software-factory --run-id 41371266984 \
+  --output .local/acceptance/e4fe06835e424d8e2a3c84ffe4c60ead23b5eeb5+inputs-4df51eb3d448fde8
+uv run python scripts/verify_acceptance.py \
+  .local/acceptance/e4fe06835e424d8e2a3c84ffe4c60ead23b5eeb5+inputs-4df51eb3d448fde8
+# {"verified_records": 49, "external_pending": []}
+```
+
+証拠の入力digestには対象コード、試験、workflow、依存lock、README、AC定義、固定試験設定を含む。結果追記や一覧の受入状態だけの文書変更は入力から除外する。今回の結果追記でAC定義・固定試験設定・実装は変更していない。ローカルの未commit検証とCIのcommit検証は別のmanifestに保存し、実CIの証拠は上記commitの結果として扱う。
+
+警告はテストでStarlette TestClientのhttpx利用非推奨が1件、ActionsでNode 20対象actionのNode 24強制実行とubuntu-latest移行の通知がある。いずれも実行成功を確認した。依存/action/runnerの更新は別変更としてlock・環境を記録して再評価する。
+
+SF-03の公開認可とSF-07の承認/CI待機の復旧は境界Fakeの契約試験。実Repository取得、Candidate、実Agent、OS隔離、公開・外部CI同期の受け入れはSF-08以降に残る。今回のGitHub Actions成功はこの基盤コードのCI検証であり、SF-18の製品機能を実装済みにしたものではない。
