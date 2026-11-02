@@ -150,6 +150,7 @@ class CandidateCommands:
         run.current_candidate_id = item.id
         payload = {
             "candidate_id": item.id,
+            "candidate": candidate_view(item),
             "source_artifact_id": item.source_artifact_id,
             "input_artifact_ids": [item.source_artifact_id],
         }

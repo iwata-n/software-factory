@@ -1,4 +1,4 @@
-"""Trusted runner entry point. Never imports or executes fetched repository code."""
+"""Trusted runner: source/assembly never execute code; verification uses a fixed profile."""
 
 import base64
 import hashlib
@@ -7,6 +7,7 @@ import json
 import os
 import posixpath
 import re
+import signal
 import subprocess
 import sys
 import tarfile
@@ -340,6 +341,118 @@ def assemble(data):
     }
 
 
+def verify(data):
+    candidate = data["candidate"]
+    root = Path("/candidate")
+    entries = []
+    for path in sorted(root.rglob("*")):
+        name = path.relative_to(root).as_posix()
+        if not canonical_path(name) or any(p.lower() == ".git" for p in name.split("/")):
+            raise Refused("CANDIDATE_PATH_DENIED")
+        if path.is_symlink():
+            entries.append((name, "120000", os.readlink(path).encode()))
+        elif path.is_file():
+            entries.append(
+                (name, "100755" if path.stat().st_mode & 0o111 else "100644", path.read_bytes())
+            )
+        elif not path.is_dir():
+            raise Refused("CANDIDATE_FILE_TYPE_DENIED")
+    validate_links(entries)
+    fingerprint = hashlib.sha256()
+    manifest = {}
+    git("init", "-q", ".")
+    for name, mode, body in entries:
+        fingerprint.update(
+            name.encode() + b"\0" + mode.encode() + b"\0" + hashlib.sha256(body).digest()
+        )
+        manifest[name] = hashlib.sha256(body).hexdigest()
+        oid = git("hash-object", "-w", "--no-filters", "--stdin", input=body).decode().strip()
+        git("update-index", "--add", "--cacheinfo", mode, oid, name)
+    if (
+        fingerprint.hexdigest() != candidate["source_digest"]
+        or manifest != candidate["metadata_body"]["file_manifest"]
+        or git("write-tree").decode().strip() != candidate["tree_sha"]
+    ):
+        raise Refused("CANDIDATE_CONTENT_MISMATCH")
+    commit = base64.b64decode(candidate["metadata_body"]["commit_object"], validate=True)
+    if (
+        not commit.startswith(("tree " + candidate["tree_sha"] + "\n").encode())
+        or git("hash-object", "-t", "commit", "--stdin", input=commit).decode().strip()
+        != candidate["head_sha"]
+    ):
+        raise Refused("CANDIDATE_COMMIT_MISMATCH")
+    for name, expected in data["profile"].get("protected_manifest", {}).items():
+        if manifest.get(name) != expected:
+            raise Refused("PROTECTED_VERIFICATION_CHANGE")
+    observations = []
+    if data["operation"] == "verify":
+        for command in data["profile"].get("commands", []):
+            report = Path(command["junit_path"])
+            if not canonical_path(command["junit_path"]):
+                raise Refused("REPORT_PATH_DENIED")
+            if any(p.is_symlink() for p in (report, *report.parents)):
+                raise Refused("REPORT_PATH_DENIED")
+            report.parent.mkdir(parents=True, exist_ok=True)
+            report.unlink(missing_ok=True)
+            log_path = Path("/tmp/check.log")
+            log_path.unlink(missing_ok=True)
+            started = time.time()
+            state, exit_code = "EXECUTED", None
+            with log_path.open("wb") as log:
+                process = None
+                try:
+                    process = subprocess.Popen(
+                        command["argv"],
+                        cwd="/work",
+                        env={
+                            **ENV,
+                            "PYTHONPATH": "/candidate:/candidate/src",
+                            "PYTHONDONTWRITEBYTECODE": "1",
+                            "PYTEST_DISABLE_PLUGIN_AUTOLOAD": "1",
+                        },
+                        stdout=log,
+                        stderr=subprocess.STDOUT,
+                        start_new_session=True,
+                    )
+                    exit_code = process.wait(timeout=command["timeout_seconds"])
+                except subprocess.TimeoutExpired:
+                    state = "TIMEOUT"
+                    os.killpg(process.pid, signal.SIGTERM)
+                    try:
+                        process.wait(timeout=5)
+                    except subprocess.TimeoutExpired:
+                        os.killpg(process.pid, signal.SIGKILL)
+                        process.wait(timeout=2)
+                    exit_code = process.returncode
+                except OSError:
+                    state = "START_FAILED"
+            junit = None
+            if (
+                not any(p.is_symlink() for p in (report, *report.parents))
+                and report.is_file()
+                and report.stat().st_size <= 16 * 1024 * 1024
+            ):
+                junit = base64.b64encode(report.read_bytes()).decode()
+            with log_path.open("rb") as log:
+                raw_log = log.read(8 * 1024 * 1024)
+            observations.append(
+                {
+                    "check_id": command["check_id"],
+                    "execution_state": state,
+                    "exit_code": exit_code,
+                    "started_at": started,
+                    "finished_at": time.time(),
+                    "log": base64.b64encode(raw_log).decode(),
+                    "junit": junit,
+                }
+            )
+    return {
+        "checks": observations,
+        "source_digest": fingerprint.hexdigest(),
+        "file_manifest": manifest,
+    }
+
+
 def main():
     try:
         data = json.loads(sys.stdin.buffer.read(1024 * 1024))
@@ -347,6 +460,8 @@ def main():
             result = fetch(data)
         elif data.get("operation") == "assemble":
             result = assemble(data)
+        elif data.get("operation") in {"verify", "inspect_candidate"}:
+            result = verify(data)
         else:
             raise Refused("RUNNER_OPERATION_UNSUPPORTED")
         print(json.dumps({"ok": True, **result}))

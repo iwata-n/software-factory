@@ -94,7 +94,104 @@ class DockerRunner:
                 removed.append(container)
             finally:
                 os.close(fd)
+        volumes = self.docker(
+            "volume",
+            "ls",
+            "-q",
+            "--filter",
+            "label=factory.namespace=" + self.namespace,
+            timeout=10,
+        )
+        if volumes.returncode:
+            raise RunnerError("CONTAINER_RUNTIME_UNAVAILABLE")
+        for volume in volumes.stdout.decode().split():
+            inspected = self.docker("volume", "inspect", volume, timeout=5)
+            if inspected.returncode:
+                continue
+            labels = json.loads(inspected.stdout)[0].get("Labels") or {}
+            owner = labels.get("factory.owner", "")
+            if owner == self.owner or not re.fullmatch(r"[0-9a-f]{32}", owner):
+                continue
+            try:
+                fd = os.open(self.state_root / (owner + ".lock"), os.O_RDWR | os.O_NOFOLLOW)
+            except OSError:
+                continue
+            try:
+                try:
+                    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                except BlockingIOError:
+                    continue
+                result = self.docker("volume", "rm", volume, timeout=7)
+                if result.returncode:
+                    raise RunnerError("ORPHAN_VOLUME_CLEANUP_UNCONFIRMED")
+                removed.append(volume)
+            finally:
+                os.close(fd)
         return removed
+
+    def execute_candidate(self, request, archive, *, timeout=120, cancelled=None):
+        from .candidate_mount import readonly_tar
+
+        self.verify_image()
+        started = time.monotonic()
+        volume = "factory-candidate-" + uuid4().hex
+        helper = "factory-volume-" + uuid4().hex
+        packed = readonly_tar(archive)
+        created = self.docker(
+            "volume",
+            "create",
+            "--label",
+            "factory.namespace=" + self.namespace,
+            "--label",
+            "factory.owner=" + self.owner,
+            volume,
+            timeout=10,
+        )
+        if created.returncode:
+            raise RunnerError("CANDIDATE_VOLUME_CREATE_FAILED")
+        try:
+            prepared = self.docker(
+                "create",
+                "--name",
+                helper,
+                "--read-only",
+                "--network",
+                "none",
+                "--user",
+                "65532:65532",
+                "--label",
+                "factory.namespace=" + self.namespace,
+                "--label",
+                "factory.owner=" + self.owner,
+                "--mount",
+                "type=volume,source=" + volume + ",target=/candidate",
+                "--entrypoint",
+                "true",
+                self.image_digest,
+                timeout=10,
+            )
+            if prepared.returncode:
+                raise RunnerError("CANDIDATE_VOLUME_PREPARE_FAILED")
+            copied = self.docker(
+                "cp",
+                "-",
+                helper + ":/candidate",
+                input=packed,
+                timeout=max(1, min(30, timeout - 10 - (time.monotonic() - started))),
+            )
+            if copied.returncode:
+                raise RunnerError("CANDIDATE_VOLUME_COPY_FAILED")
+            return self.execute(
+                request,
+                timeout=timeout - (time.monotonic() - started),
+                cancelled=cancelled,
+                candidate_volume=volume,
+            )
+        finally:
+            self.docker("rm", "--force", helper, timeout=7)
+            removed = self.docker("volume", "rm", volume, timeout=7)
+            if removed.returncode:
+                raise RunnerError("CANDIDATE_VOLUME_CLEANUP_FAILED")
 
     @staticmethod
     def docker(*args, **kwargs):
@@ -127,6 +224,7 @@ class DockerRunner:
         network: bool = False,
         cancelled: Event | None = None,
         pause_at: str | None = None,
+        candidate_volume: str | None = None,
     ) -> RunnerResult:
         self.verify_image()
         if timeout <= 10 or (cancelled and cancelled.is_set()):
@@ -171,6 +269,13 @@ class DockerRunner:
         ]
         if pause_at:
             args += ["--env", "FACTORY_TEST_PAUSE_AT=" + pause_at]
+        if candidate_volume:
+            if not re.fullmatch(r"factory-candidate-[0-9a-f]{32}", candidate_volume):
+                raise ValueError("only supervisor-owned candidate volumes are allowed")
+            args += [
+                "--mount",
+                "type=volume,source=" + candidate_volume + ",target=/candidate,readonly",
+            ]
         args += [self.image_digest]
         started = time.monotonic()
         with self._lock:
@@ -204,6 +309,8 @@ class DockerRunner:
                     break
                 except subprocess.TimeoutExpired:
                     encoded = None
+            if cancelled and cancelled.is_set():
+                raise RunnerError("RUNNER_CANCELLED")
             try:
                 body = json.loads(stdout)
             except (ValueError, UnicodeDecodeError):

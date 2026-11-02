@@ -2,9 +2,9 @@
 
 [設計書 v0.4](docs/Software_Factory_Design_v0.4.md) に基づくソフトウェアファクトリーの初期実装です。[実装計画](docs/Implementation_Plan.md) にタスク、依存関係、完了条件、受け入れ試験の対応を記載しています。
 
-FastAPIのControl Plane、PostgreSQL、Leaseで接続する別プロセスWorker、Source Runner、Artifact、不変Candidateと管理対象Assemblerを実装しています。既定のFake Agentは `PLAN → 計画検証 → IMPLEMENT` を模擬実行し、変更patchを作らないため `BLOCKED / CHANGE_ARTIFACT_MISSING` で停止します。実Agent、独立検証、PR作成、MVP全体の成功判定は後続です。
+FastAPIのControl Plane、PostgreSQL、Leaseで接続する別プロセスWorker、Source Runner、Artifact、不変Candidateと管理対象Assemblerを実装しています。既定のFake Agentは `PLAN → 計画検証 → IMPLEMENT` を模擬実行し、変更patchを作らないため `BLOCKED / CHANGE_ARTIFACT_MISSING` で停止します。独立Verifierと構造化レビュー証拠を実装しています。実Agent、Gate、PR作成、MVP全体の成功判定は後続です。
 
-有効な変更patchを受理したRunは、管理対象Assemblerでbase/tree/digestを照合し、不変CandidateとVERIFY/REVIEWの入力Jobを作成します。後続の検証・Gateが未実装の段階ではRun成功を返しません。タスク全体の受入判定は実装計画に従います。
+有効な変更patchを受理したRunは、管理対象Assemblerでbase/tree/digestを照合し、不変CandidateとVERIFY/REVIEWの入力Jobを作成します。Verifierは固定Profileで実行し、ReviewerはAC別証拠を提出します。Gate接続前はRun成功を返しません。タスク全体の受入判定は実装計画に従います。
 
 ## ローカル起動
 
@@ -169,3 +169,14 @@ Assemblerはbase commit/tree/digestとpatchの実差分を検査します。保�
 管理対象Runnerは個別のkernel lockで所有者を示します。Supervisorをkillした場合、次のSupervisorは同じstate領域の所有者不在のコンテナだけを削除します。生存中の所有者のコンテナは削除しません。`FACTORY_RUNNER_STATE_ROOT` の標準値は `.local/runner/owners` です。これはSF-10の再試行回復であり、独立watchdogと全Sandbox停止保証はSF-21の受け入れで検証します。
 
 実装時に参照した公式資料: [FastAPIのテスト](https://fastapi.tiangolo.com/tutorial/testing/)、[SQLAlchemyの複合外部キーと制約](https://docs.sqlalchemy.org/en/20/core/constraints.html)、[PostgreSQLの行ロック](https://www.postgresql.org/docs/current/sql-select.html)。
+
+
+## 独立Verifierとレビュー証拠
+
+Project Policyの `verification_commands` にチェックID、argv、`expected_test_ids`、timeout、JUnit相対pathを設定し、`protected_manifest` に必須テスト/設定のSHA-256を登録します。Run開始時に全体をProfile/hashとして固定します。argvは管理者が設定するリストで、Agentの結果本文からcommandを採用しません。JUnit pathは `/work` からの相対path、候補コードは `/candidate` です。pytestを使う場合は固定imageに含む9.2.0を使用し、`--rootdir=/candidate` と明示した候補内テストpath、書込可能なJUnit pathを指定します。
+
+管理対象pipeline Workerの `VERIFY` は新しいネットワークなしcontainerで実行します。CandidateはDocker管理volumeへroot所有で配置し、実行時はread-only mountにします。CP/Publisher/Worker資格情報、host bind mount、Docker socketを渡しません。実行前にhead/tree/code digest、file manifest、保護manifestを再計算します。JUnitとLOGを別Artifactに確定し、CPがJUnit bytes・終了code・必須IDからCheckを導出します。timeout/起動失敗はERROR、不正/欠落/0件/全skip/必須テスト欠落はINCONCLUSIVEです。
+
+`REVIEW` は同じ固定候補を読取専用で検査し、AC別判定と位置/証拠付きFindingを保存します。実モデルbackendはSF-20で接続します。backend未設定、AC欠落、具体的な証拠参照のない判定はINCONCLUSIVEとして保存し、合格にはしません。originはWorkerの管理区分とJob種別からCPが付与し、自己申告は拒否します。古い候補・別Profile/head/image等の証拠は出所付き履歴へ保存し、`eligible=false` にします。
+
+User認証付きの `GET /v1/candidates/{id}/checks` と `/findings` で結果を取得できます。Check/FindingはDBでも追記後の変更を禁止します。VERIFY/REVIEWが両方完了した現在の停止理由は `QUALITY_GATE_NOT_IMPLEMENTED` です。SF-12で決定論的Gateへ接続します。

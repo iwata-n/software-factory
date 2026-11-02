@@ -221,6 +221,9 @@ class Service:
         self.checkpoint = checkpoint or (lambda name: None)
         self.artifacts = ArtifactCommands(self, storage)
         self.candidates = CandidateCommands(self)
+        from .evidence import EvidenceCommands
+
+        self.evidence = EvidenceCommands(self)
 
     def principal(self, session: Session, token: str, role: str) -> Principal:
         actor = session.scalar(select(Principal).where(Principal.token_hash == token_hash(token)))
@@ -546,6 +549,11 @@ class Service:
                 "schema_version": 1,
                 "commands": [command.model_dump() for command in policy.verification_commands],
                 "protected_manifest": policy.protected_manifest,
+                "review_check_ids": [
+                    name
+                    for name in spec.verification.required_checks
+                    if name in {"review", "acceptance_review"}
+                ],
             }
             snapshot["verification_profile_hash"] = digest(snapshot["verification_profile"])
         if repo.remote_url:
@@ -902,6 +910,10 @@ class Service:
                 report = self.candidates.validate(
                     session, actor, attempt, job, run, data.result, data.artifact_ids
                 )
+            elif job.kind in {"VERIFY", "REVIEW"}:
+                report = self.evidence.validate(
+                    session, actor, attempt, job, run, data.result, data.artifact_ids
+                )
         self.settle(run, attempt, data.usage_microusd)
         clean_result = scrub(data.result)
         attempt.result = scrub(data.model_dump())
@@ -961,6 +973,8 @@ class Service:
             elif job.kind == "ASSEMBLE_CANDIDATE":
                 transition(session, run, "CANDIDATE_ASSEMBLED")
                 self.candidates.create(session, actor, attempt, job, run, report)
+            elif job.kind in {"VERIFY", "REVIEW"}:
+                self.evidence.save(session, actor, attempt, job, run, report)
             else:
                 raise DomainError(409, "UNSUPPORTED_COMPLETION_KIND")
         return {"accepted": True, "attempt_id": attempt.id, "run": run_view(run)}

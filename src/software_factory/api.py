@@ -32,6 +32,8 @@ from .models import (
     Artifact,
     Attempt,
     Candidate,
+    Check,
+    Finding,
     Job,
     JobDependency,
     PlanVersion,
@@ -96,7 +98,7 @@ def create_app(
         version="0.1.0",
         lifespan=lifespan,
         description=(
-            "Local control plane with immutable Candidates and managed assembly. "
+            "Local control plane with immutable Candidates and independent evidence. "
             "Default Fake Agent produces no patch. Verification, publication and real-agent "
             "integration are tracked by the implementation plan."
         ),
@@ -265,6 +267,42 @@ def create_app(
         return service.read(
             token, lambda s, a: candidate_view(owned(s, Candidate, candidate_id, a.workspace_id))
         )
+
+    @app.get("/v1/candidates/{candidate_id}/checks", tags=["Candidates"])
+    def checks_get(candidate_id: str, token: Token):
+        from .evidence import check_view
+
+        def query(s, a):
+            owned(s, Candidate, candidate_id, a.workspace_id)
+            return [
+                check_view(c)
+                for c in s.scalars(
+                    select(Check)
+                    .where(Check.workspace_id == a.workspace_id, Check.candidate_id == candidate_id)
+                    .order_by(Check.kind, Check.key, Check.id)
+                )
+            ]
+
+        return service.read(token, query)
+
+    @app.get("/v1/candidates/{candidate_id}/findings", tags=["Candidates"])
+    def findings_get(candidate_id: str, token: Token):
+        from .evidence import finding_view
+
+        def query(s, a):
+            owned(s, Candidate, candidate_id, a.workspace_id)
+            return [
+                finding_view(f)
+                for f in s.scalars(
+                    select(Finding)
+                    .where(
+                        Finding.workspace_id == a.workspace_id, Finding.candidate_id == candidate_id
+                    )
+                    .order_by(Finding.finding_key, Finding.id)
+                )
+            ]
+
+        return service.read(token, query)
 
     @app.put("/v1/candidates/{candidate_id}", tags=["Candidates"])
     @app.patch("/v1/candidates/{candidate_id}", tags=["Candidates"])

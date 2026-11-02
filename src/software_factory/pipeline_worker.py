@@ -1,6 +1,8 @@
 """Trusted managed stages. Transport credentials stay outside the runner."""
 
 import base64
+import json
+import time
 from threading import Event, Lock, Thread
 
 import httpx
@@ -10,10 +12,13 @@ from .sandbox import DockerRunner, RunnerError
 
 
 class PipelineAdapter:
-    capabilities = Capabilities(kinds=("ASSEMBLE_CANDIDATE",), adapters=("fake", "codex_cli"))
+    capabilities = Capabilities(
+        kinds=("ASSEMBLE_CANDIDATE", "VERIFY", "REVIEW"), adapters=("fake", "codex_cli")
+    )
 
-    def __init__(self, runner: DockerRunner):
+    def __init__(self, runner: DockerRunner, *, reviewer=None):
         self.runner = runner
+        self.reviewer = reviewer
         self._result = None
         self._events = []
         self._cancel = Event()
@@ -60,52 +65,55 @@ class PipelineAdapter:
             snapshot = job["snapshot"]
             if self.runner.image_digest != snapshot["execution_image_digest"]:
                 raise RunnerError("IMAGE_DIGEST_MISMATCH")
-            if job["kind"] != "ASSEMBLE_CANDIDATE":
-                raise RunnerError("MANAGED_STAGE_UNSUPPORTED", "POLICY")
-            patch_id = job["input"]["patch_artifact_id"]
-            patch = self.input_bytes(patch_id, transport)
-            source = job.get("source")
-            if not source or source["sha"] != job["base_sha"]:
-                raise RunnerError("FIXED_SOURCE_REQUIRED", "POLICY")
-            result = self.runner.execute(
-                {
-                    "operation": "assemble",
-                    "source": source,
-                    "patch": base64.b64encode(patch).decode(),
-                    "allowed_write_paths": snapshot["policy"]["allowed_write_paths"],
-                    "protected_paths": snapshot["policy"]["protected_paths"],
-                    "protected_manifest": snapshot["policy"].get("protected_manifest", {}),
-                },
-                timeout=job["execution"]["timeout_seconds"],
-                cancelled=cancelled,
-            )
-            body = result.body
-            report = {
-                "base_sha": job["base_sha"],
-                "parent_sha": body["base_sha"],
-                "head_sha": body["head_sha"],
-                "tree_sha": body["tree"],
-                "source_digest": body["source_digest"],
-                "spec_hash": snapshot["task_spec_hash"],
-                "profile_hash": snapshot["verification_profile_hash"],
-                "image_digest": result.image_digest,
-                "source_artifact_id": "$artifact/source",
-                "patch_artifact_id": patch_id,
-                "file_manifest": body["file_manifest"],
-                "changed_paths": body["changed_paths"],
-                "commit_object": body["commit_object"],
-                "isolation": result.isolation,
-            }
-            output = ProducedArtifact(
-                "source", "SOURCE", base64.b64decode(body["archive"], validate=True)
-            )
-            events.append(
-                {
-                    "kind": "PROGRESS",
-                    "body": {"stage": job["kind"], "container_id": result.container_id},
+            if job["kind"] in {"VERIFY", "REVIEW"}:
+                result_value, events = self.execute_evidence(job, cancelled, transport)
+            elif job["kind"] == "ASSEMBLE_CANDIDATE":
+                patch_id = job["input"]["patch_artifact_id"]
+                patch = self.input_bytes(patch_id, transport)
+                source = job.get("source")
+                if not source or source["sha"] != job["base_sha"]:
+                    raise RunnerError("FIXED_SOURCE_REQUIRED", "POLICY")
+                result = self.runner.execute(
+                    {
+                        "operation": "assemble",
+                        "source": source,
+                        "patch": base64.b64encode(patch).decode(),
+                        "allowed_write_paths": snapshot["policy"]["allowed_write_paths"],
+                        "protected_paths": snapshot["policy"]["protected_paths"],
+                        "protected_manifest": snapshot["policy"].get("protected_manifest", {}),
+                    },
+                    timeout=job["execution"]["timeout_seconds"],
+                    cancelled=cancelled,
+                )
+                body = result.body
+                report = {
+                    "base_sha": job["base_sha"],
+                    "parent_sha": body["base_sha"],
+                    "head_sha": body["head_sha"],
+                    "tree_sha": body["tree"],
+                    "source_digest": body["source_digest"],
+                    "spec_hash": snapshot["task_spec_hash"],
+                    "profile_hash": snapshot["verification_profile_hash"],
+                    "image_digest": result.image_digest,
+                    "source_artifact_id": "$artifact/source",
+                    "patch_artifact_id": patch_id,
+                    "file_manifest": body["file_manifest"],
+                    "changed_paths": body["changed_paths"],
+                    "commit_object": body["commit_object"],
+                    "isolation": result.isolation,
                 }
-            )
-            result_value = AgentResult("EXECUTED", report, artifacts=(output,))
+                output = ProducedArtifact(
+                    "source", "SOURCE", base64.b64decode(body["archive"], validate=True)
+                )
+                events.append(
+                    {
+                        "kind": "PROGRESS",
+                        "body": {"stage": job["kind"], "container_id": result.container_id},
+                    }
+                )
+                result_value = AgentResult("EXECUTED", report, artifacts=(output,))
+            else:
+                raise RunnerError("MANAGED_STAGE_UNSUPPORTED", "POLICY")
         except RunnerError as error:
             result_value = AgentResult("FAILED", {}, category=error.category, reason=error.code)
         except httpx.HTTPStatusError as error:
@@ -130,6 +138,127 @@ class PipelineAdapter:
                 if generation == self._generation:
                     self._events.extend(events)
                     self._result = result_value
+
+    def execute_evidence(self, job, cancelled, transport):
+        candidate = job["input"]["candidate"]
+        profile = job["snapshot"]["verification_profile"]
+        archive = self.input_bytes(job["input"]["source_artifact_id"], transport)
+        target = {
+            key: candidate[key]
+            for key in (
+                "candidate_id",
+                "head_sha",
+                "source_digest",
+                "spec_hash",
+                "profile_hash",
+                "image_digest",
+            )
+        }
+        started = time.time()
+        try:
+            outcome = self.runner.execute_candidate(
+                {
+                    "operation": "verify" if job["kind"] == "VERIFY" else "inspect_candidate",
+                    "candidate": candidate,
+                    "profile": profile,
+                },
+                archive,
+                timeout=job["execution"]["timeout_seconds"],
+                cancelled=cancelled,
+            )
+            observations, isolation = outcome.body["checks"], outcome.isolation
+            events = [
+                {
+                    "kind": "PROGRESS",
+                    "body": {"stage": job["kind"], "container_id": outcome.container_id},
+                }
+            ]
+        except RunnerError as error:
+            if job["kind"] != "VERIFY" or error.category == "POLICY" or cancelled.is_set():
+                raise
+            observations = [
+                {
+                    "check_id": command["check_id"],
+                    "execution_state": "START_FAILED",
+                    "started_at": started,
+                    "finished_at": time.time(),
+                    "exit_code": None,
+                    "log": base64.b64encode(error.code.encode()).decode(),
+                    "junit": None,
+                }
+                for command in profile.get("commands", [])
+            ]
+            isolation, events = {"start_failed": True}, []
+        report = {
+            "target": target,
+            "isolation": isolation,
+            "checks": [],
+            "criteria": [],
+            "findings": [],
+        }
+        outputs = []
+        if job["kind"] == "VERIFY":
+            for index, observation in enumerate(observations):
+                item = {
+                    key: observation[key]
+                    for key in (
+                        "check_id",
+                        "execution_state",
+                        "exit_code",
+                        "started_at",
+                        "finished_at",
+                    )
+                }
+                log_key = f"check-{index}-log"
+                log = (
+                    base64.b64decode(observation["log"], validate=True)
+                    .decode("utf-8", errors="replace")
+                    .encode()
+                )
+                outputs.append(ProducedArtifact(log_key, "LOG", log))
+                item["log_artifact_id"] = "$artifact/" + log_key
+                if observation["junit"] is not None:
+                    key = f"check-{index}-junit"
+                    outputs.append(
+                        ProducedArtifact(
+                            key, "JUNIT", base64.b64decode(observation["junit"], validate=True)
+                        )
+                    )
+                    item["junit_artifact_id"] = "$artifact/" + key
+                report["checks"].append(item)
+        else:
+            # The backend receives immutable bytes and a data context, never the HTTP client/token.
+            reviewed = (
+                self.reviewer.review(
+                    {
+                        "target": target,
+                        "task_spec": job["snapshot"]["task_spec"],
+                        "profile": profile,
+                        "source_artifact_id": job["input"]["source_artifact_id"],
+                        "source_archive": archive,
+                    },
+                    cancelled,
+                )
+                if self.reviewer
+                else {}
+            )
+            if not isinstance(reviewed, dict) or set(reviewed) - {"criteria", "findings"}:
+                raise RunnerError("REVIEW_SCHEMA_INVALID", "POLICY")
+            report["criteria"] = reviewed.get("criteria", [])
+            report["findings"] = reviewed.get("findings", [])
+            outputs.append(
+                ProducedArtifact(
+                    "review-log",
+                    "LOG",
+                    json.dumps(
+                        {
+                            "backend_configured": self.reviewer is not None,
+                            "criteria_reported": len(report["criteria"]),
+                        }
+                    ).encode(),
+                )
+            )
+        return AgentResult("EXECUTED", report, artifacts=tuple(outputs)), events
 
     def events(self):
         with self._lock:

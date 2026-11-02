@@ -108,6 +108,79 @@ class VerificationCommand(Contract):
         return self
 
 
+class EvidenceTarget(Contract):
+    candidate_id: Name
+    head_sha: Sha
+    source_digest: Annotated[str, Field(pattern=r"^[0-9a-f]{64}$")]
+    spec_hash: Annotated[str, Field(pattern=r"^[0-9a-f]{64}$")]
+    profile_hash: Annotated[str, Field(pattern=r"^[0-9a-f]{64}$")]
+    image_digest: Annotated[str, Field(pattern=r"^sha256:[0-9a-f]{64}$")]
+
+
+class CheckObservation(Contract):
+    check_id: Name
+    execution_state: Literal["EXECUTED", "TIMEOUT", "START_FAILED"]
+    exit_code: int | None = Field(default=None, ge=-255, le=255)
+    started_at: float = Field(ge=0, allow_inf_nan=False)
+    finished_at: float = Field(ge=0, allow_inf_nan=False)
+    log_artifact_id: Name
+    junit_artifact_id: Name | None = None
+
+    @model_validator(mode="after")
+    def valid_times(self):
+        if self.finished_at < self.started_at:
+            raise ValueError("check end precedes start")
+        return self
+
+
+class CriterionObservation(Contract):
+    criterion_id: Name
+    status: Literal["PASS", "FAIL", "INCONCLUSIVE"]
+    explanation: Annotated[str, Field(min_length=1, max_length=4000)]
+    evidence_artifact_ids: list[Name] = Field(default_factory=list, max_length=100)
+
+
+class FindingLocation(Contract):
+    path: Name
+    start_line: int = Field(ge=1, le=1000000)
+    end_line: int = Field(ge=1, le=1000000)
+
+    @model_validator(mode="after")
+    def valid_location(self):
+        if not safe_path(self.path) or self.end_line < self.start_line:
+            raise ValueError("invalid finding location")
+        return self
+
+
+class FindingObservation(Contract):
+    id: Name
+    candidate_id: Name
+    criterion_id: Name
+    severity: Literal["critical", "high", "medium", "low", "info"]
+    location: FindingLocation
+    description: Annotated[str, Field(min_length=1, max_length=4000)]
+    evidence_artifact_ids: list[Name] = Field(min_length=1, max_length=100)
+
+
+class EvidenceReport(Contract):
+    target: EvidenceTarget
+    isolation: dict
+    checks: list[CheckObservation] = Field(default_factory=list, max_length=100)
+    criteria: list[CriterionObservation] = Field(default_factory=list, max_length=100)
+    findings: list[FindingObservation] = Field(default_factory=list, max_length=1000)
+
+    @model_validator(mode="after")
+    def unique_records(self):
+        for ids in (
+            [c.check_id for c in self.checks],
+            [c.criterion_id for c in self.criteria],
+            [f.id for f in self.findings],
+        ):
+            if len(ids) != len(set(ids)):
+                raise ValueError("duplicate evidence record")
+        return self
+
+
 class ProjectPolicy(Contract):
     version: Literal[1] = 1
     allowed_write_paths: list[Name] = Field(min_length=1, max_length=100)
@@ -266,7 +339,7 @@ class WorkerEventBatch(Contract):
 
 class ArtifactReserve(Contract):
     fence: int = Field(ge=1)
-    kind: Literal["PATCH", "LOG", "RESULT", "EVIDENCE", "SOURCE"]
+    kind: Literal["PATCH", "LOG", "RESULT", "EVIDENCE", "SOURCE", "JUNIT"]
     size_bytes: int = Field(ge=0, le=10**12, strict=True)
     sha256: Annotated[str, Field(pattern=r"^[0-9a-f]{64}$")]
 

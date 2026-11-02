@@ -6,7 +6,7 @@
 
 前段のSF-01〜07再評価では、不足する基盤実装とAC付き試験を追加し、ローカルと実GitHub CIのPostgreSQL 17で各327ケースが成功した。全43 ACと共通6条件の証拠49件を対象SHAへ照合して受け入れた。現在の既定Fake実行は `PLAN → VALIDATE → IMPLEMENT` を模擬し、patchを生成しないため `ASSEMBLE_CANDIDATE` で `BLOCKED / CHANGE_ARTIFACT_MISSING` に停止する。PATCHを提出するWorkerには管理Assemblerを接続する。
 
-残り17タスクの実装を継続し、SF-08/09を追加で受け入れた。現在はSF-01〜09が受け入れ済みで、残り15タスク。最新の受入基準revisionは `512d89bad04723aa2e2d57baf8d3254b72853dbf`、全477ケースと62件の条件別証拠を実CIまで照合済み。SF-10は隔離Assembler、不変Candidateモデル/API、工程接続、4地点kill復旧を実装した。タスク試験と既存全回帰・実CIの最終照合を実施中。未検証条件を実装済みの部分だけで合格へ変更しない。以後のコード変更では全回帰・証拠・実CIを再評価する。
+残り17タスクの実装を継続し、SF-08/09を追加で受け入れた。現在はSF-01〜10が受け入れ済みで、残り14タスク。最新の受入基準revisionは `b38ef0c6e0d4ea4d35f2372ba07f193b31a8db8b`、全544ケースと69件の条件別証拠を実CIまで照合済み。SF-11/12の独立検証・レビュー証拠と品質Gateへ進む。未検証条件を実装済みの部分だけで合格へ変更しない。以後のコード変更では全回帰・証拠・実CIを再評価する。
 
 ## マイルストーンと依存関係
 
@@ -22,7 +22,7 @@ M1は全ACと共通条件を満たし受け入れ済み。設計書17章の「�
 
 ## タスク一覧
 
-各タスクはコード、必要なマイグレーション、API契約、失敗系テスト、起動・運用手順を含む。実装状態と受け入れ状態は別に記録する。SF-01〜09は実CIとArtifact照合まで完了した。対象revisionと証拠は末尾の受入確定に記載する。
+各タスクはコード、必要なマイグレーション、API契約、失敗系テスト、起動・運用手順を含む。実装状態と受け入れ状態は別に記録する。SF-01〜10は実CIとArtifact照合まで完了した。対象revisionと証拠は末尾の受入確定に記載する。
 
 | ID | タスクと成果物 | 依存 | 受け入れ条件 | 実装状態 | 受入状態 |
 |---|---|---|---|---|---|
@@ -35,8 +35,8 @@ M1は全ACと共通条件を満たし受け入れ済み。設計書17章の「�
 | [SF-07](#sf-07-キャンセルと永続イベント) | 取消・Graph・イベント・Outbox | SF-05、SF-06 | SF-07-AC01〜06 | 実装済み | 受け入れ済み |
 | [SF-08](#sf-08-repository接続とsha解決) | Repository接続・実SHA解決 | SF-03 | SF-08-AC01〜06 | 実装済み | 受け入れ済み |
 | [SF-09](#sf-09-artifactのライフサイクル) | Artifact予約・確定・取得・回収 | SF-02、SF-05 | SF-09-AC01〜07 | 実装済み | 受け入れ済み |
-| [SF-10](#sf-10-隔離assemblerとcandidate) | 隔離Assembler・不変Candidate | SF-08、SF-09 | SF-10-AC01〜07 | 実装済み | 未判定 |
-| [SF-11](#sf-11-独立検証とレビュー証拠) | Verifier・Reviewer・Check・Finding | SF-10 | SF-11-AC01〜06 | 未着手 | 未判定 |
+| [SF-10](#sf-10-隔離assemblerとcandidate) | 隔離Assembler・不変Candidate | SF-08、SF-09 | SF-10-AC01〜07 | 実装済み | 受け入れ済み |
+| [SF-11](#sf-11-独立検証とレビュー証拠) | Verifier・Reviewer・Check・Finding | SF-10 | SF-11-AC01〜06 | 実装中 | 未判定 |
 | [SF-12](#sf-12-決定論的な品質gate) | Local Gate・最終Gate | SF-11 | SF-12-AC01〜07 | 未着手 | 未判定 |
 | [SF-13](#sf-13-修正上限と進展の判定) | Repair・Candidate世代・早期打切り | SF-12 | SF-13-AC01〜06 | 未着手 | 未判定 |
 | [SF-14](#sf-14-plan版と対象を固定する承認) | Plan版・再計画・計画承認 | SF-04、SF-12 | SF-14-AC01〜06 | 未着手 | 未判定 |
@@ -59,7 +59,7 @@ ACのIDは `SF-番号-AC連番` とし、各行の期待結果をすべて満た
 
 検証欄のUTは外部I/Oを使わない単体試験、ITは実PostgreSQL・Storage・OSを使う統合試験、CTはAPI/Adapter契約試験、E2Eは独立プロセスまたは実サービスを接続する試験を表す。Mock/Fakeの結果は契約・故障分岐の証拠とし、実GitHub・実Agent・OS隔離の成功の代用にはしない。
 
-SF-01〜09の受け入れ試験は `tests/acceptance/test_sf01.py`〜`test_sf09.py` に実装した。pytestの `ac` markerで条件IDを対応付け、1つのACに複数ケースがある場合は全ケースを実行する。SF-10は `tests/acceptance/test_sf10*.py` と `tests/test_assembler.py` に実Assembler・API・DB・別PID故障復旧の試験を実装し、最終照合中。以後の試験追加先は計画段階であり、実行済みとして扱わない。
+SF-01〜09の受け入れ試験は `tests/acceptance/test_sf01.py`〜`test_sf09.py` に実装した。pytestの `ac` markerで条件IDを対応付け、1つのACに複数ケースがある場合は全ケースを実行する。SF-10は `tests/acceptance/test_sf10*.py` と `tests/test_assembler.py` に実Assembler・API・DB・別PID故障復旧の試験を実装し、実CIまで照合済み。以後の試験追加先は計画段階であり、実行済みとして扱わない。
 
 ### 共通の検証と証拠
 
@@ -512,7 +512,7 @@ uv run ruff format --check .
 
 ## 次の実装単位
 
-SF-01〜09は実CIとArtifact照合まで完了した。次の機能実装単位はSF-10〜12とする。隔離Assemblerを不変Candidateへ接続し、独立検証・Review・決定論的Gateをつなぐ。以後も残るSF-13〜24まで全受け入れ条件を検証する。
+SF-01〜10は実CIとArtifact照合まで完了した。次の機能実装単位はSF-10〜12とする。隔離Assemblerを不変Candidateへ接続し、独立検証・Review・決定論的Gateをつなぐ。以後も残るSF-13〜24まで全受け入れ条件を検証する。
 
 受け入れ設定は上記の値で固定する。実環境の設定manifestとして、評価用HTTPS Repository/Integration ID、実Agentのengine/model/料金版、image digest、許可接続先、検証command/AC対応、通知先、backup保存先を担当タスクの開始時に記入する。未設定や資格情報不足は該当ACを未検証とし、代替Fakeで合格扱いにしない。値の変更はPolicy/manifestの新版と影響ACの再検証を必要とする。
 
@@ -608,3 +608,19 @@ SF-03の公開認可とSF-07の承認/CI待機の復旧は境界Fakeの契約試
 | 共通 | C-01〜06 PASS | 全回帰・DB移行・認可・冪等性・TX rollback・秘密非露出と、実CI Artifactを対象revisionへ照合 |
 
 この受入確定はSF-01〜09の対象revisionに対する結果である。SF-10を含む現在の変更は全回帰・実CIで再評価し、以下に別の対象revisionとして記録する。残り15タスク全体の完了を示すものではない。
+
+
+### SF-10の受入確定
+
+対象commit `b38ef0c6e0d4ea4d35f2372ba07f193b31a8db8b` の[実CI run 41384422711](https://github.com/iwata-n/software-factory/actions/runs/41384422711)が成功した。ローカル544件PASS（179.59秒）、CI544件PASS（239.97秒）、両環境skip/xfail 0。OpenAPI操作IDの重複も解消した。残る警告はStarlette TestClientのhttpx利用非推奨1件。
+
+入力digestは `658262014cf2c52a5f920870d3df99269d112f5b0b6121ed0566089234d2299b`。[factory-acceptance Artifact](https://github.com/iwata-n/software-factory/actions/runs/41384422711/artifacts/13114677411)のZIP SHA-256 `cbef2fa31329e15477affd590dc621afe2b991609b0377185b065db25532d177` がGitHub APIのdigestと一致した。全63 ACと共通6条件の69件を対象SHA・JUnit・fixtureへ照合し、`verified_records=69, external_pending=[]` を確認した。保存先は `.local/acceptance/b38ef0c6e0d4ea4d35f2372ba07f193b31a8db8b+inputs-658262014cf2c52a/`。
+
+SF-10の追加64ケースは、実Assemblerからの固定CandidateとVERIFY/REVIEW入力、20回同時確定、API/SQL不変制約、権限・fence・期限境界、全TX rollback、実差分攻撃、4地点でのWorker SIGKILL・孤立container回収・同入力再試行を含む。既存SF-01〜09も全回帰した。CIの実image digestは `sha256:2a6c47e1296aebdfe8f168e4b10ec64b9a4e958dcd51c3514d2ec7d8b5c60096`。起動時回収は確認済みだが、独立watchdogによる停止期限保証はSF-21で引き続き実装・検証する。
+
+
+### SF-11の実装と検証中の記録
+
+0006で追記専用Check/Finding、管理Workerに限定した証拠提出、Candidate/head/Spec/Profile/image/originの固定、実JUnit bytesからのサーバー判定、AC別レビューと実在位置/Artifactの照合を追加した。Verifierは新しい使い捨てcontainerでコードを再検算し、root所有のDocker volumeをread-onlyでmountする。ログ/JUnitの書込先だけを別に持つ。管理対象Profileのargv/timeout/必須IDを固定し、Agent自己申告のcommand/PASS/originは採用しない。
+
+ローカルのSF-11試験52ケースがPASS。実pytestの成功/失敗、実timeout/起動不能、不正/欠落XML、0件/全skip/必須ID欠落、5種類の対象tuple不一致、AC別3判定、位置/証拠不正8種類、20回同時完了、全TX rollback、DB不変制約、新API認可を含む。レビューのモデル呼出そのものはSF-20で検証する。現段階のFixture Reviewerは契約検証用であり、実Agentの代用にはしない。全回帰と対象revisionの実CIが完了するまでSF-11は未判定を維持する。

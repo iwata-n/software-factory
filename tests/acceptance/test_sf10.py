@@ -50,7 +50,9 @@ def pipeline(world, source_bundle, runner, tmp_path):
             "protected_paths": [".github", "migrations", "checks"],
             "protected_manifest": {
                 "checks/golden.py": hashlib.sha256(b"# immutable required check\n").hexdigest()
-            },
+            }
+            | source.get("protected_manifest", {}),
+            "verification_commands": source.get("verification_commands", []),
         }
         s.get(Repository, world.repository_id).remote_url = "https://fixture.example/owner/repo.git"
         s.add(

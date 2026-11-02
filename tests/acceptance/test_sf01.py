@@ -86,10 +86,14 @@ def test_empty_upgrade_is_scoped_and_matches_models(database, evidence):
 
 
 @pytest.mark.ac("SF-01-AC03")
-def test_previous_revision_data_survives_upgrade(database, evidence):
+@pytest.mark.parametrize("revision", ["0001", "previous"])
+def test_previous_revision_data_survives_upgrade(database, evidence, revision):
     from tests.conftest import example_policy, example_spec
 
-    with schema_database(database, "0001") as old:
+    if revision == "previous":
+        scripts = ScriptDirectory.from_config(Config("alembic.ini"))
+        revision = scripts.get_revision(scripts.get_current_head()).down_revision
+    with schema_database(database, revision) as old:
         with old.engine.begin() as connection:
             metadata = MetaData()
             metadata.reflect(bind=connection)

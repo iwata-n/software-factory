@@ -380,3 +380,70 @@ class Candidate(Tenant, Base):
     image_digest: Mapped[str] = mapped_column(String(71))
     metadata_body: Mapped[dict] = mapped_column(JSON)
     created_at: Mapped[float] = mapped_column(Float)
+
+
+class Check(Tenant, Base):
+    __tablename__ = "checks"
+    __table_args__ = (
+        UniqueConstraint("workspace_id", "id"),
+        UniqueConstraint("workspace_id", "attempt_id", "kind", "key"),
+        ForeignKeyConstraint(
+            ["workspace_id", "run_id", "job_id"], ["jobs.workspace_id", "jobs.run_id", "jobs.id"]
+        ),
+        ForeignKeyConstraint(
+            ["workspace_id", "run_id", "candidate_id"],
+            ["candidates.workspace_id", "candidates.run_id", "candidates.id"],
+        ),
+        ForeignKeyConstraint(
+            ["workspace_id", "job_id", "attempt_id"],
+            ["job_attempts.workspace_id", "job_attempts.job_id", "job_attempts.id"],
+        ),
+        CheckConstraint("status IN ('PASS','FAIL','ERROR','INCONCLUSIVE')"),
+    )
+    run_id: Mapped[str] = mapped_column(String(36))
+    candidate_id: Mapped[str] = mapped_column(String(36))
+    job_id: Mapped[str] = mapped_column(String(36))
+    attempt_id: Mapped[str] = mapped_column(String(36))
+    kind: Mapped[str] = mapped_column(String(20))
+    key: Mapped[str] = mapped_column(String(200))
+    status: Mapped[str] = mapped_column(String(20))
+    origin: Mapped[str] = mapped_column(String(40))
+    eligible: Mapped[bool] = mapped_column(Boolean)
+    target: Mapped[dict] = mapped_column(JSON)
+    started_at: Mapped[float] = mapped_column(Float)
+    finished_at: Mapped[float] = mapped_column(Float)
+    exit_code: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    test_ids: Mapped[list] = mapped_column(JSON)
+    counts: Mapped[dict] = mapped_column(JSON)
+    artifact_ids: Mapped[list] = mapped_column(JSON)
+    metadata_body: Mapped[dict] = mapped_column(JSON)
+
+
+class Finding(Tenant, Base):
+    __tablename__ = "findings"
+    __table_args__ = (
+        UniqueConstraint("workspace_id", "attempt_id", "finding_key"),
+        ForeignKeyConstraint(
+            ["workspace_id", "run_id", "job_id"], ["jobs.workspace_id", "jobs.run_id", "jobs.id"]
+        ),
+        ForeignKeyConstraint(
+            ["workspace_id", "run_id", "candidate_id"],
+            ["candidates.workspace_id", "candidates.run_id", "candidates.id"],
+        ),
+        ForeignKeyConstraint(
+            ["workspace_id", "job_id", "attempt_id"],
+            ["job_attempts.workspace_id", "job_attempts.job_id", "job_attempts.id"],
+        ),
+    )
+    run_id: Mapped[str] = mapped_column(String(36))
+    candidate_id: Mapped[str] = mapped_column(String(36))
+    job_id: Mapped[str] = mapped_column(String(36))
+    attempt_id: Mapped[str] = mapped_column(String(36))
+    finding_key: Mapped[str] = mapped_column(String(200))
+    criterion_id: Mapped[str] = mapped_column(String(200))
+    severity: Mapped[str] = mapped_column(String(20))
+    location: Mapped[dict] = mapped_column(JSON)
+    description: Mapped[str] = mapped_column(String(4000))
+    artifact_ids: Mapped[list] = mapped_column(JSON)
+    origin: Mapped[str] = mapped_column(String(40))
+    eligible: Mapped[bool] = mapped_column(Boolean)
