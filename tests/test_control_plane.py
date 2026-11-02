@@ -409,7 +409,11 @@ def test_concurrent_identical_completions_create_only_one_next_job(world):
 def test_budget_blocks_before_claim_and_usage_overrun_cannot_progress(world):
     with world.database.transaction() as session:
         run = session.get(Run, world.run_id)
-        run.spent_microusd = 950_000
+        costs = world.client.app.state.service.costs
+        costs.append(
+            session, run, None, "fixture-spend", "SPENT", "ADJUSTMENT", 950_000, "simulation"
+        )
+        costs.refresh(session, run)
     assert world.claim().status_code == 204
     assert world.run()["stop_reason"] == "BUDGET_EXHAUSTED"
 

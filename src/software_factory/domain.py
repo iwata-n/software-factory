@@ -62,10 +62,12 @@ def decide(
         return Decision(RunStatus.CANCELLING, run.phase, "CANCEL_REQUESTED")
     if event.kind == "SPEC_CHANGE_REQUESTED":
         return Decision(RunStatus.CANCELLING, run.phase, "SPEC_CHANGE_REQUIRED")
+    if event.kind == "BUDGET_STOP_REQUESTED":
+        return Decision(RunStatus.CANCELLING, run.phase, "BUDGET_EXCEEDED")
     if run.status == RunStatus.CANCELLING:
         if event.kind == "EXECUTION_RIGHT_ENDED":
-            if run.reason == "SPEC_CHANGE_REQUIRED":
-                return Decision(RunStatus.BLOCKED, run.phase, "SPEC_CHANGE_REQUIRED")
+            if run.reason in {"SPEC_CHANGE_REQUIRED", "BUDGET_EXCEEDED", "USAGE_UNKNOWN"}:
+                return Decision(RunStatus.BLOCKED, run.phase, run.reason)
             return Decision(RunStatus.CANCELLED, run.phase, "EXECUTION_RIGHT_ENDED")
         return Decision(run.status, run.phase, "CANCEL_REQUESTED")
     if event.kind == "ATTEMPTS_EXHAUSTED":

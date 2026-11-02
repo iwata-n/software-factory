@@ -190,6 +190,59 @@ class RequiredCICheck(Contract):
     check_name: Name
 
 
+MicroUSD = Annotated[int, Field(strict=True, ge=0, le=10**12)]
+Rate = Annotated[str, Field(pattern=r"^(0|[1-9][0-9]*)(\.[0-9]{1,9})?$", max_length=32)]
+
+
+class PricingManifest(Contract):
+    version: Name
+    provider: Literal["fixture", "openai", "codex_cli"]
+    model: Name
+    currency: Literal["USD"] = "USD"
+    basis: Literal["provider_invoice", "provider_list_price", "budget_estimate"]
+    source_url: Annotated[str, Field(min_length=1, max_length=1000)]
+    input_usd_per_million: Rate
+    cached_input_usd_per_million: Rate
+    output_usd_per_million: Rate
+
+
+class ModelCallUsage(Contract):
+    call_id: Name
+    input_tokens: Annotated[int, Field(strict=True, ge=0, le=10**9)]
+    cached_input_tokens: Annotated[int, Field(strict=True, ge=0, le=10**9)] = 0
+    output_tokens: Annotated[int, Field(strict=True, ge=0, le=10**9)]
+
+    @model_validator(mode="after")
+    def cached_is_subset(self):
+        if self.cached_input_tokens > self.input_tokens:
+            raise ValueError("cached tokens must be part of total input")
+        return self
+
+
+class UsageDelivery(Contract):
+    provider: Name
+    delivery_id: Name
+    sequence: Annotated[int, Field(strict=True, ge=1, le=10**9)]
+    total_microusd: MicroUSD
+    currency: Literal["USD"] = "USD"
+    final: Annotated[bool, Field(strict=True)]
+    pricing_manifest_hash: Annotated[str, Field(pattern=r"^[0-9a-f]{64}$")] | None = None
+    calls: list[ModelCallUsage] = Field(default_factory=list, max_length=1000)
+
+    @model_validator(mode="after")
+    def unique_calls(self):
+        if len({c.call_id for c in self.calls}) != len(self.calls):
+            raise ValueError("model call IDs must be unique")
+        return self
+
+
+class BudgetRequest(Contract):
+    expected_run_revision: int = Field(ge=1)
+    current_budget_microusd: MicroUSD
+    new_budget_microusd: MicroUSD
+    reason: Annotated[str, Field(min_length=1, max_length=4000)]
+
+
 class ProjectPolicy(Contract):
     version: Literal[1] = 1
     allowed_write_paths: list[Name] = Field(min_length=1, max_length=100)
@@ -206,6 +259,7 @@ class ProjectPolicy(Contract):
     protected_manifest: dict[str, str] = Field(default_factory=dict, max_length=10000)
     allow_external_model: bool = False
     require_plan_approval: bool = False
+    pricing_manifest: PricingManifest | None = None
     run_budget_microusd: int = Field(gt=0, le=10**12)
     job_reservation_microusd: int = Field(gt=0, le=10**12)
     max_infra_attempts_per_job: int = Field(default=3, ge=1, le=3)
@@ -338,14 +392,14 @@ class Complete(Contract):
     outcome: Literal["EXECUTED", "CANCELLED"]
     artifact_ids: list[Name] = Field(default_factory=list, max_length=100)
     result: dict = Field(default_factory=dict, max_length=100)
-    usage_microusd: int = Field(default=0, ge=0, le=10**12)
+    usage_microusd: MicroUSD | None = 0
 
 
 class Fail(Contract):
     fence: int = Field(ge=1)
     category: Literal["INFRASTRUCTURE", "POLICY", "INCONCLUSIVE"]
     reason: Annotated[str, Field(min_length=1, max_length=2000)]
-    usage_microusd: int = Field(default=0, ge=0, le=10**12)
+    usage_microusd: MicroUSD | None = 0
 
 
 class Cancel(Contract):

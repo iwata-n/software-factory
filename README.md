@@ -211,3 +211,11 @@ Project Policyの `require_plan_approval=true` では、妥当なPlanの後に `
 承認はPlan/hash、Spec、base SHA、Profile、Policy、Run revision、現Candidate/証拠（未作成ならnull）と24時間の期限へ固定します。古い対象は409で具体的なstale理由を返し、denyは `PLAN_REJECTED` で停止します。一般のPlan承認で予算・権限・検証・merge/deployを変更できません。
 
 `POST /v1/runs/{id}/replan` は現在のrevisionとreasonで同じSpecの再計画を要求します。目的/必須AC/Repositoryを変える `requested_task` は既存snapshotを更新せず `SPEC_CHANGE_REQUIRED` にします。稼働中なら停止を要求して実行権終了後にBLOCKEDへ移り、変更仕様は新Spec・新Runから実行します。
+
+## 費用台帳と予算変更
+
+費用は整数microUSDで記録し、予約・解放・実費・暫定額・調整を追記専用台帳に残します。`GET /v1/runs/{id}/costs` は台帳から計算したspent/reserved/availableと明細を返します。Workerの `POST /v1/worker/attempts/{id}/usage` は自身のAttemptだけを対象とし、provider delivery IDと累積sequenceで重複・逆順を処理します。実Providerの計測には管理対象Workerの `usage:trusted` 権限が必要です。
+
+Lease失効時は予約額を保守的に計上し、後日の確定usageで調整します。これは失効した成果物の採用権を復活させません。取得不能は `USAGE_UNKNOWN`、上限超過は実額を保持して `BUDGET_EXCEEDED` で停止します。実Agentと価格表の接続はSF-20で検証します。
+
+増額は `POST /v1/runs/{id}/budget-requests` に現revision・現予算・新上限・reasonを提出し、返された対象hashを通常のapprovals/decisionsで承認します。承認は24時間で失効し、元snapshotを保持したまま新予算版を追加します。消費+予約未満の上限、古い対象、稼働中の変更を拒否します。増額で不明usageや品質停止は解消できず、Plan待ちには新予算に固定した再承認が必要です。

@@ -227,6 +227,8 @@ class PlanCommands:
         from .service import DomainError, event, owned, run_view, transition
 
         request = owned(session, ApprovalRequest, approval_id, actor.workspace_id)
+        if request.action == "approve_budget":
+            return self.service.budgets.decide(session, actor, request, data)
         run = owned(session, Run, request.run_id, actor.workspace_id)
         if request.action != "approve_plan":
             raise DomainError(409, "APPROVAL_ACTION_MISMATCH")
@@ -426,6 +428,9 @@ class PlanCommands:
         ):
             request.status = "EXPIRED"
             run = owned(session, Run, request.run_id, workspace_id)
+            if request.action == "approve_budget":
+                self.service.budgets.expire(session, request, run)
+                continue
             if (
                 run.status == "WAITING_EXTERNAL"
                 and run.phase == "WAIT_PLAN_APPROVAL"

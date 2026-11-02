@@ -115,6 +115,9 @@ def run_view(run: Run) -> dict:
         "spent_microusd": run.spent_microusd,
         "wait_context": run.wait_context,
         "current_candidate_id": run.current_candidate_id,
+        "cost_state": run.cost_state,
+        "budget_version": run.budget_version,
+        "available_microusd": run.budget_microusd - run.spent_microusd - run.reserved_microusd,
     }
 
 
@@ -235,6 +238,12 @@ class Service:
         from .plans import PlanCommands
 
         self.plans = PlanCommands(self)
+        from .costs import CostCommands
+
+        self.costs = CostCommands(self)
+        from .budgets import BudgetCommands
+
+        self.budgets = BudgetCommands(self)
 
     def principal(self, session: Session, token: str, role: str) -> Principal:
         actor = session.scalar(select(Principal).where(Principal.token_hash == token_hash(token)))
@@ -590,6 +599,7 @@ class Service:
         )
         session.add(run)
         session.flush()
+        self.costs.initial_budget(session, run)
         enqueue(session, run, "PLAN")
         event(session, run, "RUN_COMPILED", {"snapshot_hash": digest(snapshot)})
         return run_view(run)
@@ -728,6 +738,7 @@ class Service:
                     transition(session, run, "ATTEMPTS_EXHAUSTED")
                     continue
                 reservation = run.snapshot["policy"]["job_reservation_microusd"]
+                self.costs.require_balanced(session, run)
                 if run.spent_microusd + run.reserved_microusd + reservation > run.budget_microusd:
                     transition(session, run, "BLOCKED", "BUDGET_EXHAUSTED")
                     continue
@@ -750,7 +761,7 @@ class Service:
                 session.add(attempt)
                 session.flush()
                 self.checkpoint("claim.attempt")
-                run.reserved_microusd += reservation
+                self.costs.reserve(session, run, attempt)
                 session.flush()
                 self.checkpoint("claim.reservation")
                 run.status = RunStatus.RUNNING
@@ -894,10 +905,10 @@ class Service:
             raise DomainError(409, "SOURCE_DIGEST_MISMATCH")
         return result
 
-    def settle(self, run: Run, attempt: Attempt, usage: int, *, uncertain: bool = False) -> None:
-        run.reserved_microusd -= attempt.reservation_microusd
-        # Lost workers may have consumed their whole reservation. Do not silently refund it.
-        run.spent_microusd += max(usage, attempt.reservation_microusd) if uncertain else usage
+    def settle(
+        self, session, run: Run, attempt: Attempt, usage: int | None, *, uncertain: bool = False
+    ) -> bool:
+        return self.costs.settle(session, run, attempt, usage, uncertain=uncertain)
 
     def complete(
         self,
@@ -909,7 +920,7 @@ class Service:
         attempt, job, run = self.lease(session, actor, lease_id, data.fence)
         allowed = self.repository_allowed(session, run)
         if not allowed:
-            self.settle(run, attempt, data.usage_microusd)
+            self.settle(session, run, attempt, data.usage_microusd)
             attempt.state, job.state = "CANCELLED", "CANCELLED"
             attempt.stop_confirmation = "WORKER_REPORTED_STOP"
             attempt.result = scrub(data.model_dump())
@@ -934,7 +945,7 @@ class Service:
                 report = self.evidence.validate(
                     session, actor, attempt, job, run, data.result, data.artifact_ids
                 )
-        self.settle(run, attempt, data.usage_microusd)
+        usage_known = self.settle(session, run, attempt, data.usage_microusd)
         clean_result = scrub(data.result)
         attempt.result = scrub(data.model_dump())
         attempt.stop_confirmation = "WORKER_REPORTED_STOP"
@@ -943,7 +954,21 @@ class Service:
             transition(session, run, "EXECUTION_RIGHT_ENDED")
         else:
             attempt.state, job.state = "SUCCEEDED", "SUCCEEDED"
-            if run.spent_microusd > run.budget_microusd:
+            if not usage_known:
+                job.state = "BLOCKED"
+                run.wait_context = {
+                    "kind": "COST_BLOCKED",
+                    "job_id": job.id,
+                    "cause": "USAGE_UNKNOWN",
+                }
+                transition(session, run, "BLOCKED", "USAGE_UNKNOWN")
+            elif run.spent_microusd > run.budget_microusd:
+                job.state = "BLOCKED"
+                run.wait_context = {
+                    "kind": "COST_BLOCKED",
+                    "job_id": job.id,
+                    "cause": "BUDGET_EXCEEDED",
+                }
                 transition(session, run, "BLOCKED", "BUDGET_EXCEEDED")
             elif job.kind == "PLAN":
                 self.plans.complete(session, actor, attempt, job, run, clean_result)
@@ -1019,15 +1044,24 @@ class Service:
         attempt.state = "FAILED"
         attempt.result = scrub(data.model_dump())
         attempt.stop_confirmation = "WORKER_REPORTED_STOP"
-        self.settle(run, attempt, data.usage_microusd)
+        usage_known = self.settle(session, run, attempt, data.usage_microusd)
         allowed = self.repository_allowed(session, run)
         if run.status == RunStatus.CANCELLING:
             job.state = "CANCELLED"
             transition(session, run, "EXECUTION_RIGHT_ENDED")
         elif not allowed:
             job.state = "CANCELLED"
+        elif not usage_known:
+            job.state = "BLOCKED"
+            run.wait_context = {"kind": "COST_BLOCKED", "job_id": job.id, "cause": "USAGE_UNKNOWN"}
+            transition(session, run, "BLOCKED", "USAGE_UNKNOWN")
         elif run.spent_microusd > run.budget_microusd:
             job.state = "FAILED"
+            run.wait_context = {
+                "kind": "COST_BLOCKED",
+                "job_id": job.id,
+                "cause": "BUDGET_EXCEEDED",
+            }
             transition(session, run, "BLOCKED", "BUDGET_EXCEEDED")
         elif data.category == "INFRASTRUCTURE":
             self.retry_or_fail(session, job, run)
@@ -1091,7 +1125,7 @@ class Service:
             run = owned(session, Run, job.run_id, workspace_id)
             attempt.state = "EXPIRED"
             attempt.stop_confirmation = "EXECUTION_RIGHT_EXPIRED"
-            self.settle(run, attempt, 0, uncertain=True)
+            self.settle(session, run, attempt, 0, uncertain=True)
             event(
                 session,
                 run,

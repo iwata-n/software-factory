@@ -23,6 +23,11 @@ def main():
     )
     enrollment.add_argument("--adapter", choices=["fake", "codex_cli"], default="fake")
     enrollment.add_argument(
+        "--usage-authority",
+        action="store_true",
+        help="Allow a managed supervisor to attest metered provider usage",
+    )
+    enrollment.add_argument(
         "--kinds",
         nargs="+",
         choices=["PLAN", "IMPLEMENT", "REPAIR", "ASSEMBLE_CANDIDATE", "VERIFY", "REVIEW"],
@@ -64,6 +69,8 @@ def main():
             }
         elif args.command == "issue-enrollment":
             kinds = args.kinds or ["PLAN", "IMPLEMENT"]
+            if args.usage_authority and not args.managed:
+                parser.error("usage authority requires --managed")
             if not args.managed and set(kinds) & {"ASSEMBLE_CANDIDATE", "VERIFY", "REVIEW"}:
                 parser.error("trusted stages require --managed")
             if not 1 <= args.ttl_seconds <= 3600:
@@ -77,7 +84,8 @@ def main():
                 Enrollment(
                     workspace_id=workspace.id,
                     token_hash=token_hash(secret),
-                    capabilities=[*kinds, f"adapter:{args.adapter}"],
+                    capabilities=[*kinds, f"adapter:{args.adapter}"]
+                    + (["usage:trusted"] if args.usage_authority else []),
                     managed=args.managed,
                     expires_at=db_now(session) + args.ttl_seconds,
                 )

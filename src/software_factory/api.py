@@ -16,6 +16,7 @@ from .contracts import (
     ApprovalSubmission,
     ArtifactFinalize,
     ArtifactReserve,
+    BudgetRequest,
     Cancel,
     Claim,
     Complete,
@@ -27,6 +28,7 @@ from .contracts import (
     RepositoryCreate,
     RunStart,
     TaskSpec,
+    UsageDelivery,
     WorkerEventBatch,
 )
 from .db import Database
@@ -285,6 +287,60 @@ def create_app(
             key,
             data.model_dump(),
             lambda s, a: service.plans.decide(s, a, approval_id, data),
+        )
+
+    @app.get("/v1/runs/{run_id}/costs", tags=["Costs"])
+    def costs_get(run_id: str, token: Token):
+        from .costs import entry_view, receipt_view
+        from .models import CostEntry, UsageReceipt
+
+        def query(s, a):
+            run = owned(s, Run, run_id, a.workspace_id)
+            return {
+                **service.costs.view(s, run),
+                "entries": [
+                    entry_view(e)
+                    for e in s.scalars(
+                        select(CostEntry)
+                        .where(CostEntry.workspace_id == a.workspace_id, CostEntry.run_id == run.id)
+                        .order_by(CostEntry.created_at, CostEntry.id)
+                    )
+                ],
+                "receipts": [
+                    receipt_view(e)
+                    for e in s.scalars(
+                        select(UsageReceipt)
+                        .where(
+                            UsageReceipt.workspace_id == a.workspace_id,
+                            UsageReceipt.run_id == run.id,
+                        )
+                        .order_by(UsageReceipt.created_at, UsageReceipt.id)
+                    )
+                ],
+            }
+
+        return service.read(token, query)
+
+    @app.post("/v1/runs/{run_id}/budget-requests", tags=["Costs"])
+    def budget_request(run_id: str, data: BudgetRequest, token: Token, key: Key = None):
+        return service.write(
+            token,
+            "USER",
+            f"runs:{run_id}:budget-request",
+            key,
+            data.model_dump(),
+            lambda s, a: service.budgets.request(s, a, run_id, data),
+        )
+
+    @app.post("/v1/worker/attempts/{attempt_id}/usage", tags=["Costs"])
+    def usage_post(attempt_id: str, data: UsageDelivery, token: Token, key: Key = None):
+        return service.write(
+            token,
+            "WORKER",
+            f"attempts:{attempt_id}:usage",
+            key,
+            data.model_dump(),
+            lambda s, a: service.costs.receive(s, a, attempt_id, data),
         )
 
     @app.post("/v1/runs/{run_id}/replan", status_code=202, tags=["Runs"])

@@ -24,7 +24,7 @@ class AgentResult:
     result: dict
     category: str | None = None
     reason: str | None = None
-    usage_microusd: int = 0
+    usage_microusd: int | None = 0
     artifacts: tuple[ProducedArtifact, ...] = ()
 
 

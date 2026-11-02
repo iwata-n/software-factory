@@ -162,6 +162,8 @@ class Run(Tenant, Base):
     created_at: Mapped[float] = mapped_column(Float)
     wait_context: Mapped[dict | None] = mapped_column(JSON, nullable=True)
     current_candidate_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    cost_state: Mapped[str] = mapped_column(String(20), default="KNOWN", server_default="KNOWN")
+    budget_version: Mapped[int] = mapped_column(Integer, default=1, server_default="1")
 
 
 class PlanVersion(Tenant, Base):
@@ -532,4 +534,87 @@ class ApprovalDecision(Tenant, Base):
     target_hash: Mapped[str] = mapped_column(String(64))
     before_revision: Mapped[int] = mapped_column(Integer)
     after_revision: Mapped[int] = mapped_column(Integer)
+    created_at: Mapped[float] = mapped_column(Float)
+
+
+class CostEntry(Tenant, Base):
+    __tablename__ = "cost_entries"
+    __table_args__ = (
+        UniqueConstraint("workspace_id", "entry_key"),
+        Index("ix_cost_entries_run_attempt", "workspace_id", "run_id", "attempt_id", "account"),
+        ForeignKeyConstraint(["workspace_id", "run_id"], ["runs.workspace_id", "runs.id"]),
+        ForeignKeyConstraint(
+            ["workspace_id", "run_id", "job_id"], ["jobs.workspace_id", "jobs.run_id", "jobs.id"]
+        ),
+        ForeignKeyConstraint(
+            ["workspace_id", "job_id", "attempt_id"],
+            ["job_attempts.workspace_id", "job_attempts.job_id", "job_attempts.id"],
+        ),
+        CheckConstraint("account IN ('RESERVED','SPENT')"),
+        CheckConstraint("currency = 'USD'"),
+        CheckConstraint(
+            "(attempt_id IS NULL AND job_id IS NULL) OR "
+            "(attempt_id IS NOT NULL AND job_id IS NOT NULL)"
+        ),
+    )
+    run_id: Mapped[str] = mapped_column(String(36))
+    job_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    attempt_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    entry_key: Mapped[str] = mapped_column(String(200))
+    account: Mapped[str] = mapped_column(String(20))
+    kind: Mapped[str] = mapped_column(String(40))
+    amount_microusd: Mapped[int] = mapped_column(BigInteger)
+    currency: Mapped[str] = mapped_column(String(3), default="USD")
+    origin: Mapped[str] = mapped_column(String(40))
+    metadata_body: Mapped[dict] = mapped_column(JSON)
+    created_at: Mapped[float] = mapped_column(Float)
+
+
+class UsageReceipt(Tenant, Base):
+    __tablename__ = "usage_receipts"
+    __table_args__ = (
+        UniqueConstraint("workspace_id", "provider", "delivery_id"),
+        UniqueConstraint("workspace_id", "attempt_id", "sequence"),
+        ForeignKeyConstraint(
+            ["workspace_id", "run_id", "job_id"], ["jobs.workspace_id", "jobs.run_id", "jobs.id"]
+        ),
+        ForeignKeyConstraint(
+            ["workspace_id", "job_id", "attempt_id"],
+            ["job_attempts.workspace_id", "job_attempts.job_id", "job_attempts.id"],
+        ),
+        CheckConstraint("total_microusd >= 0 AND sequence > 0"),
+        CheckConstraint("currency = 'USD'"),
+    )
+    run_id: Mapped[str] = mapped_column(String(36))
+    job_id: Mapped[str] = mapped_column(String(36))
+    attempt_id: Mapped[str] = mapped_column(String(36))
+    provider: Mapped[str] = mapped_column(String(40))
+    delivery_id: Mapped[str] = mapped_column(String(200))
+    sequence: Mapped[int] = mapped_column(Integer)
+    total_microusd: Mapped[int] = mapped_column(BigInteger)
+    currency: Mapped[str] = mapped_column(String(3))
+    final: Mapped[bool] = mapped_column(Boolean)
+    applied: Mapped[bool] = mapped_column(Boolean)
+    payload_hash: Mapped[str] = mapped_column(String(64))
+    origin: Mapped[str] = mapped_column(String(40))
+    metadata_body: Mapped[dict] = mapped_column(JSON)
+    created_at: Mapped[float] = mapped_column(Float)
+
+
+class BudgetVersion(Tenant, Base):
+    __tablename__ = "budget_versions"
+    __table_args__ = (
+        UniqueConstraint("workspace_id", "run_id", "version"),
+        ForeignKeyConstraint(["workspace_id", "run_id"], ["runs.workspace_id", "runs.id"]),
+        ForeignKeyConstraint(
+            ["workspace_id", "run_id", "approval_id"],
+            ["approval_requests.workspace_id", "approval_requests.run_id", "approval_requests.id"],
+        ),
+        CheckConstraint("limit_microusd > 0"),
+    )
+    run_id: Mapped[str] = mapped_column(String(36))
+    version: Mapped[int] = mapped_column(Integer)
+    limit_microusd: Mapped[int] = mapped_column(BigInteger)
+    approval_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    reason: Mapped[str] = mapped_column(String(4000))
     created_at: Mapped[float] = mapped_column(Float)
