@@ -41,7 +41,7 @@ M1は全ACと共通条件を満たし受け入れ済み。設計書17章の「�
 | [SF-13](#sf-13-修正上限と進展の判定) | Repair・Candidate世代・早期打切り | SF-12 | SF-13-AC01〜06 | 実装済み | 受け入れ済み |
 | [SF-14](#sf-14-plan版と対象を固定する承認) | Plan版・再計画・計画承認 | SF-04、SF-12 | SF-14-AC01〜06 | 実装済み | 受け入れ済み |
 | [SF-15](#sf-15-費用台帳と予算変更) | 費用/予約台帳・精算・予算変更 | SF-05、SF-13 | SF-15-AC01〜06 | 実装中 | 未判定 |
-| [SF-16](#sf-16-人間の介入コマンド) | 介入と承認の共通処理 | SF-14、SF-15 | SF-16-AC01〜06 | 未着手 | 未判定 |
+| [SF-16](#sf-16-人間の介入コマンド) | 介入と承認の共通処理 | SF-14、SF-15 | SF-16-AC01〜06 | 実装中 | 未判定 |
 | [SF-17](#sf-17-trusted-publisherとdraft-pr) | Trusted Publisher・Draft PR・操作台帳 | SF-10、SF-12、SF-16 | SF-17-AC01〜06 | 未着手 | 未判定 |
 | [SF-18](#sf-18-ci同期とwebhookの重複排除) | CI・Webhook Inbox・定期照合 | SF-17 | SF-18-AC01〜06 | 未着手 | 未判定 |
 | [SF-19](#sf-19-公開結果unknownの復旧とrun成功) | 公開UNKNOWN復旧・Run成功 | SF-18 | SF-19-AC01〜06 | 未着手 | 未判定 |
@@ -679,3 +679,9 @@ SF-14の59ケースがPASS。Plan版2採用と再不採用、max_replans=0、質
 入力digest `6363e314c36a26cba30923d2c4f5e8777cf78b2067b6a76137c64bba7b0d81c7`、[factory-acceptance Artifact](https://github.com/iwata-n/software-factory/actions/runs/41394045864/artifacts/13119290708)のZIP SHA-256 `2168ffd50332f845f5fba2e9c28d80de50f9f6cf4dcd32caccb042280ff9379c` が実GitHub APIと一致した。全88 ACと共通6条件を対象SHA・JUnit・fixtureへ照合し、`verified_records=94, external_pending=[]`。保存先は `.local/acceptance/57850d625b35bea57a9616b4edbe7423b701cb7b+inputs-6363e314c36a26cb/`。
 
 SF-14追加59ケースと純粋遷移5ケースを含め全回帰した。1回再計画、Plan版固定、24時間の対象付き承認、20回競合、stale拒否、一般承認で保護差分を許さないこと、新Specが必要な仕様変更と停止を受け入れた。M3の残りはSF-15/16。
+
+### SF-15/16の実装・再検証中の範囲
+
+SF-15は0010で費用/予約/調整とusage受領、予算版を追記台帳へ移行した。累積sequence/delivery IDを照合し、失効時の暫定額から確定実費へ1回だけ調整する。元snapshotを保持する対象付き予算承認と、未知usage/超過時の停止を追加した。全回帰で旧列比較の試験不備を検出し、旧列保存の照合へ修正した。遅延usageが別の稼働Attemptを超過させる場合も停止し、先行するUser取消を保持する。修正revision `363d9d81d37b054721f5b10e2f9c19022fb0ae69` は全回帰と実CIを再検証中であり、まだ受け入れ済みではない。
+
+SF-16は介入APIと個別承認を同じ内部コマンド・認可・対象検証・再送台帳へ集約した。approve_plan/approve_budget/cancel/resolve_blockedだけを許可し、取消のHTTP statusも両経路202とする。停止解除は固定した現対象を再検証し、費用確定・必要残額・同じJobの試行上限、または現Candidateの信頼済み証拠からのGate再評価を要求する。品質/Spec/保護差分/上限を一般承認で上書きしない。CI再開は元deadlineを保持する。全actionの監査・状態・Outboxを同時commitし、rollback試験を追加した。タスク全体は全回帰・実CI・条件別証拠の照合まで未判定とする。

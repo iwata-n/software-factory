@@ -219,3 +219,11 @@ Project Policyの `require_plan_approval=true` では、妥当なPlanの後に `
 Lease失効時は予約額を保守的に計上し、後日の確定usageで調整します。これは失効した成果物の採用権を復活させません。取得不能は `USAGE_UNKNOWN`、上限超過は実額を保持して `BUDGET_EXCEEDED` で停止します。実Agentと価格表の接続はSF-20で検証します。
 
 増額は `POST /v1/runs/{id}/budget-requests` に現revision・現予算・新上限・reasonを提出し、返された対象hashを通常のapprovals/decisionsで承認します。承認は24時間で失効し、元snapshotを保持したまま新予算版を追加します。消費+予約未満の上限、古い対象、稼働中の変更を拒否します。増額で不明usageや品質停止は解消できず、Plan待ちには新予算に固定した再承認が必要です。
+
+## 人間の介入
+
+`POST /v1/runs/{id}/interventions` は `action`、`subject_id`、整数の `expected_run_revision`、`reason` を必須とします。許可actionは `approve_plan`、`approve_budget`、`cancel`、`resolve_blocked` です。承認対象はApproval IDで、`target_hash` と `decision=approve/deny` を追加します。個別decisions APIと同じ認可・対象検証・意思決定・再送台帳を使い、同じキーによる経路間再送も同じ結果を返します。取消はRun IDを対象とし、両経路とも202を返します。
+
+`GET /v1/runs/{id}/interventions` は停止解除用の現対象/hashを返します。`resolve_blocked` はそのhashを固定し、台帳・現Spec/Policy/Profile・稼働Lease・停止原因を再確認します。費用が確定し残額が十分なら同じJobを上限内で再試行します。証拠不足は現Candidateの信頼済み証拠からGateを再計算し、解消を確認できる場合にだけ再開します。CIの金融停止を解除しても元の待機期限を保持します。
+
+一般の介入では、不変候補・無進展・修正/試行上限・保護差分・Spec変更・CI期限切れを解除できません。許可された介入はactor、action、固定対象、前後revision、reason、時刻を状態と同じTXで監査します。

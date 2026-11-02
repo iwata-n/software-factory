@@ -23,6 +23,7 @@ from .contracts import (
     Enroll,
     Fail,
     Heartbeat,
+    Intervention,
     ProjectCreate,
     ReplanRequest,
     RepositoryCreate,
@@ -280,14 +281,19 @@ def create_app(
 
     @app.post("/v1/approvals/{approval_id}/decisions", tags=["Approvals"])
     def approval_decide(approval_id: str, data: ApprovalSubmission, token: Token, key: Key = None):
-        return service.write(
-            token,
-            "USER",
-            f"approval:{approval_id}:decision",
-            key,
-            data.model_dump(),
-            lambda s, a: service.plans.decide(s, a, approval_id, data),
-        )
+        return service.interventions.approval(token, key, approval_id, data)
+
+    @app.get("/v1/runs/{run_id}/interventions", tags=["Interventions"])
+    def intervention_target(run_id: str, token: Token):
+        return service.read(token, lambda s, a: service.interventions.view(s, a, run_id))
+
+    @app.post("/v1/runs/{run_id}/interventions", tags=["Interventions"])
+    def intervention(
+        run_id: str, data: Intervention, token: Token, response: Response, key: Key = None
+    ):
+        if data.action == "cancel":
+            response.status_code = 202
+        return service.interventions.execute(token, key, run_id, data)
 
     @app.get("/v1/runs/{run_id}/costs", tags=["Costs"])
     def costs_get(run_id: str, token: Token):

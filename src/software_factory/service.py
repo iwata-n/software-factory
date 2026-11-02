@@ -25,6 +25,7 @@ from .contracts import (
 from .db import Database, db_now
 from .domain import TERMINAL, DomainEvent, RunSnapshot, RunStatus, decide
 from .models import (
+    ApprovalRequest,
     Attempt,
     AuditEvent,
     Enrollment,
@@ -244,6 +245,9 @@ class Service:
         from .budgets import BudgetCommands
 
         self.budgets = BudgetCommands(self)
+        from .interventions import InterventionCommands
+
+        self.interventions = InterventionCommands(self)
 
     def principal(self, session: Session, token: str, role: str) -> Principal:
         actor = session.scalar(select(Principal).where(Principal.token_hash == token_hash(token)))
@@ -1090,6 +1094,23 @@ class Service:
             raise DomainError(409, "RUN_REVISION_CONFLICT")
         if run.status in TERMINAL:
             raise DomainError(409, "RUN_TERMINAL")
+        before = run.state_revision
+        target = {
+            "run_id": run.id,
+            "candidate_id": run.current_candidate_id,
+            "spec_hash": run.snapshot["task_spec_hash"],
+            "policy_hash": run.snapshot["policy_hash"],
+            "profile_hash": run.snapshot["verification_profile_hash"],
+            "run_revision": before,
+        }
+        for request in session.scalars(
+            select(ApprovalRequest).where(
+                ApprovalRequest.workspace_id == run.workspace_id,
+                ApprovalRequest.run_id == run.id,
+                ApprovalRequest.status == "PENDING",
+            )
+        ):
+            request.status = "INVALIDATED"
         transition(session, run, "CANCEL_REQUESTED")
         event(session, run, "USER_CANCEL_REASON", {"principal_id": actor.id, "reason": data.reason})
         active = False
@@ -1105,6 +1126,23 @@ class Service:
                 job.state = "CANCELLED"
         if not active:
             transition(session, run, "EXECUTION_RIGHT_ENDED")
+        session.add(
+            AuditEvent(
+                workspace_id=actor.workspace_id,
+                actor_id=actor.id,
+                operation="intervention.cancel",
+                body={
+                    "action": "cancel",
+                    "target": target,
+                    "before_revision": before,
+                    "after_revision": run.state_revision,
+                    "reason": data.reason,
+                },
+                created_at=db_now(session),
+            )
+        )
+        session.flush()
+        self.checkpoint("intervention.cancelled")
         return run_view(run)
 
     def reconcile_workspace(self, session: Session, workspace_id: str) -> int:

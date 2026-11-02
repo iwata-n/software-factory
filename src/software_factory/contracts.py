@@ -366,10 +366,34 @@ class ReplanRequest(Contract):
 
 
 class ApprovalSubmission(Contract):
-    expected_run_revision: int = Field(ge=1)
+    expected_run_revision: int = Field(ge=1, strict=True)
     target_hash: Annotated[str, Field(pattern=r"^[0-9a-f]{64}$")]
     decision: Literal["approve", "deny"]
     reason: Annotated[str, Field(min_length=1, max_length=4000)]
+
+
+class Intervention(Contract):
+    action: Literal["approve_plan", "approve_budget", "cancel", "resolve_blocked"]
+    subject_id: Name
+    expected_run_revision: int = Field(ge=1, strict=True)
+    reason: Annotated[str, Field(min_length=1, max_length=4000)]
+    target_hash: Annotated[str, Field(pattern=r"^[0-9a-f]{64}$")] | None = None
+    decision: Literal["approve", "deny"] | None = None
+
+    @model_validator(mode="after")
+    def scoped_decision(self):
+        if self.action in {"approve_plan", "approve_budget"}:
+            if self.target_hash is None or self.decision is None:
+                raise ValueError("approval requires target_hash and decision")
+        elif self.decision is not None:
+            raise ValueError("only an approval accepts a decision")
+        if self.action == "resolve_blocked" and self.target_hash is None:
+            raise ValueError("resolution requires the current intervention target hash")
+        if self.action == "cancel" and self.target_hash is not None:
+            raise ValueError("cancellation is bound to the run revision")
+        if self.action == "cancel" and len(self.reason) > 2000:
+            raise ValueError("cancellation reason exceeds its contract limit")
+        return self
 
 
 class Claim(Contract):
@@ -403,7 +427,7 @@ class Fail(Contract):
 
 
 class Cancel(Contract):
-    expected_run_revision: int = Field(ge=1)
+    expected_run_revision: int = Field(ge=1, strict=True)
     reason: Annotated[str, Field(min_length=1, max_length=2000)]
 
 

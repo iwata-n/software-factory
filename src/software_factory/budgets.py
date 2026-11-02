@@ -183,6 +183,11 @@ class BudgetCommands:
         if (
             task.latest_spec_version != run.spec_version
             or digest(project.policy) != run.snapshot["policy_hash"]
+            or digest(run.snapshot["policy"]) != run.snapshot["policy_hash"]
+            or digest(run.snapshot["verification_profile"])
+            != run.snapshot["verification_profile_hash"]
+            or digest(run.snapshot["task_spec"]) != run.snapshot["task_spec_hash"]
+            or run.snapshot["base_sha"] != run.base_sha
         ):
             raise DomainError(409, "BUDGET_POLICY_OR_SPEC_STALE")
         limit = request.target["new_budget_microusd"]
