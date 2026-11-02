@@ -374,15 +374,21 @@ class CostCommands:
                 },
             )
             if run.spent_microusd > run.budget_microusd:
-                if run.status not in {"SUCCEEDED", "FAILED", "CANCELLED"}:
+                if run.status not in {"SUCCEEDED", "FAILED", "CANCELLED", "CANCELLING"}:
+                    active_job = session.scalar(
+                        select(Job)
+                        .join(Attempt, (Attempt.job_id == Job.id))
+                        .where(Job.run_id == run.id, Attempt.state == "LEASED")
+                        .limit(1)
+                    )
                     if (run.wait_context or {}).get("kind") != "COST_BLOCKED":
                         run.wait_context = {
                             "kind": "COST_BLOCKED",
-                            "job_id": job.id,
+                            "job_id": active_job.id if active_job else job.id,
                             "cause": "BUDGET_EXCEEDED",
                             "previous_wait": run.wait_context,
                         }
-                    if attempt.state == "LEASED":
+                    if active_job is not None:
                         transition(session, run, "BUDGET_STOP_REQUESTED")
                     else:
                         transition(session, run, "BLOCKED", "BUDGET_EXCEEDED")

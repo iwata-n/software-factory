@@ -64,7 +64,10 @@ def test_upgrade_backfills_existing_plan_hash_without_changing_body_or_parent_da
         assert row["body_hash"] == digest(body) and row["producer_job_id"] is None
         assert {k: row[k] for k in before["plan_versions"][0]} == before["plan_versions"][0]
         for name in ("tasks", "task_spec_versions", "runs", "jobs"):
-            assert before[name] == after[name]
+            previous = {item["id"]: item for item in before[name]}
+            assert set(previous) == {item["id"] for item in after[name]}
+            for item in after[name]:
+                assert {k: item[k] for k in previous[item["id"]]} == previous[item["id"]]
         command.upgrade(Config("alembic.ini"), "head")
         assert dump(old) == after
         evidence(

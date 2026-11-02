@@ -105,6 +105,46 @@ def test_live_cost_overrun_requests_stop_and_preserves_actual_charge(world, evid
     )
 
 
+@pytest.mark.ac("SF-15-AC04", "SF-15-AC05")
+@pytest.mark.parametrize("already_cancelling", [False, True])
+def test_late_overrun_stops_the_current_attempt_and_preserves_user_cancellation(
+    world, clock, already_cancelling, evidence
+):
+    old = world.claim().json()
+    clock.advance(90)
+    Service(world.database).reconcile()
+    clock.advance(2)
+    active = world.claim().json()
+    assert active["job"]["attempt_id"] != old["job"]["attempt_id"]
+    if already_cancelling:
+        assert (
+            world.post(
+                f"/v1/runs/{world.run_id}/cancel",
+                {
+                    "expected_run_revision": world.run()["state_revision"],
+                    "reason": "cancel before late metering arrives",
+                },
+            ).status_code
+            == 202
+        )
+    assert report(world, old, 1000001).status_code == 200
+    assert world.run()["status"] == "CANCELLING"
+    heartbeat = world.post(
+        f"/v1/worker/leases/{active['lease']['id']}/heartbeat",
+        {"fence": active["lease"]["fence"]},
+        token=world.worker_token,
+    )
+    assert heartbeat.json()["cancel_requested"] is True
+    assert submit(world, active).status_code == 200
+    assert world.run()["status"] == ("CANCELLED" if already_cancelling else "BLOCKED")
+    assert world.run()["spent_microusd"] == 1000001
+    assert not world.get(f"/v1/runs/{world.run_id}/plan").json()["plans"]
+    evidence(
+        "an expired attempt's late overrun stops current execution without replacing a user cancel",
+        {"already_cancelling": already_cancelling, "run": world.run()},
+    )
+
+
 @pytest.mark.ac("SF-15-AC06")
 def test_budget_grant_reissues_plan_approval_on_final_revision(world, evidence):
     world = make_approval_world(world)
