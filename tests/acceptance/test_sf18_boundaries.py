@@ -466,9 +466,10 @@ def test_current_pr_changes_do_not_modify_verified_result(waiting, monkeypatch, 
     )
 
 
+@pytest.mark.ac("SF-18-AC03")
 @pytest.mark.parametrize("waiting", [None, MERGE], indirect=True)
 def test_late_signed_check_is_preserved_for_previous_candidate_only(
-    waiting, publication, monkeypatch
+    waiting, publication, monkeypatch, evidence
 ):
     world, _, poll, _, pull, _, check, stub = waiting
     candidate_a = world.run()["current_candidate_id"]
@@ -531,3 +532,23 @@ def test_late_signed_check_is_preserved_for_previous_candidate_only(
     assert world.get(f"/v1/candidates/{candidate_b}/ci-history").json() == {"observations": []}
     assert world.run() == before
     assert world.run()["wait_context"]["checks"] == []
+    with world.database.transaction() as session:
+        assert (
+            session.scalar(
+                select(Gate.id).where(Gate.candidate_id == candidate_b, Gate.stage == "FINAL")
+            )
+            is None
+        )
+    assert world.get(f"/v1/runs/{world.run_id}/result").status_code == 404
+    evidence(
+        "late CI is retained only for the previous candidate and cannot pass the current gate",
+        {
+            "previous_candidate_id": candidate_a,
+            "current_candidate_id": candidate_b,
+            "old_provider_reported_sha": observation["provider_reported_sha"],
+            "old_observations": 1,
+            "eligible_current_checks": 0,
+            "current_final_gates": 0,
+            "result_status": 404,
+        },
+    )
