@@ -15,7 +15,7 @@ from tempfile import TemporaryDirectory
 from uuid import uuid4
 
 from psycopg.conninfo import make_conninfo
-from sqlalchemy import func, inspect, select, update
+from sqlalchemy import delete, func, inspect, select, update
 
 from software_factory.db import Database, db_now
 from software_factory.domain import TERMINAL
@@ -24,10 +24,14 @@ from software_factory.models import (
     Attempt,
     AuditEvent,
     Enrollment,
+    Job,
+    OutboxEvent,
     Principal,
     PublicationOperation,
     Run,
     RunEvent,
+    WorkerEvent,
+    Workspace,
 )
 from software_factory.storage import LocalArtifactStorage, content_hash, identifier
 
@@ -238,33 +242,33 @@ def collect(database, root):
         raise ValueError("Artifact source directory must exist")
     storage = LocalArtifactStorage(root)
     with database.transaction() as session:
+        # Match Control Plane mutation ordering even when an operator invokes collect online.
+        list(session.scalars(select(Workspace.id).order_by(Workspace.id).with_for_update()))
         now = db_now(session)
-        last_event = (
-            select(func.max(RunEvent.created_at))
-            .where(RunEvent.workspace_id == Run.workspace_id, RunEvent.run_id == Run.id)
-            .correlate(Run)
-            .scalar_subquery()
-        )
+        cutoff = now - 30 * DAY
         unresolved = (
             select(PublicationOperation.id)
             .where(
                 PublicationOperation.workspace_id == Run.workspace_id,
                 PublicationOperation.run_id == Run.id,
-                PublicationOperation.state.in_(["PENDING", "IN_FLIGHT", "UNKNOWN"]),
+                PublicationOperation.state.in_(["PENDING", "IN_FLIGHT", "UNKNOWN", "RECONCILING"]),
             )
             .exists()
         )
+        leased = (
+            select(Job.id)
+            .where(
+                Job.workspace_id == Run.workspace_id, Job.run_id == Run.id, Job.state == "LEASED"
+            )
+            .exists()
+        )
+        eligible = (Run.status.in_(TERMINAL), Run.finished_at <= cutoff, ~unresolved, ~leased)
         expired = session.scalars(
             select(Artifact)
             .join(Run, (Run.workspace_id == Artifact.workspace_id) & (Run.id == Artifact.run_id))
             .where(
                 (Artifact.status.in_(["RESERVED", "UPLOADED"]) & (Artifact.expires_at <= now))
-                | (
-                    (Artifact.status == "AVAILABLE")
-                    & Run.status.in_(TERMINAL)
-                    & (last_event <= now - 30 * DAY)
-                    & ~unresolved
-                )
+                | ((Artifact.status == "AVAILABLE") & Run.id.in_(select(Run.id).where(*eligible)))
             )
         )
         marked = 0
@@ -285,13 +289,66 @@ def collect(database, root):
                 )
             )
             marked += 1
+        removed_events = 0
+        for run in session.scalars(select(Run).where(*eligible)):
+            stream = (
+                RunEvent.workspace_id == run.workspace_id,
+                RunEvent.run_id == run.id,
+            )
+            first_retained = session.scalar(
+                select(func.min(RunEvent.revision)).where(*stream, RunEvent.created_at > cutoff)
+            )
+            old = delete(RunEvent).where(*stream, RunEvent.created_at <= cutoff)
+            if first_retained is not None:
+                old = old.where(RunEvent.revision < first_retained)
+            deleted = old.returning(RunEvent.revision).cte()
+            count, last_deleted = session.execute(
+                select(func.count(), func.max(deleted.c.revision)).select_from(deleted)
+            ).one()
+            if last_deleted is not None:
+                run.events_pruned_through = max(run.events_pruned_through or 0, last_deleted)
+                attempts = (
+                    select(Attempt.id)
+                    .join(
+                        Job, (Job.workspace_id == Attempt.workspace_id) & (Job.id == Attempt.job_id)
+                    )
+                    .where(Job.workspace_id == run.workspace_id, Job.run_id == run.id)
+                )
+                session.execute(
+                    delete(WorkerEvent).where(
+                        WorkerEvent.workspace_id == run.workspace_id,
+                        WorkerEvent.attempt_id.in_(attempts),
+                        WorkerEvent.run_revision <= last_deleted,
+                    )
+                )
+                removed_events += count
+            session.execute(
+                delete(OutboxEvent).where(
+                    OutboxEvent.workspace_id == run.workspace_id,
+                    OutboxEvent.run_id == run.id,
+                    OutboxEvent.kind == "WORKER_EVENT",
+                    OutboxEvent.created_at <= cutoff,
+                )
+            )
+            if run.evidence_expired_at is None or count:
+                if run.evidence_expired_at is None:
+                    run.evidence_expired_at = now
+                session.add(
+                    AuditEvent(
+                        workspace_id=run.workspace_id,
+                        actor_id="local-admin",
+                        operation="run.evidence.collect",
+                        body={"run_id": run.id, "events_removed": count},
+                        created_at=now,
+                    )
+                )
     # Commit the tombstone first. A failed unlink can be retried on the next invocation.
     with database.transaction() as session:
         for workspace, artifact in session.execute(
             select(Artifact.workspace_id, Artifact.id).where(Artifact.status == "DELETED")
         ):
             storage.delete(workspace, artifact)
-    return {"marked_deleted": marked}
+    return {"marked_deleted": marked, "events_removed": removed_events}
 
 
 def main():

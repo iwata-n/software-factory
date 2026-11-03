@@ -482,6 +482,7 @@ async function loadDetail() {
       section("Run", fields([
         ["Run ID", run.run_id], ["状態", run.status], ["段階", run.phase],
         ["Revision", run.state_revision], ["停止理由", run.stop_reason],
+        ...(run.evidence_expired_at == null ? [] : [["証拠の保持期限", "回収済み"]]),
         ["待機種別", context?.kind], ["要対応理由", context?.cause],
       ])),
       section("費用 (µUSD)", fields([

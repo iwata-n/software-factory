@@ -31,6 +31,12 @@ def event_view(event):
 def event_batch(session, run, revision):
     if revision is not None and revision > run.state_revision:
         raise DomainError(422, "INVALID_EVENT_CURSOR")
+    if (
+        revision is not None
+        and run.events_pruned_through is not None
+        and revision <= run.events_pruned_through
+    ):
+        raise DomainError(410, "EVENT_CURSOR_EXPIRED")
     events = list(
         session.scalars(
             select(RunEvent)

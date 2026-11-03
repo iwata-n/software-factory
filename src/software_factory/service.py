@@ -113,6 +113,8 @@ def run_view(run: Run) -> dict:
         "phase": run.phase,
         "state_revision": run.state_revision,
         "stop_reason": run.stop_reason,
+        "finished_at": run.finished_at,
+        "evidence_expired_at": run.evidence_expired_at,
         "base_sha": run.base_sha,
         "snapshot": run.snapshot,
         "budget_microusd": run.budget_microusd,
@@ -126,17 +128,19 @@ def run_view(run: Run) -> dict:
     }
 
 
-def event(session: Session, run: Run, kind: str, body: dict) -> None:
+def event(session: Session, run: Run, kind: str, body: dict) -> float:
     run.state_revision += 1
+    created_at = db_now(session)
     fields = dict(
         workspace_id=run.workspace_id,
         run_id=run.id,
         kind=kind,
         body=scrub(body),
-        created_at=db_now(session),
+        created_at=created_at,
     )
     session.add(RunEvent(**fields, revision=run.state_revision))
     session.add(OutboxEvent(**fields))
+    return created_at
 
 
 def enqueue(
@@ -215,7 +219,9 @@ def transition(
             payload=payload,
             step_key=step_key,
         )
-    event(session, run, kind, {"reason": decision.reason, "phase": run.phase})
+    recorded_at = event(session, run, kind, {"reason": decision.reason, "phase": run.phase})
+    if run.status in TERMINAL and previous_status not in TERMINAL:
+        run.finished_at = recorded_at
     if run.status != previous_status and run.status in {"FAILED", "BLOCKED"}:
         enqueue_result(session, run)
 

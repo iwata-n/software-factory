@@ -260,7 +260,9 @@ class CIPoller:
         session.add(result)
         run.status, run.phase, run.stop_reason = "SUCCEEDED", "COMPLETE", None
         run.wait_context = None
-        event(session, run, "VERIFIED_DRAFT_PR", {"result_id": result.id, "gate_id": gate.id})
+        run.finished_at = event(
+            session, run, "VERIFIED_DRAFT_PR", {"result_id": result.id, "gate_id": gate.id}
+        )
         enqueue_result(
             session,
             run,

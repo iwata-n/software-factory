@@ -10,7 +10,17 @@ from sqlalchemy.engine import make_url
 from scripts.factory_maintenance import DAY, backup, collect, inventory, restore
 from software_factory.api import create_app
 from software_factory.db import Database, db_now
-from software_factory.models import Artifact, Attempt, AuditEvent, Run, RunEvent
+from software_factory.models import (
+    Artifact,
+    Attempt,
+    AuditEvent,
+    Job,
+    OutboxEvent,
+    Run,
+    RunEvent,
+    WorkerEvent,
+)
+from software_factory.service import event
 from software_factory.storage import LocalArtifactStorage
 from tests.acceptance.test_sf09 import artifacts as artifacts
 
@@ -25,20 +35,33 @@ def test_artifact_collection_at_boundaries(world, artifacts):
         now = db_now(session)
         session.execute(update(Artifact).where(Artifact.id == pending).values(expires_at=now))
         session.execute(update(RunEvent).values(created_at=now - 30 * DAY))
+        last_revision = session.get(Run, world.run_id).state_revision
     database = Database(
         world.database.engine.url.render_as_string(hide_password=False), clock=lambda: now
     )
     try:
         # A live run protects finalized evidence even when its events are old.
-        assert collect(database, root) == {"marked_deleted": 1}
+        assert collect(database, root) == {"marked_deleted": 1, "events_removed": 0}
         assert world.get(f"/v1/artifacts/{evidence}/content").content == b"hello"
         with database.transaction() as session:
-            session.execute(update(Run).values(status="SUCCEEDED"))
+            session.execute(update(Job).values(state="SUCCEEDED"))
+            session.execute(update(Attempt).values(state="SUCCEEDED"))
+            session.execute(update(Run).values(status="SUCCEEDED", finished_at=now - 30 * DAY))
         database.sessions.configure(info={"clock": lambda: now - 0.001})
-        assert collect(database, root) == {"marked_deleted": 0}
+        assert collect(database, root) == {"marked_deleted": 0, "events_removed": 0}
         database.sessions.configure(info={"clock": lambda: now})
-        assert collect(database, root) == {"marked_deleted": 1}
-        assert collect(database, root) == {"marked_deleted": 0}
+        collected = collect(database, root)
+        assert collected["marked_deleted"] == 1 and collected["events_removed"] > 0
+        assert collect(database, root) == {"marked_deleted": 0, "events_removed": 0}
+        assert world.run()["evidence_expired_at"] == now
+        assert world.run()["finished_at"] == now - 30 * DAY
+        cursor = f"{world.run_id}:{last_revision}"
+        response = world.client.get(
+            f"/v1/runs/{world.run_id}/events?wait_seconds=0",
+            headers={"Authorization": f"Bearer {world.user_token}", "Last-Event-ID": cursor},
+        )
+        assert response.status_code == 410
+        assert world.get(f"/v1/runs/{world.run_id}/event-history").json() == {"events": []}
         reply = world.get(f"/v1/artifacts/{evidence}/content")
         assert reply.status_code == 404
         assert "EVIDENCE_RETENTION_EXPIRED" in reply.text
@@ -52,6 +75,77 @@ def test_artifact_collection_at_boundaries(world, artifacts):
                 )
                 == 2
             )
+    finally:
+        database.engine.dispose()
+
+
+def test_retention_prunes_only_old_history_prefix_and_keeps_terminal_anchor(world, artifacts):
+    root = world.client.app.state.service.artifacts.storage.root
+    lease = artifacts.lease
+    run_path = f"/v1/runs/{world.run_id}"
+    recorded = world.post(
+        f"/v1/worker/leases/{lease['id']}/events",
+        {
+            "fence": lease["fence"],
+            "events": [{"sequence": 1, "kind": "LOG", "body": {"line": "test"}}],
+        },
+        token=world.worker_token,
+    )
+    assert recorded.status_code == 200
+    assert (
+        world.post(
+            run_path + "/cancel",
+            {"expected_run_revision": world.run()["state_revision"], "reason": "retention fixture"},
+        ).status_code
+        == 202
+    )
+    assert (
+        world.post(
+            f"/v1/worker/leases/{lease['id']}/complete",
+            {"fence": lease["fence"], "outcome": "CANCELLED"},
+            token=world.worker_token,
+        ).status_code
+        == 200
+    )
+    finished = world.run()["finished_at"]
+    assert finished is not None
+    database = Database(
+        world.database.engine.url.render_as_string(hide_password=False),
+        clock=lambda: finished + DAY,
+    )
+    try:
+        with database.transaction() as session:
+            run = session.get(Run, world.run_id)
+            old_revision = run.state_revision
+            event(session, run, "LATE_AUDIT_FIXTURE", {})
+            late_revision = run.state_revision
+        database.sessions.configure(info={"clock": lambda: finished + 30 * DAY})
+        collected = collect(database, root)
+        assert collected["events_removed"] > 0
+        with database.transaction() as session:
+            assert session.scalar(select(WorkerEvent.id)) is None
+            assert (
+                session.scalar(select(OutboxEvent.id).where(OutboxEvent.kind == "WORKER_EVENT"))
+                is None
+            )
+        assert world.run()["finished_at"] == finished
+        history = world.get(run_path + "/event-history").json()["events"]
+        assert [item["revision"] for item in history] == [late_revision]
+        headers = {"Authorization": f"Bearer {world.user_token}"}
+        endpoint = run_path + "/events?wait_seconds=0"
+        assert (
+            world.client.get(
+                endpoint, headers=headers | {"Last-Event-ID": f"{world.run_id}:{old_revision}"}
+            ).status_code
+            == 410
+        )
+        assert (
+            world.client.get(
+                endpoint, headers=headers | {"Last-Event-ID": f"{world.run_id}:{late_revision}"}
+            ).status_code
+            == 200
+        )
+        assert collect(database, root) == {"marked_deleted": 0, "events_removed": 0}
     finally:
         database.engine.dispose()
 
