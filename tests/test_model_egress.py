@@ -63,6 +63,7 @@ def test_connect_allows_only_the_configured_host_and_tls_port(monkeypatch):
             thread.join(timeout=2)
 
 
+@pytest.mark.ac("SF-21-AC03")
 @pytest.mark.parametrize(
     "private", ["127.0.0.1", "169.254.169.254", "192.168.1.1", "::1", "224.0.0.1"]
 )

@@ -17,6 +17,7 @@ EXTERNAL_CRITERIA = {
     "SF-19-AC03": "sf19-verification.json",
     "SF-19-AC05": "current-pr-drift.json",
     "SF-19-AC06": "sf19-verification.json",
+    "SF-21-AC03": "live-egress.json",
 }
 
 
@@ -104,6 +105,7 @@ def required_criteria() -> list[str]:
         "SF-20-AC05",
         "SF-21-AC01",
         "SF-21-AC02",
+        "SF-21-AC03",
         "SF-21-AC04",
         "SF-21-AC05",
         "SF-21-AC06",

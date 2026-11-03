@@ -271,6 +271,45 @@ def verify_current_pr_drift(report, manifest):
     return [draft["url"], check["url"], rerun["url"]]
 
 
+def verify_model_egress(report, manifest, record):
+    cases = record["observed"]
+    runners = [
+        observation
+        for case in cases
+        for observation in case["observations"]
+        if isinstance(observation["observed"], dict)
+        and "direct_public_private_metadata_routes" in observation["observed"]
+    ]
+    if (
+        report["revision"] != manifest["revision"]
+        or not re.fullmatch(r"sha256:[a-f0-9]{64}", report["image"])
+        or report["allowed_host"] != "chatgpt.com"
+        or report["verified_tls"] not in {"TLSv1.2", "TLSv1.3"}
+        or report["cross_host_tls"] != "DENIED"
+        or report["blocked_connect"]
+        != {
+            "auth.openai.com:443": 403,
+            "chatgpt.com:80": 403,
+            "169.254.169.254:443": 403,
+        }
+        or len(runners) != 2
+        or any(
+            row["observed"]["direct_public_private_metadata_routes"] != "ENETUNREACH"
+            for row in runners
+        )
+        or not any(
+            row["observed"].get("direct_external_dns") == "DENIED"
+            and row.get("image_digest") == report["image"]
+            for row in runners
+        )
+        or sum("test_mixed_dns_answers_fail_closed" in case["test_case_id"] for case in cases) != 5
+        or any(case["result"] != "PASS" for case in cases)
+    ):
+        raise ValueError(
+            "Live model egress evidence is incomplete or inconsistent"
+        )
+
+
 def audit(directory: Path, *, allow_ci_pending: bool = False) -> dict:
     manifest = json.loads((directory / "manifest.json").read_text())
     current = source_manifest()
@@ -460,6 +499,16 @@ def audit(directory: Path, *, allow_ci_pending: bool = False) -> dict:
             external_urls=urls,
             external_verification={"filename": drift.name, "sha256": sha(drift.read_bytes())},
             evidence_paths=list(dict.fromkeys([*record["evidence_paths"], drift.name])),
+        )
+        path.write_text(json.dumps(record, indent=2, ensure_ascii=False))
+    egress = directory / EXTERNAL_CRITERIA["SF-21-AC03"]
+    if egress.exists():
+        path, record = records["SF-21-AC03"]
+        verify_model_egress(json.loads(egress.read_text()), manifest, record)
+        record.update(
+            result="PASS",
+            external_verification={"filename": egress.name, "sha256": sha(egress.read_bytes())},
+            evidence_paths=list(dict.fromkeys([*record["evidence_paths"], egress.name])),
         )
         path.write_text(json.dumps(record, indent=2, ensure_ascii=False))
     for ac, (_, record) in records.items():
