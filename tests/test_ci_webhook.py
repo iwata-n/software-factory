@@ -28,7 +28,7 @@ def webhook(world, monkeypatch):
     with world.database.transaction() as session:
         session.get(Repository, world.repository_id).remote_url = f"https://github.com/{NAME}.git"
 
-    def send(body, *, delivery=None, secret=SECRET, event="workflow_run"):
+    def send(body, *, delivery=None, secret=SECRET, event="workflow_run", integration=None):
         encoded = json.dumps(body).encode()
         headers = {
             "X-Hub-Signature-256": "sha256="
@@ -38,12 +38,15 @@ def webhook(world, monkeypatch):
         }
         with TestClient(create_app(world.database)) as http:
             return http.post(
-                f"/v1/webhooks/github/{integration_id}", content=encoded, headers=headers
+                f"/v1/webhooks/github/{integration or integration_id}",
+                content=encoded,
+                headers=headers,
             )
 
     return send
 
 
+@pytest.mark.ac("SF-18-AC01", "SF-18-AC02")
 def test_signed_delivery_is_durable_and_conflicting_reuse_is_rejected(world, webhook):
     delivery = str(uuid4())
     body = {"repository": {"id": 9001, "full_name": NAME}, "untrusted": "discard this text"}
@@ -61,6 +64,7 @@ def test_signed_delivery_is_durable_and_conflicting_reuse_is_rejected(world, web
         assert "discard this text" not in repr(vars(saved))
 
 
+@pytest.mark.ac("SF-18-AC01")
 @pytest.mark.parametrize(
     ("repository", "secret", "status"),
     [
@@ -70,12 +74,15 @@ def test_signed_delivery_is_durable_and_conflicting_reuse_is_rejected(world, web
     ],
 )
 def test_invalid_delivery_does_not_enter_inbox(world, webhook, repository, secret, status):
+    before = world.run()
     response = webhook({"repository": repository}, secret=secret)
+    assert world.run() == before
     assert response.status_code == status
     with world.database.transaction() as session:
         assert session.scalar(select(CIWebhookDelivery)) is None
 
 
+@pytest.mark.ac("SF-18-AC02")
 def test_concurrent_replays_commit_one_inbox_row(world, webhook):
     delivery = str(uuid4())
     body = {"repository": {"id": 9001, "full_name": NAME}}
@@ -86,6 +93,7 @@ def test_concurrent_replays_commit_one_inbox_row(world, webhook):
         assert len(list(session.scalars(select(CIWebhookDelivery)))) == 1
 
 
+@pytest.mark.ac("SF-18-AC01")
 def test_integration_cannot_cross_workspace(world, webhook, monkeypatch):
     import os
 
@@ -93,5 +101,15 @@ def test_integration_cannot_cross_workspace(world, webhook, monkeypatch):
     next(iter(integrations.values()))["workspace_id"] = world.other_workspace_id
     monkeypatch.setenv("FACTORY_GITHUB_WEBHOOKS", json.dumps(integrations))
     assert webhook({"repository": {"id": 9001, "full_name": NAME}}).status_code == 404
+    with world.database.transaction() as session:
+        assert session.scalar(select(CIWebhookDelivery)) is None
+
+
+@pytest.mark.ac("SF-18-AC01")
+def test_signed_delivery_for_unknown_integration_has_no_side_effects(world, webhook):
+    before = world.run()
+    response = webhook({"repository": {"id": 9001, "full_name": NAME}}, integration=uuid4())
+    assert response.status_code == 404
+    assert world.run() == before
     with world.database.transaction() as session:
         assert session.scalar(select(CIWebhookDelivery)) is None
