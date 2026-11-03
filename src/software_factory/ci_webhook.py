@@ -35,7 +35,7 @@ class GitHubWebhook(BaseModel):
     repository_id: UUID
     github_repository_id: Annotated[int, Field(strict=True, gt=0)]
     github_repository: Annotated[str, Field(pattern=r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")]
-    secret: Annotated[SecretStr, Field(min_length=32)]
+    secret: Annotated[SecretStr, Field(min_length=32)] | None = None
 
 
 def configured_webhooks():
@@ -194,7 +194,7 @@ def save_delivery(service, config, integration_id, delivery_id, event, body):
     return {"accepted": True}
 
 
-def webhook_router(service, integrations):
+def webhook_router(service, integrations, vault=None):
     router = APIRouter()
 
     @router.post("/v1/webhooks/github/{integration_id}", status_code=202, tags=["CI"])
@@ -210,10 +210,16 @@ def webhook_router(service, integrations):
             if len(body) + len(chunk) > MAX_BODY:
                 raise DomainError(413, "WEBHOOK_BODY_TOO_LARGE")
             body.extend(chunk)
-        expected = (
-            "sha256="
-            + hmac.new(config.secret.get_secret_value().encode(), body, "sha256").hexdigest()
-        )
+        secret = None
+        if vault:
+            secret = await run_in_threadpool(
+                vault.webhook_secret, str(config.workspace_id), integration_id
+            )
+        if not secret and config.secret:
+            secret = config.secret.get_secret_value()
+        if not secret:
+            raise DomainError(401, "INVALID_WEBHOOK_SIGNATURE")
+        expected = "sha256=" + hmac.new(secret.encode(), body, "sha256").hexdigest()
         if not hmac.compare_digest(expected.encode(), signature.encode()):
             raise DomainError(401, "INVALID_WEBHOOK_SIGNATURE")
 

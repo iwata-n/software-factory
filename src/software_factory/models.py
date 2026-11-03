@@ -12,6 +12,7 @@ from sqlalchemy import (
     ForeignKeyConstraint,
     Index,
     Integer,
+    LargeBinary,
     String,
     UniqueConstraint,
 )
@@ -40,6 +41,15 @@ class Workspace(Base):
     restore_reconciliation_required: Mapped[bool] = mapped_column(
         Boolean, default=False, server_default="false"
     )
+
+
+class IntegrationSettings(Base):
+    __tablename__ = "integration_settings"
+
+    workspace_id: Mapped[str] = mapped_column(ForeignKey("workspaces.id"), primary_key=True)
+    provider: Mapped[str] = mapped_column(String(20), primary_key=True)
+    ciphertext: Mapped[bytes] = mapped_column(LargeBinary)
+    oauth_state_hash: Mapped[str | None] = mapped_column(String(64), unique=True)
 
 
 class Principal(Tenant, Base):

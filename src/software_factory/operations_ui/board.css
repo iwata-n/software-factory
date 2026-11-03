@@ -96,3 +96,8 @@ summary { cursor: pointer; padding: 10px 0; }
 .execution[data-stopped="true"] { border-color: #c68070; background: #fff5f2; }
 #execution-form { margin-top: 10px; }
 #worker-list { overflow-wrap: anywhere; }
+
+.integration-field { display: grid; gap: .25rem; margin-block: .5rem; }
+.integration-field[hidden] { display: none; }
+.integration-field input, .integration-field select { min-width: 0; width: 100%; }
+#integration-settings a, #integration-settings button { margin-inline-end: .5rem; }

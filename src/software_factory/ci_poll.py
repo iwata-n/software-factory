@@ -60,8 +60,13 @@ def stale_snapshot(previous, observed):
 
 
 class CIPoller:
-    def __init__(self, service, integrations, tokens):
+    def __init__(self, service, integrations, tokens, vault=None):
         self.service = service
+        self.vault = vault
+        self.available = {
+            (str(config.workspace_id), str(config.repository_id)): (key, config)
+            for key, config in integrations.items()
+        }
         self.bindings = {}
         for integration_id, token in tokens.items():
             config = integrations.get(integration_id)
@@ -71,6 +76,18 @@ class CIPoller:
             if key in self.bindings:
                 raise ValueError("Multiple GitHub CI read integrations for one repository")
             self.bindings[key] = integration_id, config, token
+
+    @property
+    def enabled(self):
+        return bool(self.bindings or (self.vault and self.available))
+
+    def binding(self, client, workspace, repository):
+        key = workspace, repository
+        config = self.available.get(key)
+        if self.vault and config:
+            if saved := self.vault.active(workspace, "github", client):
+                return *config, SecretStr(saved["token"])
+        return self.bindings.get(key)
 
     def reader(self, client, binding):
         _, config, token = binding
@@ -95,14 +112,14 @@ class CIPoller:
             return {"status": "UNKNOWN", "reason": str(exc)}
 
     def poll(self, client):
-        if not self.bindings:
+        if not self.enabled:
             return
         with self.service.db.transaction() as session:
             runs = session.execute(
                 select(Run.workspace_id, Run.id, Run.repository_id).where(*WAITING)
             ).all()
         for workspace_id, run_id, repository_id in runs:
-            binding = self.bindings.get((workspace_id, repository_id))
+            binding = self.binding(client, workspace_id, repository_id)
             if binding is None:
                 continue
             integration_id, config, _ = binding

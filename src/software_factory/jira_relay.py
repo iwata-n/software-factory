@@ -13,14 +13,22 @@ from .security import redact
 from .worker import validate_api_url
 
 
-def read_issue(client, mapping: JiraMapping, issue_key, email, jira_token):
+def read_issue(client, mapping: JiraMapping, issue_key, email, jira_token, *, cloud_id=None):
     if not re.fullmatch(rf"{re.escape(mapping.project_key)}-[0-9]{{1,20}}", issue_key):
         raise ValueError("Issue must belong to the configured Jira project")
+    base = mapping.site
+    headers = {"Accept": "application/json"}
+    auth = None
+    if cloud_id:
+        base = f"https://api.atlassian.com/ex/jira/{cloud_id}"
+        headers["Authorization"] = f"Bearer {jira_token}"
+    else:
+        auth = httpx.BasicAuth(email, jira_token)
     response = client.get(
-        f"{mapping.site}/rest/api/3/issue/{issue_key}",
+        f"{base}/rest/api/3/issue/{issue_key}",
         params={"fields": f"project,updated,{mapping.field_id}"},
-        auth=httpx.BasicAuth(email, jira_token),
-        headers={"Accept": "application/json"},
+        auth=auth,
+        headers=headers,
         follow_redirects=False,
     )
     response.raise_for_status()

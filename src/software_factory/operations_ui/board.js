@@ -60,6 +60,8 @@ function disconnect(text = "接続を終了しました。", error = false) {
   executionButtons.forEach((id) => { get(id).disabled = false; });
   executionContext = undefined;
   closeExecutionForm();
+  get("integration-settings").close();
+  get("integration-open").hidden = true;
   get("execution").hidden = true;
   get("worker-panel").hidden = true;
   get("worker-panel").open = false;
@@ -144,6 +146,7 @@ function renderExecution(context) {
     ? `緊急停止中 · Rev. ${execution.revision}`
     : `実行を許可 · Rev. ${execution.revision}`;
   get("execution-action").hidden = access !== "ADMIN";
+  get("integration-open").hidden = access !== "ADMIN";
   get("execution-action").textContent = execution.stopped ? "緊急停止を解除" : "緊急停止";
 }
 
@@ -547,3 +550,260 @@ detail.addEventListener("close", () => {
 get("execution-action").addEventListener("click", openExecutionForm);
 get("execution-dismiss").addEventListener("click", closeExecutionForm);
 get("execution-form").addEventListener("submit", submitExecution);
+
+const settingsPath = "/v1/operations/integrations";
+const settingsDialog = get("integration-settings");
+let settingsRequest;
+const providerFields = {
+  jira: [
+    ["site", "Jira サイト（https://…atlassian.net）"],
+    ["project_key", "Jira プロジェクトキー"],
+    ["field_id", "TaskSpec フィールド ID"],
+    ["email", "Jira アカウントのメール", "email", "token"],
+  ],
+  slack: [
+    ["channel", "送信先チャンネル ID"],
+    ["team_id", "Slack Workspace ID", "text", "oauth"],
+  ],
+  github: [],
+};
+
+async function integrationCall(path, method, body, signal) {
+  const response = await fetch(settingsPath + path, {
+    method, signal, cache: "no-store", redirect: "error",
+    headers: {Authorization: `Bearer ${token}`, "Content-Type": "application/json"},
+    ...(body === undefined ? {} : {body: JSON.stringify(body)}),
+  });
+  if (!response.ok) {
+    const {code} = await response.json();
+    throw new Error(code ?? "INTEGRATION_REQUEST_FAILED");
+  }
+  return response.status === 204 ? null : response.json();
+}
+
+function integrationMessage(text, error = false) {
+  message("integration-status", text, error);
+}
+
+function settingsAction(action) {
+  return async (event) => {
+    event.preventDefault();
+    if (!settingsRequest || settingsRequest.signal.aborted) return;
+    const control = event.submitter ?? event.currentTarget;
+    const signal = settingsRequest.signal;
+    control.disabled = true;
+    try {
+      await action(signal);
+    } catch (error) {
+      if (!signal.aborted) integrationMessage(`設定を処理できませんでした（${error.message}）`, true);
+    } finally {
+      control.disabled = false;
+    }
+  };
+}
+
+function settingsField(key, label, type = "text", initial = "") {
+  const wrapper = element("label", label, "integration-field");
+  const input = element("input");
+  input.name = key;
+  input.type = type;
+  input.required = true;
+  input.autocomplete = "off";
+  input.spellcheck = false;
+  input.value = initial;
+  wrapper.append(input);
+  return wrapper;
+}
+
+function settingsCard(provider, label, value, oauthAvailable, projects) {
+  const card = element("section", undefined, "detail-section");
+  card.append(element("h3", label), element("p", value.connected ? "設定済み" : "未接続"));
+  const form = element("form");
+  const mode = element("select");
+  mode.name = "mode";
+  for (const [key, title] of [["token", "トークン"], ["oauth", "OAuth"]]) {
+    if (key === "oauth" && !oauthAvailable) continue;
+    const option = element("option", title);
+    option.value = key;
+    mode.append(option);
+  }
+  mode.value = value.mode ?? "token";
+  if (!mode.value) mode.value = "token";
+  if (provider !== "github") {
+    const label = element("label", "認証方式", "integration-field");
+    label.append(mode);
+    form.append(label);
+  }
+  if (provider === "jira") {
+    const projectLabel = element("label", "Factory Project", "integration-field");
+    const project = element("select");
+    project.name = "project_id";
+    project.required = true;
+    const placeholder = element("option", "プロジェクトを選択");
+    placeholder.value = "";
+    project.append(placeholder);
+    for (const {id, name} of projects) {
+      const option = element("option", name);
+      option.value = id;
+      project.append(option);
+    }
+    project.value = value.project_id ?? "";
+    projectLabel.append(project);
+    form.append(projectLabel);
+  }
+  const fields = [...providerFields[provider], ["token", "トークン", "password", "token"]];
+  if (provider !== "github") fields.push(
+    ["client_id", "OAuth Client ID", "text", "oauth"],
+    ["client_secret", "OAuth Client Secret", "password", "oauth"],
+  );
+  const entries = fields.map(([key, label, type, only]) => {
+    const field = settingsField(key, label, type, value[key] ?? "");
+    form.append(field);
+    return [field, only];
+  });
+  function showFields() {
+    for (const [field, only] of entries) {
+      field.hidden = Boolean(only && only !== mode.value);
+      field.querySelector("input").disabled = field.hidden;
+    }
+  }
+  mode.addEventListener("change", showFields);
+  showFields();
+  const save = element("button", "保存");
+  form.append(save);
+  form.addEventListener("submit", settingsAction(async (signal) => {
+    const body = Object.fromEntries(new FormData(form));
+    for (const field of form.querySelectorAll('input[type="password"]')) field.value = "";
+    await integrationCall(`/${provider}`, "PUT", body, signal);
+    await refreshSettings(signal);
+    if (!signal.aborted) integrationMessage("設定を保存しました。");
+  }));
+  card.append(form);
+  if (provider !== "github" && oauthAvailable && value.mode === "oauth") {
+    const start = element("button", "OAuth 認可リンクを発行");
+    const link = element("a", "認可ページを開く（別タブ）");
+    link.hidden = true;
+    link.target = "_blank";
+    link.rel = "noopener noreferrer";
+    start.addEventListener("click", settingsAction(async (signal) => {
+      const result = await integrationCall(`/${provider}/oauth/start`, "POST", undefined, signal);
+      const url = new URL(result.url);
+      const expected = provider === "jira" ? "https://auth.atlassian.com" : "https://slack.com";
+      if (url.origin !== expected) throw new Error("OAUTH_ORIGIN_INVALID");
+      link.href = url.href;
+      link.hidden = false;
+      integrationMessage("認可完了後、この画面で「状態を更新」を押してください。");
+    }));
+    card.append(start, link);
+  }
+  if (value.mode) {
+    const remove = element("button", "設定を削除");
+    remove.addEventListener("click", settingsAction(async (signal) => {
+      if (!window.confirm(`${label} の保存済み設定を削除しますか？`)) return;
+      await integrationCall(`/${provider}`, "DELETE", undefined, signal);
+      await refreshSettings(signal);
+      if (!signal.aborted) integrationMessage("設定を削除しました。");
+    }));
+    card.append(remove);
+  }
+  if (provider === "github") {
+    for (const hook of value.webhooks) {
+      const path = `/github/webhooks/${encodeURIComponent(hook.id)}`;
+      const section = element("section", undefined, "detail-section");
+      section.append(element("h4", `Webhook · ${hook.repository}`), element("p",
+        hook.configured ? "Web設定済み" : hook.environment_configured ? "環境設定を使用" : "未設定"));
+      section.append(element("code", `/v1/webhooks/github/${hook.id}`));
+      const form = element("form");
+      const field = settingsField("secret", "Webhook 署名シークレット", "password");
+      field.querySelector("input").minLength = 32;
+      form.append(field, element("button", "署名シークレットを保存"));
+      form.addEventListener("submit", settingsAction(async (signal) => {
+        const body = Object.fromEntries(new FormData(form));
+        field.querySelector("input").value = "";
+        await integrationCall(path, "PUT", body, signal);
+        await refreshSettings(signal);
+        if (!signal.aborted) integrationMessage("署名シークレットを保存しました。");
+      }));
+      section.append(form);
+      if (hook.configured) {
+        const remove = element("button", "Web設定を解除");
+        remove.addEventListener("click", settingsAction(async (signal) => {
+          if (!window.confirm("Webで保存した署名シークレットを解除しますか？")) return;
+          await integrationCall(path, "DELETE", undefined, signal);
+          await refreshSettings(signal);
+          if (!signal.aborted) integrationMessage("署名シークレットを解除しました。");
+        }));
+        section.append(remove);
+      }
+      card.append(section);
+    }
+  }
+  if (provider === "jira" && value.connected) {
+    const importer = element("form");
+    importer.append(settingsField("issue_key", "取り込む Jira 課題キー"), element("button", "取り込む"));
+    importer.addEventListener("submit", settingsAction(async (signal) => {
+      const result = await integrationCall("/jira/import", "POST", Object.fromEntries(new FormData(importer)), signal);
+      if (!signal.aborted) integrationMessage(`Jira 取り込み結果 · ${result.state}${result.task_id ? " · " + result.task_id : ""}`);
+    }));
+    card.append(importer);
+  }
+  if (provider === "slack" && value.connected) {
+    const deliver = element("button", "保留中の通知を1件配送");
+    deliver.addEventListener("click", settingsAction(async (signal) => {
+      const result = await integrationCall("/slack/deliver", "POST", undefined, signal);
+      if (!signal.aborted) integrationMessage(result.state ? `配送結果 · ${result.state}` : "配送待ちの通知はありません。");
+    }));
+    card.append(deliver);
+  }
+  return card;
+}
+
+async function refreshSettings(signal) {
+  const loopback = ["localhost", "127.0.0.1", "[::1]"].includes(window.location.hostname);
+  if (window.location.protocol !== "https:" && !loopback) {
+    integrationMessage("連携の認証情報を設定するには HTTPS で開いてください。", true);
+    return;
+  }
+  const status = await integrationCall("", "GET", undefined, signal);
+  if (signal.aborted) return;
+  const container = get("integration-providers");
+  container.replaceChildren();
+  if (!status.available) {
+    integrationMessage("連携設定にはサーバーの暗号化キー設定が必要です。", true);
+    return;
+  }
+  const reload = element("button", "状態を更新");
+  reload.addEventListener("click", settingsAction(async (signal) => {
+    await refreshSettings(signal);
+    if (!signal.aborted) integrationMessage("状態を更新しました。");
+  }));
+  container.append(reload);
+  for (const [provider, label] of [["jira", "Jira Cloud"], ["slack", "Slack Bot"], ["github", "GitHub CI 読み取り"]]) {
+    container.append(settingsCard(provider, label, status.providers[provider], status.oauth_available, status.projects));
+  }
+}
+
+get("integration-open").addEventListener("click", async () => {
+  settingsRequest = new AbortController();
+  const {signal} = settingsRequest;
+  settingsDialog.showModal();
+  integrationMessage("設定を取得中…");
+  try {
+    integrationMessage("");
+    await refreshSettings(signal);
+  } catch (error) {
+    if (!signal.aborted) integrationMessage(`設定を取得できませんでした（${error.message}）`, true);
+  }
+});
+settingsDialog.addEventListener("close", () => {
+  if (settingsDialog.open) return;
+  settingsRequest?.abort();
+  get("integration-providers").replaceChildren();
+});
+const oauthResult = new URLSearchParams(location.search).get("oauth");
+if (oauthResult === "connected" || oauthResult === "failed") {
+  message("status", oauthResult === "connected"
+    ? "OAuth 認可が完了しました。このタブを閉じ、元の設定画面で状態を更新してください。"
+    : "OAuth 認可を完了できませんでした。元の設定画面からやり直してください。", oauthResult === "failed");
+  history.replaceState(null, "", location.pathname);
+}

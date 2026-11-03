@@ -21,6 +21,7 @@
     <div id="toolbar" class="controls" hidden>
       <button id="refresh">更新</button>
       <button id="disconnect">切断</button>
+      <button id="integration-open" hidden>連携設定</button>
     </div>
     <section id="execution" class="execution" aria-labelledby="execution-title" hidden>
       <h2 id="execution-title">Workspace の実行状態</h2>
@@ -45,6 +46,14 @@
     <div id="board" class="board" aria-label="Run の状態別一覧" hidden></div>
     <button id="older" hidden>過去の Run を追加表示</button>
   </main>
+  <dialog id="integration-settings" aria-labelledby="integration-title">
+    <header class="detail-header">
+      <h2 id="integration-title">連携設定</h2>
+      <form method="dialog"><button>閉じる</button></form>
+    </header>
+    <p id="integration-status" role="status"></p>
+    <div id="integration-providers"></div>
+  </dialog>
   <dialog id="detail" aria-labelledby="detail-title">
     <header class="detail-header">
       <h2 id="detail-title">Run 詳細</h2>

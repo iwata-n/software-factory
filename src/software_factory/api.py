@@ -43,6 +43,7 @@ from .contracts import (
     WorkspaceExecutionChange,
 )
 from .db import Database
+from .integration_settings import Vault, integration_router, oauth_origin
 from .jira_input import configured_jira, jira_router
 from .models import (
     ApprovalRequest,
@@ -54,6 +55,7 @@ from .models import (
     Gate,
     HistoricalCIObservation,
     IdempotencyRecord,
+    IntegrationSettings,
     Job,
     JobDependency,
     OutboxEvent,
@@ -69,7 +71,7 @@ from .models import (
 from .operations import event_view, operations_router
 from .resolver import SourceResolver
 from .service import DomainError, Service, owned, run_view
-from .slack_delivery import NOTIFICATION
+from .slack_delivery import NOTIFICATION, SlackClient, SlackDispatcher
 
 security = HTTPBearer(auto_error=False)
 
@@ -97,7 +99,10 @@ def create_app(
     )
 
     integrations = configured_webhooks()
-    ci_poller = CIPoller(service, integrations, configured_read_tokens())
+    vault = Vault(service.db, os.getenv("FACTORY_INTEGRATION_KEY"))
+    ci_poller = CIPoller(
+        service, integrations, configured_read_tokens(), vault if vault.cipher else None
+    )
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
@@ -121,9 +126,39 @@ def create_app(
                     logging.getLogger(__name__).error("GitHub CI reconciliation failed")
                 await asyncio.sleep(min(reconcile_interval, 5))
 
+        def deliver_slack():
+            with service.db.transaction() as session:
+                workspaces = session.scalars(
+                    select(IntegrationSettings.workspace_id).where(
+                        IntegrationSettings.provider == "slack"
+                    )
+                ).all()
+            with httpx.Client(timeout=10, trust_env=False) as client:
+                for workspace in workspaces:
+                    try:
+                        if value := vault.active(workspace, "slack", client):
+                            SlackDispatcher(
+                                service.db,
+                                SlackClient(client, value["token"]),
+                                workspace,
+                                value["channel"],
+                            ).deliver_one()
+                    except DomainError:
+                        continue
+
+        async def slack_loop():
+            while True:
+                try:
+                    await run_in_threadpool(deliver_slack)
+                except Exception:
+                    logging.getLogger(__name__).error("Slack dispatch failed")
+                await asyncio.sleep(15)
+
         tasks = [asyncio.create_task(reconciliation_loop())]
-        if ci_poller.bindings:
+        if ci_poller.enabled:
             tasks.append(asyncio.create_task(ci_loop()))
+        if vault.cipher:
+            tasks.append(asyncio.create_task(slack_loop()))
         try:
             yield
         finally:
@@ -142,10 +177,11 @@ def create_app(
         ),
     )
     app.state.service = service
-    app.include_router(webhook_router(service, integrations))
+    app.include_router(webhook_router(service, integrations, vault if vault.cipher else None))
     if jira := configured_jira():
         app.include_router(jira_router(service, *jira))
     app.include_router(operations_router(service, Token))
+    app.include_router(integration_router(service, Token, vault, oauth_origin(), integrations))
 
     @app.exception_handler(DomainError)
     async def domain_error(request: Request, error: DomainError):
@@ -289,14 +325,14 @@ def create_app(
         def query(session, actor):
             run, result = verified_result(session, actor, run_id)
             repo = owned(session, Repository, run.repository_id, actor.workspace_id)
-            binding = ci_poller.bindings.get((run.workspace_id, run.repository_id))
-            if not repo.active or (binding and not ci_poller.matches_repository(repo, binding[1])):
-                return None, result.body["draft_pr"]
-            return binding, result.body["draft_pr"]
+            return repo, result.body["draft_pr"]
 
-        binding, draft = service.read(token, query)
+        repo, draft = service.read(token, query)
         response.headers["Cache-Control"] = "no-store"
         with httpx.Client(timeout=5, trust_env=False) as client:
+            binding = ci_poller.binding(client, repo.workspace_id, repo.id) if repo.active else None
+            if binding and not ci_poller.matches_repository(repo, binding[1]):
+                binding = None
             return ci_poller.observe_result_pr(client, binding, draft)
 
     @app.get("/v1/runs/{run_id}/notifications", tags=["Integrations"])
@@ -1064,6 +1100,7 @@ def main():
     uvicorn.run(
         "software_factory.api:app_factory",
         factory=True,
+        access_log=False,
         host="127.0.0.1",
         port=int(os.environ.get("FACTORY_PORT", "8000")),
     )
