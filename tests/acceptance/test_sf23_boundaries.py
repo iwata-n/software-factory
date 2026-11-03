@@ -1,6 +1,8 @@
 """Run console foundation. Full SF-23 AC01 also needs SF-19 live evidence."""
 
 import json
+import signal
+import socket
 import sys
 from concurrent.futures import ThreadPoolExecutor
 from threading import Barrier
@@ -19,6 +21,7 @@ from software_factory.models import Attempt, AuditEvent, Principal, Project, Run
 from software_factory.service import Service, issue_token, token_hash
 from software_factory.worker_credentials import WorkerCredentials
 from tests.conftest import example_spec
+from tests.test_processes import start_control_plane
 
 
 def test_console_shell_loads_only_packaged_assets(world):
@@ -79,30 +82,56 @@ def test_run_index_paginates_timestamp_ties_and_matches_run_details(world):
 
 
 @pytest.mark.ac("SF-23-AC03")
-def test_event_stream_resumes_from_last_run_revision_after_restart(world):
+def test_event_stream_resumes_from_last_run_revision_after_restart(world, evidence):
     history = f"/v1/runs/{world.run_id}/event-history"
     path = f"/v1/runs/{world.run_id}/events?wait_seconds=0"
-    before = world.get(history).json()["events"]
-    first = world.get(path)
-    assert first.status_code == 200 and first.headers["content-type"].startswith(
-        "text/event-stream"
-    )
-    assert first.headers["cache-control"] == "no-store"
-    assert sse_revisions(first) == [(world.run_id, item["revision"]) for item in before]
-    assert world.claim().status_code == 200
+    headers = {"Authorization": f"Bearer {world.user_token}"}
+    with socket.socket() as listener:
+        listener.bind(("127.0.0.1", 0))
+        port = listener.getsockname()[1]
+    process = start_control_plane(port)
+    old_pid = process.pid
+    try:
+        with httpx.Client(base_url=f"http://127.0.0.1:{port}", headers=headers) as client:
+            before = client.get(history).raise_for_status().json()["events"]
+            first = client.get(path)
+            assert first.status_code == 200
+            assert first.headers["content-type"].startswith("text/event-stream")
+            assert first.headers["cache-control"] == "no-store"
+            assert sse_revisions(first) == [(world.run_id, item["revision"]) for item in before]
+            process.kill()
+            process.communicate(timeout=5)
+            assert process.returncode == -signal.SIGKILL
+            assert world.claim().status_code == 200
 
-    last = f"{world.run_id}:{before[-1]['revision']}"
-    headers = {"Authorization": f"Bearer {world.user_token}", "Last-Event-ID": last}
-    resumed = TestClient(create_app(world.database)).get(path, headers=headers)
-    after = world.get(history).json()["events"][len(before) :]
-    assert after
-    assert sse_revisions(resumed) == [(world.run_id, item["revision"]) for item in after]
-    headers["Last-Event-ID"] = f"{world.run_id}:{after[-1]['revision']}"
-    assert not sse_revisions(world.client.get(path, headers=headers))
+            process = start_control_plane(port)
+            assert process.pid != old_pid
+            last = f"{world.run_id}:{before[-1]['revision']}"
+            resumed = client.get(path, headers={"Last-Event-ID": last})
+            after = client.get(history).raise_for_status().json()["events"][len(before) :]
+            assert after and resumed.status_code == 200
+            assert sse_revisions(resumed) == [(world.run_id, item["revision"]) for item in after]
+            latest = f"{world.run_id}:{after[-1]['revision']}"
+            assert not sse_revisions(client.get(path, headers={"Last-Event-ID": latest}))
+        evidence(
+            "SSE resumes from the persisted cursor after a real Control Plane process restart",
+            {
+                "stopped_pid": old_pid,
+                "restarted_pid": process.pid,
+                "cursor": last,
+                "resumed_revisions": [item["revision"] for item in after],
+                "repeat_from_latest_count": 0,
+            },
+            run_id=world.run_id,
+        )
+    finally:
+        if process.poll() is None:
+            process.terminate()
+            process.communicate(timeout=10)
 
 
 @pytest.mark.ac("SF-23-AC03")
-def test_event_stream_scopes_cursor_and_reports_retained_history_gap(world):
+def test_event_stream_scopes_cursor_and_reports_retained_history_gap(world, evidence):
     path = f"/v1/runs/{world.run_id}/events?wait_seconds=0"
     headers = {"Authorization": f"Bearer {world.user_token}"}
     assert world.get(path, token=world.other_user_token).status_code == 404
@@ -129,6 +158,11 @@ def test_event_stream_scopes_cursor_and_reports_retained_history_gap(world):
         path, headers=headers | {"Last-Event-ID": f"{world.run_id}:{latest - 1}"}
     )
     assert sse_revisions(boundary) == [(world.run_id, latest)]
+    evidence(
+        "Foreign cursor is 404 and expired history is 410 with a recoverable retained boundary",
+        {"foreign_cursor": 404, "expired_cursor": expired.status_code, "latest_revision": latest},
+        run_id=world.run_id,
+    )
 
 
 def sse_revisions(response):
