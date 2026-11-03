@@ -80,7 +80,9 @@ class EngineManifest(BaseModel):
     reasoning_effort: Literal["low", "medium", "high", "xhigh"]
     execution_mode: Literal["structured_text_no_repo_checkout", "isolated_linux"]
     isolation: LinuxIsolation | None = None
-    code_mode_host_sha256: Annotated[str, Field(pattern=r"^[0-9a-f]{64}$")] | None = None
+    code_mode_host_sha256: Annotated[str, Field(pattern=r"^[0-9a-f]{64}$")] | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
     timeout_seconds: int = Field(ge=1, le=2700)
     max_input_bytes: int = Field(ge=1024, le=2 * 1024 * 1024)
     max_output_bytes: int = Field(ge=1024, le=16 * 1024 * 1024)
