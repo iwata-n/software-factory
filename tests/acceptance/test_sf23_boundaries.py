@@ -327,7 +327,9 @@ def test_rotation_races_active_heartbeat_and_claim_without_changing_slot(world, 
 
 
 @pytest.mark.ac("SF-23-AC05")
-def test_workspace_user_access_separates_read_run_operations_and_worker_administration(world):
+def test_workspace_user_access_separates_read_run_operations_and_worker_administration(
+    world, evidence
+):
     viewer, operator = issue_token(), issue_token()
     with world.database.transaction() as session:
         for token, access in ((viewer, "VIEWER"), (operator, "OPERATOR")):
@@ -389,6 +391,8 @@ def test_workspace_user_access_separates_read_run_operations_and_worker_administ
         assert world.get(run_path, token=token).status_code == 200
         assert world.get(f"{root}/workers", token=token).status_code == 200
     assert world.run()["state_revision"] == revision
+    assert world.get(run_path, token=world.other_user_token).status_code == 404
+    assert world.get(f"{root}/workers", token=world.other_user_token).status_code == 404
     assert (
         world.post(enrollment_path, {"kinds": ["PLAN"]}, token=world.other_user_token).status_code
         == 404
@@ -410,6 +414,19 @@ def test_workspace_user_access_separates_read_run_operations_and_worker_administ
     assert world.post(revoke_path, {"reason": "evaluation"}).status_code == 200
     assert world.claim().status_code == 401
     assert world.claim(token=new_worker.json()["worker_token"]).status_code == 204
+    evidence(
+        "Operation authority is enforced per role and Workspace without exposing credentials",
+        {
+            "viewer_denied_operations": len(ordinary_mutations + administrative_mutations),
+            "operator_denied_admin_operations": len(administrative_mutations),
+            "worker_denied_user_operations": len(ordinary_mutations + administrative_mutations),
+            "foreign_workspace": 404,
+            "operator_cancel": 202,
+            "admin_enroll": 201,
+            "admin_revoke": 200,
+            "revoked_worker_claim": 401,
+        },
+    )
 
 
 @pytest.mark.ac("SF-23-AC06")
