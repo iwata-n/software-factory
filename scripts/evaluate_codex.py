@@ -259,7 +259,9 @@ def main():
     output = args.output.resolve()
     output.mkdir(mode=0o700, parents=True, exist_ok=False)
     identity = source_manifest()
-    engine = CodexCLI.from_file(args.codex_binary, ROOT / args.codex_manifest)
+    engine = CodexCLI.from_file(
+        args.codex_binary, ROOT / args.codex_manifest, require_isolation=publish_live
+    )
     image = os.environ["FACTORY_RUNNER_IMAGE_DIGEST"]
     report = {
         "result": "IN_PROGRESS",
@@ -567,6 +569,8 @@ def main():
                 ]
                 if adapter == "pipeline":
                     argv += ["--reviewer", "codex_cli"]
+                if not engine.isolated:
+                    argv.append("--host-codex-evaluation")
                 environment = base_env | {
                     "FACTORY_WORKER_TOKEN": secret,
                     "FACTORY_RUNNER_IMAGE_DIGEST": image,

@@ -379,3 +379,23 @@ def test_linux_startup_diagnostic_does_not_replace_valid_turn():
         parse_events(encoded([items[0], warning]))
     with pytest.raises(CodexError, match="CODEX_TOOL_ACTIVITY_DENIED"):
         parse_events(encoded([*items[:2], warning, *items[2:]]))
+
+
+@pytest.mark.parametrize(
+    "role", [("--adapter", "codex_cli"), ("--adapter", "pipeline", "--reviewer", "codex_cli")]
+)
+def test_worker_requires_isolation_for_model_roles(monkeypatch, capsys, tmp_path, role):
+    import sys
+
+    from software_factory.worker import main
+
+    monkeypatch.setenv("FACTORY_WORKER_TOKEN", "synthetic")
+    monkeypatch.delenv("FACTORY_WORKER_CREDENTIAL_FILE", raising=False)
+    monkeypatch.delenv("FACTORY_CODEX_MANIFEST", raising=False)
+    monkeypatch.setattr(
+        sys, "argv", ["worker", *role, "--codex-binary", str(tmp_path / "must-not-open")]
+    )
+    with pytest.raises(SystemExit) as denied:
+        main()
+    assert denied.value.code == 2
+    assert "ISOLATED_CODEX_RUNNER_REQUIRED" in capsys.readouterr().err
