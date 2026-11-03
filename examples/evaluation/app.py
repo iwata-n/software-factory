@@ -2,7 +2,7 @@
 
 
 def describe_items(items):
-    return ", ".join(items)
+    return ", ".join(items) if items else "データがありません"
 
 
 def parse_count(value):
