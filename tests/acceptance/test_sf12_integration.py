@@ -122,6 +122,26 @@ def test_real_fail_creates_repair_intent_without_publication(pipeline, evidence)
     )
 
 
+@pytest.mark.ac("SF-20-AC02")
+def test_model_review_pass_cannot_override_required_verifier_failure(pipeline, evidence):
+    pipeline.prepare(PATCH.replace(b"+value = 2", b"+value = 3"))
+    assert pipeline.assemble()["accepted"]
+    review = prepared(pipeline, "REVIEW", Reviewer("PASS"))
+    assert deliver(pipeline, review).status_code == 200
+    assert rows(pipeline, Gate) == []
+    assert not [job for job in rows(pipeline, Job) if job.kind == "PUBLISH_DRAFT"]
+
+    assert deliver(pipeline, prepared(pipeline, "VERIFY")).status_code == 200
+    (gate,) = rows(pipeline, Gate)
+    assert gate.status == "FAIL" and pipeline.world.run()["phase"] == "REPAIR"
+    assert not [job for job in rows(pipeline, Job) if job.kind == "PUBLISH_DRAFT"]
+    evidence(
+        "Review PASS alone cannot produce a Gate; the required verifier failure requests repair",
+        {"review": "PASS", "gate": gate.status, "publication_jobs": 0},
+        candidate_id=gate.candidate_id,
+    )
+
+
 @pytest.mark.ac("SF-12-AC02")
 @pytest.mark.parametrize("source_bundle", ["timeout"], indirect=True)
 def test_infrastructure_error_retries_same_job_and_input_until_limit(pipeline, clock, evidence):

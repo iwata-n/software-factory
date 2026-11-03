@@ -10,6 +10,7 @@ import difflib
 import hashlib
 import json
 import os
+import signal
 import socket
 import subprocess
 import sys
@@ -29,6 +30,7 @@ from sqlalchemy import MetaData, select, text
 from sqlalchemy.engine import make_url
 
 from software_factory.adapters import AgentResult, Capabilities, FakeAgent, ProducedArtifact
+from software_factory.contracts import digest
 from software_factory.db import Database
 from software_factory.models import CIWebhookDelivery, PublicationOperation, Run, RunEvent
 from software_factory.pipeline_worker import PipelineAdapter
@@ -234,6 +236,84 @@ def verify_live_ci(
     print(json.dumps({"run_id": run_id, "pr": draft["url"], "ci": check["url"]}), flush=True)
 
 
+def verify_live_pr_drift(user, run_id, output, identity, restart_control_plane):
+    path = f"/v1/runs/{run_id}/result"
+    original = user.get(path).raise_for_status().json()
+    draft = original["draft_pr"]
+    head_ref = f"codex/factory/{run_id}"
+    assert draft["head_ref"] == head_ref
+    assert draft["base_ref"].startswith("codex/factory-evaluation/")
+
+    def mutate(method, resource, body):
+        return json.loads(
+            subprocess.check_output(
+                ["gh", "api", "--method", method, f"repos/{REPOSITORY}/{resource}", "--input", "-"],
+                input=json.dumps(body).encode(),
+                timeout=25,
+            )
+        )
+
+    commit = github(f"git/commits/{draft['head_sha']}")
+    new_head = mutate(
+        "POST",
+        "git/commits",
+        {
+            "message": "Synthetic operator follow-up after Factory verification",
+            "tree": commit["tree"]["sha"],
+            "parents": [draft["head_sha"]],
+        },
+    )["sha"]
+    assert new_head != draft["head_sha"]
+    mutate("PATCH", f"git/refs/heads/{head_ref}", {"sha": new_head, "force": False})
+    deadline = time.monotonic() + 240
+    while time.monotonic() < deadline:
+        moved = user.get(path + "/current-pr").raise_for_status().json()
+        runs = github(f"actions/runs?head_sha={new_head}&event=pull_request")["workflow_runs"]
+        current_ci = next(
+            (
+                run
+                for run in runs
+                if run["path"] == EVALUATION_WORKFLOW and run["status"] == "completed"
+            ),
+            None,
+        )
+        if moved.get("head_sha") == new_head and current_ci:
+            break
+        time.sleep(3)
+    else:
+        raise RuntimeError("GitHub did not expose the changed head and completed CI")
+    assert not moved["target_matches"] and current_ci["head_sha"] == new_head
+    after_ci = user.get(path).raise_for_status().json()
+    assert after_ci == original
+    closed = mutate("PATCH", f"pulls/{draft['number']}", {"state": "closed"})
+    assert closed["state"] == "closed" and not closed["merged"]
+    restart_control_plane()
+    current = user.get(path + "/current-pr").raise_for_status().json()
+    assert current["state"] == "CLOSED" and not current["target_matches"]
+    assert current["head_sha"] == new_head
+    after_close = user.get(path).raise_for_status().json()
+    assert after_close == original
+    report = {
+        "revision": identity["revision"],
+        "run_id": run_id,
+        "pr_url": draft["url"],
+        "historical_head": draft["head_sha"],
+        "current_head": new_head,
+        "current_ci": {
+            "id": current_ci["id"],
+            "url": current_ci["html_url"],
+            "conclusion": current_ci["conclusion"],
+        },
+        "original_result": original,
+        "result_digests": [digest(snapshot) for snapshot in (original, after_ci, after_close)],
+        "current_pr": current,
+        "historical_result_unchanged": True,
+        "merged": closed["merged"],
+    }
+    (output / "current-pr-drift.json").write_text(json.dumps(report, indent=2) + "\n")
+    print(json.dumps(report), flush=True)
+
+
 def verify_live_ci_failure(user, run, publication, state, output, identity, restart_control_plane):
     run_id = run["run_id"]
     candidate_id = run["current_candidate_id"]
@@ -277,52 +357,162 @@ def verify_live_ci_failure(user, run, publication, state, output, identity, rest
     print(json.dumps({"run_id": run_id, "pr": draft["url"], "ci": check["url"]}), flush=True)
 
 
+def crash_publisher_before_report():
+    """Run the isolated fault-injection child with credentials supplied only on stdin."""
+    settings = json.load(sys.stdin)
+
+    class InterruptedPublisher(GitHubDraftPublisher):
+        def publish(self, inputs):
+            super().publish(inputs)
+            os.kill(os.getpid(), signal.SIGKILL)
+
+    with httpx.Client(
+        base_url=settings["cp_url"],
+        trust_env=False,
+        headers={"Authorization": f"Bearer {settings['publisher_token']}"},
+    ) as client:
+        PublisherSupervisor(
+            client,
+            InterruptedPublisher(SourcePolicy((REMOTE,)), settings["github_token"]),
+            PublicationJournal(Path(settings["journal"])),
+        ).run_once()
+    raise RuntimeError("Publisher did not reach the lost-response injection point")
+
+
+def interrupt_live_publication(journal_path, cp_url, publisher_token, github_token):
+    child = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "import sys; sys.path.insert(0, 'scripts'); "
+            "from evaluate_publication import crash_publisher_before_report; "
+            "crash_publisher_before_report()",
+        ],
+        cwd=ROOT,
+        env={
+            **{key: os.environ[key] for key in ("PATH", "HOME", "LANG") if key in os.environ},
+            "PYTHONPATH": str(ROOT / "src"),
+        },
+        input=json.dumps(
+            {
+                "cp_url": cp_url,
+                "publisher_token": publisher_token,
+                "github_token": github_token,
+                "journal": str(journal_path),
+            }
+        ),
+        text=True,
+        capture_output=True,
+        timeout=180,
+    )
+    if child.returncode != -signal.SIGKILL:
+        raise RuntimeError("Publisher did not terminate at the lost-response injection point")
+    pending = PublicationJournal(journal_path).read()
+    assert pending["phase"] == "STARTED" and "report" not in pending
+    operation = pending["operation"]
+    with Database().transaction() as session:
+        stored = session.get(PublicationOperation, operation["operation_id"])
+        assert stored.state == "IN_FLIGHT"
+    return operation
+
+
+def matching_live_drafts(operation):
+    target = operation["target"]
+    params = httpx.QueryParams(
+        state="all",
+        head=f"{REPOSITORY.split('/')[0]}:{target['head_ref']}",
+        base=target["base_ref"],
+    )
+    return github(f"pulls?{params}")
+
+
+def verify_live_restart(output, identity, publisher, run_id, cp_url, publish, on_unknown=None):
+    github_token = subprocess.check_output(
+        ["gh", "auth", "token", "--hostname", "github.com"], text=True
+    ).strip()
+    journal = output / "interrupted-publisher"
+    operation = interrupt_live_publication(
+        journal, cp_url, publisher["publisher_token"], github_token
+    )
+    (before,) = matching_live_drafts(operation)
+    assert before["draft"] and before["head"]["sha"] == operation["target"]["candidate"]["head_sha"]
+    restarted, publication = publish(journal)
+    assert restarted["state"] == "UNKNOWN"
+    (unknown,) = publication["operations"]
+    assert unknown["state"] == "UNKNOWN" and unknown["next_reconcile_at"] is not None
+    if on_unknown is not None:
+        on_unknown()
+    with httpx.Client(
+        base_url=cp_url,
+        trust_env=False,
+        headers={"Authorization": f"Bearer {publisher['publisher_token']}"},
+    ) as client:
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline:
+            reply = client.get("/v1/publisher/reconciliations")
+            reply.raise_for_status()
+            if reply.json()["operations"]:
+                break
+            time.sleep(0.1)
+        else:
+            raise RuntimeError("read-only recovery did not become due")
+    recovered, publication = publish(journal)
+    assert recovered["state"] == "SUCCEEDED"
+    (completed,) = publication["operations"]
+    assert completed["operation_id"] == unknown["operation_id"] == operation["operation_id"]
+    assert completed["state"] == "SUCCEEDED" and completed["reconcile_attempts"] == 1
+    observed = publication["pull_request"]
+    assert observed["number"] == before["number"] and observed["head_sha"] == before["head"]["sha"]
+    (after,) = matching_live_drafts(operation)
+    assert (after["id"], after["head"]["sha"]) == (before["id"], before["head"]["sha"])
+    reads = publication["observations"][-1]["body"]["provider_requests"]
+    assert reads and all(item["method"] == "GET" for item in reads)
+    with Database().transaction() as session:
+        events = session.scalars(
+            select(RunEvent).where(RunEvent.run_id == run_id).order_by(RunEvent.revision)
+        )
+        recovered_states = [
+            "RECONCILING" if event.kind == "PUBLICATION_RECONCILING" else event.body["status"]
+            for event in events
+            if event.kind in {"PUBLICATION_RECONCILING", "PUBLICATION_RESULT_RECORDED"}
+            and event.body.get("operation_id") == operation["operation_id"]
+        ]
+    assert recovered_states == ["UNKNOWN", "RECONCILING", "SUCCEEDED"]
+    evidence = {
+        "revision": identity["revision"],
+        "run_id": run_id,
+        "publisher_exit_signal": "SIGKILL",
+        "journal_phase_at_crash": "STARTED",
+        "states": ["IN_FLIGHT", *recovered_states],
+        "operation_id": operation["operation_id"],
+        "operation_key": operation["operation_key"],
+        "base_sha": operation["target"]["candidate"]["base_sha"],
+        "pull_request": observed["url"],
+        "head_sha": observed["head_sha"],
+        "provider_requests": reads,
+        "matching_prs_before": 1,
+        "matching_prs_after": 1,
+    }
+    (output / "evaluation.json").write_text(json.dumps(evidence, indent=2) + "\n")
+    print(json.dumps(evidence), flush=True)
+    return publication
+
+
 def verify_live_restore(output, identity, account, publisher, run_id, cp_url, cp_environment):
-    """Lose the provider response before CP persistence, then recover from an encrypted backup."""
-
-    class LostPublicationReport(Exception):
-        pass
-
-    def interrupt(point):
-        if point == "publisher.after_external":
-            raise LostPublicationReport
-
+    """Kill the Publisher before result persistence, then recover from an encrypted backup."""
     github_token = subprocess.check_output(
         ["gh", "auth", "token", "--hostname", "github.com"], text=True
     ).strip()
     original_token = publisher["publisher_token"]
     backend = GitHubDraftPublisher(SourcePolicy((REMOTE,)), github_token)
-    journal = PublicationJournal(output / "interrupted-publisher")
-    with httpx.Client(
-        base_url=cp_url, trust_env=False, headers={"Authorization": f"Bearer {original_token}"}
-    ) as client:
-        try:
-            PublisherSupervisor(client, backend, journal, checkpoint=interrupt).run_once()
-        except LostPublicationReport:
-            pending = journal.read()
-        else:
-            raise RuntimeError("Publisher did not reach the lost-report injection point")
-    if pending["report"]["status"] != "SUCCEEDED":
-        raise RuntimeError(f"GitHub publication failed: {pending['report'].get('reason')}")
-    pull = pending["report"]["pull_request"]
-    operation = pending["operation"]
+    operation = interrupt_live_publication(
+        output / "interrupted-publisher", cp_url, original_token, github_token
+    )
     source = Database()
-    with source.transaction() as session:
-        stored = session.get(PublicationOperation, operation["operation_id"])
-        assert stored.state == "IN_FLIGHT"
-
-    def remote_matches():
-        params = httpx.QueryParams(
-            state="all",
-            head=f"{REPOSITORY.split('/')[0]}:{pull['head_ref']}",
-            base=pull["base_ref"],
-        )
-        return [
-            (item["id"], item["number"], item["head"]["sha"]) for item in github(f"pulls?{params}")
-        ]
-
-    before = remote_matches()
-    assert len(before) == 1 and before[0][1:] == (pull["number"], pull["head_sha"])
+    (pull,) = matching_live_drafts(operation)
+    assert pull["draft"] and not pull.get("merged")
+    assert pull["head"]["sha"] == operation["target"]["candidate"]["head_sha"]
+    before = [(pull["id"], pull["number"], pull["head"]["sha"])]
     name = "sf24_publication_" + uuid4().hex
     with source.engine.connect().execution_options(isolation_level="AUTOCOMMIT") as connection:
         connection.execute(text(f"CREATE DATABASE {name}"))
@@ -419,9 +609,12 @@ def verify_live_restore(output, identity, account, publisher, run_id, cp_url, cp
                     assert reads and all(item["method"] == "GET" for item in reads)
                     result = client.get(f"/v1/runs/{run_id}/publication").json()
                     assert result["pull_request"]["number"] == pull["number"]
-                    assert result["pull_request"]["head_sha"] == pull["head_sha"]
+                    assert result["pull_request"]["head_sha"] == pull["head"]["sha"]
                     post(client, path, action)
-                after = remote_matches()
+                after = [
+                    (p["id"], p["number"], p["head"]["sha"])
+                    for p in matching_live_drafts(operation)
+                ]
                 assert after == before
             finally:
                 process.terminate()
@@ -430,8 +623,10 @@ def verify_live_restore(output, identity, account, publisher, run_id, cp_url, cp
             "evaluation": "SF24_LIVE_PUBLICATION_RESTORE",
             "revision": identity["revision"],
             "run_id": run_id,
-            "pull_request": pull["url"],
-            "head_sha": pull["head_sha"],
+            "pull_request": pull["html_url"],
+            "head_sha": pull["head"]["sha"],
+            "publisher_exit_signal": "SIGKILL",
+            "journal_phase_at_crash": "STARTED",
             "pre_restore_operation": "IN_FLIGHT",
             "recovered_operation": recovery["state"],
             "provider_requests": reads,
@@ -466,14 +661,26 @@ def main():
     parser.add_argument("--actions-workflow-id", type=int)
     parser.add_argument("--fixture-base-sha")
     parser.add_argument("--restore-publication", action="store_true")
+    parser.add_argument("--restart-publisher", action="store_true")
+    parser.add_argument("--restart-control-plane", action="store_true")
+    parser.add_argument("--drift-current-pr", action="store_true")
     parser.add_argument("--expect-ci-failure", action="store_true")
     parser.add_argument("--live-webhook", action="store_true")
     args = parser.parse_args()
     live_ci = args.actions_workflow_id is not None
-    if (args.restore_publication or args.expect_ci_failure or args.live_webhook) and not live_ci:
+    recovery = args.restore_publication or args.restart_publisher or args.restart_control_plane
+    if (
+        recovery or args.expect_ci_failure or args.live_webhook or args.drift_current_pr
+    ) and not live_ci:
         parser.error("restore and failure rehearsals require the fixed Actions evaluation profile")
-    if args.restore_publication and (args.expect_ci_failure or args.live_webhook):
+    if recovery and (
+        args.expect_ci_failure
+        or args.live_webhook
+        or sum((args.restore_publication, args.restart_publisher, args.restart_control_plane)) > 1
+    ):
         parser.error("select one rehearsal at a time")
+    if args.drift_current_pr and (recovery or args.expect_ci_failure or args.live_webhook):
+        parser.error("PR drift rehearsal requires the successful polling profile")
     if live_ci != bool(args.fixture_base_sha):
         parser.error("--actions-workflow-id and --fixture-base-sha must be specified together")
     if live_ci and (
@@ -706,6 +913,60 @@ def main():
                 'return ", ".join(items) if items else "データがありません"',
             )
             fixture = FixtureAgent(before, first)
+
+            def restart_control_plane():
+                process = processes[-1]
+                if args.restart_control_plane:
+                    process.kill()
+                else:
+                    process.terminate()
+                process.wait(timeout=10)
+                log = files.enter_context((output / "control-plane-restarts.log").open("ab"))
+                processes[-1] = subprocess.Popen(
+                    [sys.executable, "-m", "software_factory.cli", "serve"],
+                    env=cp_environment,
+                    cwd=ROOT,
+                    stdout=log,
+                    stderr=log,
+                )
+                wait_ready(cp_url + "/healthz", processes[-1])
+                return [process.pid, processes[-1].pid], process.returncode
+
+            restart_samples = {}
+
+            def snapshot():
+                values = {}
+                for name in ("", "/publication", "/result", "/notifications", "/event-history"):
+                    reply = user.get(f"/v1/runs/{run_id}{name}")
+                    assert reply.status_code == (
+                        404 if name == "/result" and values[""]["status"] != "SUCCEEDED" else 200
+                    ), reply.text
+                    values[name] = reply.json()
+                return values
+
+            def capture_restart():
+                before = snapshot()
+                pids, exit_code = restart_control_plane()
+                after = snapshot()
+                assert exit_code == -signal.SIGKILL and pids[0] != pids[1]
+                assert after == before
+                run = before[""]
+                (operation,) = before["/publication"]["operations"]
+                restart_samples[run["phase"] if run["status"] != "SUCCEEDED" else "SUCCEEDED"] = {
+                    "pids": pids,
+                    "exit_code": exit_code,
+                    "before_digest": digest(before),
+                    "after_digest": digest(after),
+                    "operation_key": operation["operation_key"],
+                    "next_reconcile_at": operation["next_reconcile_at"],
+                    "ci_deadline_at": (run.get("wait_context") or {}).get("deadline_at"),
+                    "pull_request": (before["/publication"]["pull_request"] or {}).get("url"),
+                    "result_id": before["/result"].get("result_id"),
+                    "notification_keys": [
+                        row["delivery_key"] for row in before["/notifications"]["notifications"]
+                    ],
+                }
+
             assert Supervisor(agent_client, fixture, heartbeat_interval=0.1).run_once()["accepted"]
             approvals = user.get(f"/v1/runs/{run_id}/approvals").json()
             request = approvals[0]
@@ -750,7 +1011,7 @@ def main():
                         "transport candidate did not pass the actual local golden checks"
                     )
 
-            def publish():
+            def publish(state_dir=output / "publisher"):
                 result = process_json(
                     [
                         sys.executable,
@@ -764,7 +1025,7 @@ def main():
                         "--allowed-remote",
                         REMOTE,
                         "--state-dir",
-                        str(output / "publisher"),
+                        str(state_dir),
                         "--once",
                     ],
                     environment=base_environment,
@@ -777,12 +1038,21 @@ def main():
 
             assert Supervisor(agent_client, fixture, heartbeat_interval=0.1).run_once()["accepted"]
             managed_stages()
+            if args.restart_publisher:
+                verify_live_restart(output, identity, publisher, run_id, cp_url, publish)
+                return
             if args.restore_publication:
                 verify_live_restore(
                     output, identity, account, publisher, run_id, cp_url, cp_environment
                 )
                 return
-            if not args.live_webhook:
+            if args.restart_control_plane:
+                publication = verify_live_restart(
+                    output, identity, publisher, run_id, cp_url, publish, capture_restart
+                )
+                (output / "evaluation.json").rename(output / "sf19-restart-verification.json")
+                capture_restart()
+            elif not args.live_webhook:
                 result, publication = publish()
                 assert result["state"] == "SUCCEEDED" and state()["phase"] == "WAIT_CI"
             if live_ci:
@@ -807,22 +1077,6 @@ def main():
                     {integration_id: provider_token}
                 )
 
-                def restart_control_plane():
-                    process = processes.pop()
-                    process.terminate()
-                    process.wait(timeout=10)
-                    log = files.enter_context((output / "control-plane-live-ci.log").open("ab"))
-                    processes.append(
-                        subprocess.Popen(
-                            [sys.executable, "-m", "software_factory.cli", "serve"],
-                            env=cp_environment,
-                            cwd=ROOT,
-                            stdout=log,
-                            stderr=log,
-                        )
-                    )
-                    wait_ready(cp_url + "/healthz", processes[-1])
-
                 restart_control_plane()
                 if args.live_webhook:
                     hook_path = f"/v1/webhooks/github/{integration_id}"
@@ -838,42 +1092,76 @@ def main():
                     state,
                     output,
                     identity,
-                    restart_control_plane,
+                    capture_restart if args.restart_control_plane else restart_control_plane,
                     expect_failure=args.expect_ci_failure,
                 )
-                if args.live_webhook:
-                    with Database().transaction() as session:
-                        deliveries = list(
-                            session.scalars(
-                                select(CIWebhookDelivery)
-                                .where(CIWebhookDelivery.integration_id == integration_id)
-                                .order_by(CIWebhookDelivery.received_at)
-                            )
+                with Database().transaction() as session:
+                    deliveries = list(
+                        session.scalars(
+                            select(CIWebhookDelivery)
+                            .where(CIWebhookDelivery.integration_id == integration_id)
+                            .order_by(CIWebhookDelivery.received_at)
                         )
-                        triggers = list(
-                            session.scalars(
-                                select(RunEvent)
-                                .where(
-                                    RunEvent.run_id == run_id,
-                                    RunEvent.kind == "GITHUB_CI_RECONCILED",
-                                )
-                                .order_by(RunEvent.revision)
+                    )
+                    triggers = list(
+                        session.scalars(
+                            select(RunEvent)
+                            .where(
+                                RunEvent.run_id == run_id,
+                                RunEvent.kind == "GITHUB_CI_RECONCILED",
                             )
+                            .order_by(RunEvent.revision)
                         )
-                    proof = {
-                        "deliveries": [
+                    )
+                proof = {
+                    "deliveries": [
+                        {
+                            "id": row.delivery_id,
+                            "event": row.event,
+                            "received_at": row.received_at,
+                        }
+                        for row in deliveries
+                    ],
+                    "reconciliations": [row.body for row in triggers],
+                }
+                expected_trigger = "WEBHOOK" if args.live_webhook else "POLL"
+                assert any(row.event != "ping" for row in deliveries) == args.live_webhook
+                assert triggers and triggers[-1].body.get("trigger") == expected_trigger
+                (output / "ci-trigger.json").write_text(json.dumps(proof, indent=2) + "\n")
+                if args.restart_control_plane:
+                    before = snapshot()
+                    (operation,) = publication["operations"]
+                    body = publication["observations"][-1]["body"]
+                    report_key = "publish-report:" + digest(body)
+                    replay = user.post(
+                        f"/v1/publisher/operations/{operation['operation_id']}/reports",
+                        json=body,
+                        headers={
+                            "Authorization": "Bearer " + publisher["publisher_token"],
+                            "Idempotency-Key": report_key,
+                        },
+                    )
+                    replay.raise_for_status()
+                    assert replay.json()["operation"]["operation_id"] == operation["operation_id"]
+                    after = snapshot()
+                    assert after == before
+                    assert set(restart_samples) == {"PUBLISH_UNKNOWN", "WAIT_CI", "SUCCEEDED"}
+                    (output / "sf19-verification.json").write_text(
+                        json.dumps(
                             {
-                                "id": row.delivery_id,
-                                "event": row.event,
-                                "received_at": row.received_at,
-                            }
-                            for row in deliveries
-                        ],
-                        "reconciliations": [row.body for row in triggers],
-                    }
-                    (output / "webhook.json").write_text(json.dumps(proof, indent=2) + "\n")
-                    assert any(row.event != "ping" for row in deliveries)
-                    assert triggers and triggers[-1].body.get("trigger") == "WEBHOOK"
+                                "revision": identity["revision"],
+                                "run_id": run_id,
+                                "stages": restart_samples,
+                                "publisher_report_key": report_key,
+                                "after_replay_digest": digest(after),
+                                "evaluation": json.loads((output / "evaluation.json").read_text()),
+                            },
+                            indent=2,
+                        )
+                        + "\n"
+                    )
+                if args.drift_current_pr:
+                    verify_live_pr_drift(user, run_id, output, identity, restart_control_plane)
                 return
             first_publication = publication
             database = Database()

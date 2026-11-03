@@ -1,4 +1,4 @@
-"""DB-free, opt-in Docker integration probes for the first SF-21 implementation."""
+"""Opt-in Docker acceptance probes for SF-21."""
 
 import json
 import os
@@ -12,6 +12,24 @@ from software_factory.sandbox import DockerRunner
 
 IMAGE = os.environ.get("SF21_TEST_IMAGE")
 pytestmark = pytest.mark.skipif(not IMAGE, reason="set SF21_TEST_IMAGE to a pinned runner image")
+
+
+def host_pid_namespace(image):
+    probe = DockerRunner.docker(
+        "run",
+        "--rm",
+        "--network",
+        "none",
+        "--pid",
+        "host",
+        "--entrypoint",
+        "readlink",
+        image,
+        "/proc/self/ns/pid",
+        timeout=8,
+    )
+    assert probe.returncode == 0, probe.stderr.decode()
+    return probe.stdout.decode().strip()
 
 
 def argv(script, lease, job, image=IMAGE):
@@ -69,8 +87,9 @@ def removed(container):
     return result.returncode and b"no such" in result.stderr.lower()
 
 
+@pytest.mark.ac("SF-21-AC05")
 @pytest.mark.parametrize("trigger", ["cancel", "owner_death", "lease", "job"])
-def test_stops_term_resistant_tree(tmp_path, trigger):
+def test_stops_term_resistant_tree(tmp_path, trigger, evidence):
     script = """
 import os, signal, time
 signal.signal(signal.SIGTERM, signal.SIG_IGN)
@@ -155,7 +174,8 @@ sys.stdin.read()
         events = records(audit_file)
         term, kill = (row for row in events if row["Action"] == "kill")
         assert [row["Actor"]["Attributes"]["signal"] for row in (term, kill)] == ["15", "9"]
-        assert 5 <= (kill["timeNano"] - term["timeNano"]) / 1e9 < 6
+        grace_seconds = (kill["timeNano"] - term["timeNano"]) / 1e9
+        assert 5 <= grace_seconds < 6
         # Test-only observer in the Linux VM's host PID namespace.
         probe = DockerRunner.docker(
             "run",
@@ -174,6 +194,19 @@ sys.stdin.read()
         )
         assert probe.returncode == 0, probe.stderr.decode()
         (tmp_path / "pids.json").write_text(json.dumps({"container": pids, "host": host_pids}))
+        evidence(
+            "TERM-resistant process tree stopped and reclaimed after the five-second grace",
+            {
+                "trigger": trigger,
+                "reason": stopping["reason"],
+                "term_to_kill_seconds": grace_seconds,
+                "stop_seconds": stopped["monotonic"] - stopping["monotonic"],
+                "remaining_at_stop_start_seconds": min(lease, job) - stopping["monotonic"],
+                "linux_host_pids_absent": host_pids,
+                "container_removed": True,
+            },
+            container_id=container,
+        )
     finally:
         proc.stdin.close()
         if proc.poll() is None:
@@ -183,11 +216,11 @@ sys.stdin.read()
 @pytest.mark.parametrize(
     ("remaining", "bad_image", "code"),
     [
-        (10, False, "INSUFFICIENT_EXECUTION_TIME"),
+        pytest.param(10, False, "INSUFFICIENT_EXECUTION_TIME", marks=pytest.mark.ac("SF-21-AC05")),
         (50, True, "IMAGE_DIGEST_MISMATCH"),
     ],
 )
-def test_admission_rejects_before_create(remaining, bad_image, code):
+def test_admission_rejects_before_create(remaining, bad_image, code, evidence):
     now = time.monotonic()
     image = "sha256:" + "0" * 64 if bad_image else IMAGE
     with subprocess.Popen(
@@ -197,10 +230,13 @@ def test_admission_rejects_before_create(remaining, bad_image, code):
     ) as proc:
         # Keep the owner pipe open until the watchdog exits.
         assert proc.wait(timeout=7) == 1
-        assert [row["code"] for row in map(json.loads, proc.stdout)] == [code]
+        trace = list(map(json.loads, proc.stdout))
+        assert [(row["event"], row["code"]) for row in trace] == [("rejected", code)]
+        evidence("Rejected before container creation", trace, remaining_seconds=remaining)
 
 
-def test_live_isolation_and_limits(tmp_path, monkeypatch):
+@pytest.mark.ac("SF-21-AC03", "SF-21-AC04")
+def test_live_isolation_and_limits(tmp_path, monkeypatch, evidence):
     host_canary = tmp_path / "secret"
     host_canary.write_text("host-only")
     monkeypatch.setenv("CP_TOKEN", "cp-canary")
@@ -222,8 +258,10 @@ for p in ['/var/run/docker.sock', '/root/.ssh', HOST_CANARY]:
         pass
     else:
         raise AssertionError(p)
-Path('/work/escape').symlink_to(HOST_CANARY)
-assert not Path('/work/escape').exists()
+escape = Path('/work/escape')
+escape.symlink_to(HOST_CANARY)
+assert not escape.exists()
+escape.unlink()
 try:
     Path('/etc/sf21').touch()
 except OSError as exc:
@@ -289,9 +327,21 @@ raise SystemExit(72)
         assert proc.wait(timeout=12) == 1
         assert event(trace_file, "exited")["exit_code"] == 72
         assert removed(container)
+        evidence(
+            "The kernel rejects writes and forks past the fixed quota",
+            {
+                "limits": metrics["limits"],
+                "direct_public_private_metadata_routes": metrics["network"],
+                "work_bytes_before_enospc": metrics["work_bytes"],
+                "peak_pids_before_eagain": metrics["peak_pids"],
+                "exit_code": event(trace_file, "exited")["exit_code"],
+            },
+            container_id=container,
+        )
 
 
-def test_memory_pressure_is_oom_failure(tmp_path):
+@pytest.mark.ac("SF-21-AC04")
+def test_memory_pressure_is_oom_failure(tmp_path, evidence):
     script = """
 import time
 from pathlib import Path
@@ -310,9 +360,15 @@ while True:
         exit_event = event(trace_file, "exited")
         assert exit_event["oom_killed"] and exit_event["exit_code"] == 137
         assert removed(container)
+        evidence(
+            "Memory pressure triggers cgroup OOM and nonzero runtime exit",
+            {"limit_bytes": 2**31, "runtime_exit": exit_event},
+            container_id=container,
+        )
 
 
-def test_cpu_pressure_is_throttled(tmp_path):
+@pytest.mark.ac("SF-21-AC04")
+def test_cpu_pressure_is_throttled(tmp_path, evidence):
     script = """
 import json, os, time
 from pathlib import Path
@@ -350,6 +406,11 @@ time.sleep(2)
         (tmp_path / "cpu-metrics.json").write_text(json.dumps(metrics, indent=2))
         assert proc.wait(timeout=8) == 0
         assert removed(container)
+        evidence(
+            "Eight runnable children are throttled within a two-CPU quota",
+            metrics,
+            container_id=container,
+        )
 
 
 def test_concurrent_sandboxes_have_separate_work_and_tmp(tmp_path):
@@ -389,7 +450,8 @@ while True:
         assert removed(b)
 
 
-def test_codex_owner_death_reclaims_network_and_auth_copy(tmp_path):
+@pytest.mark.ac("SF-21-AC05", "SF-21-AC06")
+def test_codex_owner_death_reclaims_network_and_auth_copy(tmp_path, evidence):
     from uuid import uuid4
 
     from software_factory.codex_watchdog import AUTH_PREFIX, names
@@ -430,7 +492,8 @@ with owner_guard(invocation, scratch):
         owner.kill()
         assert owner.wait(timeout=2) == -9
         until(lambda: removed(container), timeout=8)
-        assert 5 <= time.monotonic() - started < 8
+        stop_seconds = time.monotonic() - started
+        assert 5 <= stop_seconds < 8
 
         def reclaimed():
             networks = DockerRunner.docker("network", "ls", "--format", "{{.Name}}", timeout=2)
@@ -442,6 +505,16 @@ with owner_guard(invocation, scratch):
             )
 
         until(reclaimed, timeout=10)
+        evidence(
+            "Codex owner death reclaims the container, gateway, networks and auth copy",
+            {
+                "owner_exit_code": owner.returncode,
+                "stop_seconds": stop_seconds,
+                "reclamation_seconds": time.monotonic() - started,
+                "resources_reclaimed": True,
+            },
+            container_id=container,
+        )
     finally:
         if owner.poll() is None:
             owner.kill()

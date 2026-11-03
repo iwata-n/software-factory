@@ -1,5 +1,6 @@
 import base64
 import hashlib
+import os
 
 import pytest
 
@@ -11,6 +12,7 @@ from tests.test_assembler import PATCH
 from tests.test_assembler import runner as runner
 
 from .helpers import worker_client
+from .test_sandbox_watchdog import host_pid_namespace
 from .test_sf10 import pipeline as pipeline
 
 GOLDEN = b"""import os
@@ -48,6 +50,31 @@ def source_bundle(tmp_path, monkeypatch, request):
     golden = GOLDEN
     if scenario == "all_skipped":
         golden += b'\npytestmark = pytest.mark.skip(reason="fixture all skipped")\n'
+    expected_ids = IDS
+    if scenario == "isolation":
+        image = os.environ.get("FACTORY_RUNNER_IMAGE_DIGEST")
+        if not image:
+            pytest.skip("set FACTORY_RUNNER_IMAGE_DIGEST to a pinned runner image")
+        # The canary is deliberately outside the archive.
+        canary = tmp_path.parent / f"{tmp_path.name}-host-only"
+        canary.write_text("synthetic-host-only")
+        golden += f"""
+def test_runtime_isolation():
+    import errno
+
+    assert not Path({str(canary)!r}).exists()
+    with pytest.raises((FileNotFoundError, PermissionError)):
+        list(Path('/root/.ssh').iterdir())
+    assert not {{'FACTORY_USER_TOKEN', 'PUBLISHER_TOKEN'}} & os.environ.keys()
+    assert os.getuid() == 65532
+    status = dict(line.split(':', 1) for line in Path('/proc/self/status').read_text().splitlines())
+    assert int(status['CapEff'], 16) == 0 and status['NoNewPrivs'].strip() == '1'
+    assert os.readlink('/proc/self/ns/pid') != {host_pid_namespace(image)!r}
+    with pytest.raises(OSError) as error:
+        Path('/etc/sf21').touch()
+    assert error.value.errno == errno.EROFS
+""".encode()
+        expected_ids = IDS + ["checks.test_golden::test_runtime_isolation"]
     (tmp_path / "checks/test_golden.py").write_bytes(golden)
     command = {
         "check_id": "unit_tests",
@@ -62,7 +89,7 @@ def source_bundle(tmp_path, monkeypatch, request):
             "no:cacheprovider",
             "--junitxml=.factory/unit.xml",
         ],
-        "expected_test_ids": IDS,
+        "expected_test_ids": expected_ids,
         "timeout_seconds": 30,
         "junit_path": ".factory/unit.xml",
     }
@@ -76,6 +103,12 @@ def source_bundle(tmp_path, monkeypatch, request):
     elif scenario == "timeout":
         command["argv"] = ["python", "-c", "import time;time.sleep(5)"]
         command["timeout_seconds"] = 1
+    elif scenario == "oom":
+        command["argv"] = [
+            "python",
+            "-c",
+            "pages = []\nwhile True: pages.append(bytearray(16 * 2**20))",
+        ]
     elif scenario == "start_failed":
         command["argv"] = ["/factory-no-such-command"]
     elif scenario == "missing_test":
@@ -197,6 +230,30 @@ def test_fresh_verifier_uses_immutable_candidate_and_fixed_command(pipeline, mon
     )
 
 
+@pytest.mark.ac("SF-21-AC01")
+@pytest.mark.parametrize("source_bundle", ["isolation"], indirect=True)
+def test_managed_verifier_denies_host_access_in_real_container(pipeline, monkeypatch, evidence):
+    for name in ("FACTORY_USER_TOKEN", "PUBLISHER_TOKEN", "GITHUB_TOKEN"):
+        monkeypatch.setenv(name, "synthetic-host-only")
+    pipeline.prepare()
+    assert pipeline.assemble()["accepted"]
+    assert stage(pipeline, "VERIFY")[0]["accepted"]
+    (item,) = checks(pipeline)
+    assert item["status"] == "PASS"
+    assert "checks.test_golden::test_runtime_isolation" in item["test_ids"]
+    isolation = item["metadata_body"]["isolation"]
+    assert isolation["user"] == "65532:65532" and isolation["read_only_root"]
+    assert isolation["cap_drop"] == ["ALL"]
+    assert isolation["security_opt"] == ["no-new-privileges"]
+    (mount,) = isolation["mounts"]
+    assert mount["Type"] == "volume" and not mount["RW"]
+    evidence(
+        "Managed verifier cannot read host data and runs in a separate PID namespace",
+        {"runtime": isolation, "tests": item["test_ids"]},
+        candidate_id=item["target"]["candidate_id"],
+    )
+
+
 @pytest.mark.ac("SF-11-AC02")
 def test_exit_one_is_failed_evidence_not_an_infrastructure_completion(pipeline, evidence):
     pipeline.prepare(PATCH.replace(b"+value = 2", b"+value = 3"))
@@ -207,6 +264,27 @@ def test_exit_one_is_failed_evidence_not_an_infrastructure_completion(pipeline, 
     assert item["status"] == "FAIL" and item["exit_code"] == 1
     assert item["counts"]["failed"] == 1 and item["eligible"]
     evidence("EXECUTED/accepted does not mean PASS; real failing test is persisted", item)
+
+
+@pytest.mark.ac("SF-21-AC04")
+@pytest.mark.parametrize("source_bundle", ["oom"], indirect=True)
+def test_managed_verifier_classifies_memory_limit_signal_as_error(pipeline, evidence):
+    pipeline.prepare()
+    assert pipeline.assemble()["accepted"]
+    assert stage(pipeline, "VERIFY")[0]["accepted"]
+    (item,) = checks(pipeline)
+    assert (item["status"], item["metadata_body"]["reason"], item["exit_code"]) == (
+        "ERROR",
+        "PROCESS_SIGNALED",
+        -9,
+    )
+    isolation = item["metadata_body"]["isolation"]
+    assert isolation["memory"] == 2**31
+    evidence(
+        "A managed verification check killed at the memory limit yields ERROR",
+        item,
+        candidate_id=item["target"]["candidate_id"],
+    )
 
 
 @pytest.mark.ac("SF-11-AC03")

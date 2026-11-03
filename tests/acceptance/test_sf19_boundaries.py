@@ -226,7 +226,7 @@ def test_cancel_and_recovered_pr_report_keep_external_history(backend, clock, ev
 
 
 @pytest.mark.ac("SF-19-AC02", "SF-19-AC06")
-def test_two_reports_for_one_attempt_cannot_spend_two_retries(publication, clock):
+def test_two_reports_for_one_attempt_cannot_spend_two_retries(publication, clock, evidence):
     pub = publication
     operation = pub.begin().json()
     initial_unknown(pub, operation)
@@ -254,6 +254,10 @@ def test_two_reports_for_one_attempt_cannot_spend_two_retries(publication, clock
     assert len(status["observations"]) == 2
     assert status["operations"][0]["reconcile_attempts"] == 1
     assert status["operations"][0]["next_reconcile_at"] == clock.value + 2
+    evidence(
+        "one persisted retry for two competing reports and unchanged next-attempt delay",
+        {"attempts": 1, "observations": 2, "next_delay_seconds": 2},
+    )
 
 
 def test_restored_publisher_reconciles_existing_pr_without_writing(

@@ -187,17 +187,6 @@ def require_postgresql17(migrated_database, pytestconfig):
 
 
 @pytest.fixture
-def evidence(request, pytestconfig):
-    reporter = pytestconfig.pluginmanager.get_plugin("factory-acceptance-reporter")
-    records = reporter.observations.setdefault(request.node.nodeid, [])
-
-    def observe(expected, observed, **identifiers):
-        records.append(redact({"expected": expected, "observed": observed, **identifiers}))
-
-    return observe
-
-
-@pytest.fixture
 def clock(database):
     from software_factory.db import db_now
 

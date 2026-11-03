@@ -211,8 +211,10 @@ class CodexCLI:
         self.verify_binary()
 
     @classmethod
-    def from_file(cls, binary, manifest_path):
+    def from_file(cls, binary, manifest_path, *, require_isolation=False):
         manifest = json.loads(Path(manifest_path).read_text())
+        if require_isolation and manifest.get("execution_mode") != "isolated_linux":
+            raise CodexError("ISOLATED_CODEX_RUNNER_REQUIRED", "POLICY", before_launch=True)
         if cls is CodexCLI and manifest.get("execution_mode") == "isolated_linux":
             from .codex_container import DockerCodexCLI
 

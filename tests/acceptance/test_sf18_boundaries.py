@@ -1,5 +1,6 @@
 import hmac
 import json
+import socket
 from concurrent.futures import ThreadPoolExecutor
 from uuid import uuid4
 
@@ -17,6 +18,7 @@ from software_factory.github_ci import CIReadError, GitHubCIReader, check_status
 from software_factory.models import Gate, OutboxEvent, Run, RunEvent, VerifiedRunResult
 from software_factory.service import Service
 from tests.test_assembler import runner as runner
+from tests.test_processes import start_control_plane
 from tests.test_publications import publication as publication
 
 from .test_sf10 import pipeline as pipeline
@@ -25,6 +27,7 @@ from .test_sf11 import source_bundle as source_bundle
 from .test_sf12_integration import begin_ci, pass_local
 from .test_sf13 import assemble_repair, repair, review, value_patch
 from .test_sf13_progress import synthetic_ci
+from .test_sf19_boundaries import claim
 
 pytestmark = pytest.mark.parametrize("source_bundle", ["ci"], indirect=True)
 MERGE = "3" * 40
@@ -178,6 +181,7 @@ def test_changed_tuple_or_untrusted_check_cannot_pass(waiting, fault, evidence):
 def test_missing_webhook_poll_recovers_429_and_503_on_durable_cadence(waiting, evidence):
     world, clock, poll, _, _, _, _, stub = waiting
     deadline = world.run()["wait_context"]["deadline_at"]
+    assert deadline - clock.value == 1800
     stub["status"] = 429
     poll()
     clock.value += 59
@@ -195,7 +199,16 @@ def test_missing_webhook_poll_recovers_429_and_503_on_durable_cadence(waiting, e
     run = world.run()
     assert run["phase"] == "FINAL_GATE_READY"
     assert run["wait_context"]["deadline_at"] == deadline
-    evidence("Missing delivery and API failures recover without extending the deadline", run)
+    evidence(
+        "fresh pollers recover missing delivery and API failures without extending the deadline",
+        {
+            "phase": run["phase"],
+            "deadline_seconds": 1800,
+            "poll_interval_seconds": 60,
+            "claim_status": 204,
+            "reserved_microusd_while_waiting": 0,
+        },
+    )
 
 
 @pytest.mark.ac("SF-18-AC05")
@@ -229,14 +242,23 @@ def test_delayed_signal_cannot_restore_old_pass_or_duplicate_final_gate(waiting,
     with ThreadPoolExecutor(max_workers=2) as pool:
         list(pool.map(lambda _: poll(), range(2)))
     assert world.run()["phase"] in {"FINAL_GATE_READY", "COMPLETE"}
+    poll()
+    assert world.run()["phase"] == "COMPLETE"
     with world.database.transaction() as session:
+        (notification,) = list(
+            session.scalars(select(OutboxEvent).where(OutboxEvent.kind == "SLACK_RUN_RESULT"))
+        )
+        assert notification.body["status"] == "SUCCEEDED"
         (final,) = list(session.scalars(select(Gate).where(Gate.stage == "FINAL")))
         (event,) = list(
             session.scalars(select(RunEvent).where(RunEvent.kind == "FINAL_GATE_DECIDED"))
         )
         assert "github-check-101" in final.evidence_ids
         assert "github-check-100" not in final.evidence_ids
-        evidence("Only the newer execution finalized the Gate", event.body)
+        evidence(
+            "Only the newer execution finalized the Gate and queued one notification",
+            event.body | {"notifications": 1},
+        )
 
 
 @pytest.mark.ac("SF-18-AC02")
@@ -277,10 +299,39 @@ def test_inbox_signal_advances_poll_without_waiting_sixty_seconds(waiting, evide
         ("completed", "neutral", "INCONCLUSIVE"),
     ],
 )
-def test_provider_status_mapping(source_bundle, state, conclusion, expected, evidence):
-    status = check_status({"status": state, "conclusion": conclusion})
-    assert status == expected
-    evidence("GitHub state mapping", {"state": state, "conclusion": conclusion, "status": status})
+def test_provider_status_mapping(waiting, state, conclusion, expected, evidence):
+    world, _, poll, _, _, _, check, stub = waiting
+    stub["checks"] = [
+        check
+        | {
+            "status": state,
+            "conclusion": conclusion,
+            "completed_at": check["completed_at"] if state == "completed" else None,
+        }
+    ]
+    assert check_status(stub["checks"][0]) == expected
+    poll()
+    with world.database.transaction() as session:
+        gate = session.scalar(select(Gate).where(Gate.stage == "FINAL"))
+        if expected == "PENDING":
+            assert gate is None and world.run()["phase"] == "WAIT_CI"
+            (adopted,) = world.run()["wait_context"]["checks"]
+            assert adopted["status"] == expected
+        else:
+            assert gate is not None
+            assert gate.status == expected
+            (adopted,) = gate.metadata_body["checks"]
+            assert adopted["status"] == expected
+    assert world.get(f"/v1/runs/{world.run_id}/result").status_code == 404
+    evidence(
+        "GitHub status is retained in the required check and only PASS can confirm",
+        {
+            "state": state,
+            "conclusion": conclusion,
+            "status": expected,
+            "gate": gate.status if gate is not None else None,
+        },
+    )
 
 
 @pytest.mark.ac("SF-18-AC05")
@@ -310,7 +361,122 @@ def test_repaired_candidate_still_stops_with_ci_timeout(pipeline, clock, evidenc
     evidence("A repaired Candidate has the same CI timeout semantics", run)
 
 
-@pytest.mark.ac("SF-19-AC03", "SF-19-AC06")
+@pytest.mark.ac("SF-19-AC06")
+@pytest.mark.parametrize("stage", ["WAIT_CI", "PUBLISH_UNKNOWN", "BLOCKED", "SUCCEEDED"])
+def test_publication_survives_control_plane_process_kill(
+    publication, clock, request, stage, evidence
+):
+    pub = publication
+    world = pub.world
+    report_key = "report"
+    if stage in {"WAIT_CI", "SUCCEEDED"}:
+        _, _, poll, _, _, _, _, _ = request.getfixturevalue("waiting")
+        state = world.get(f"/v1/runs/{world.run_id}/publication").json()
+        (operation,) = state["operations"]
+        report_body = pub.success(operation)
+        report_body["pull_request"].update(external_id="456", merge_sha=MERGE)
+        if stage == "SUCCEEDED":
+            poll()
+            poll()
+    else:
+        operation = pub.begin().json()
+        report_body = {
+            "delivery_id": "unknown-0",
+            "target_hash": operation["target_hash"],
+            "status": "UNKNOWN",
+            "reason": "PUBLISH_UNKNOWN",
+        }
+        assert pub.report(operation, report_body, key=report_key).status_code == 200
+        if stage == "BLOCKED":
+            for attempt, delay in enumerate((1, 2, 4), 1):
+                clock.advance(delay)
+                assert claim(pub, operation, attempt, f"claim-{attempt}").status_code == 200
+                report_key = f"report-{attempt}"
+                report_body = report_body | {
+                    "delivery_id": f"unknown-{attempt}",
+                    "reconcile_attempt": attempt,
+                }
+                assert pub.report(operation, report_body, key=report_key).status_code == 200
+
+    original = pub.report(operation, report_body, key=report_key)
+    assert original.status_code == 200, original.text
+    with socket.socket() as listener:
+        listener.bind(("127.0.0.1", 0))
+        port = listener.getsockname()[1]
+    path = f"/v1/runs/{world.run_id}"
+
+    def snapshot(client):
+        responses = {}
+        for suffix in ("", "/publication", "/result", "/event-history"):
+            response = client.get(path + suffix)
+            assert response.status_code == (
+                404 if suffix == "/result" and stage != "SUCCEEDED" else 200
+            ), response.text
+            responses[suffix] = response.json()
+        with world.database.transaction() as session:
+            notices = session.scalars(
+                select(OutboxEvent).where(
+                    OutboxEvent.run_id == world.run_id, OutboxEvent.kind == "SLACK_RUN_RESULT"
+                )
+            )
+            responses["notification_ids"] = [row.id for row in notices]
+        return responses
+
+    process = start_control_plane(port)
+    old_pid = process.pid
+    try:
+        with httpx.Client(
+            base_url=f"http://127.0.0.1:{port}",
+            headers={"Authorization": f"Bearer {world.user_token}"},
+        ) as client:
+            before = snapshot(client)
+            assert stage in {before[""]["status"], before[""]["phase"]}
+            (saved,) = before["/publication"]["operations"]
+            assert saved["operation_key"] == operation["operation_key"]
+            if stage == "WAIT_CI":
+                assert before[""]["wait_context"]["deadline_at"] > clock()
+            if stage == "PUBLISH_UNKNOWN":
+                assert saved["next_reconcile_at"] == clock() + 1
+            if stage == "BLOCKED":
+                assert saved["reason"] == "PUBLISH_UNKNOWN" and saved["required_action"]
+            if stage in {"WAIT_CI", "SUCCEEDED"}:
+                assert before["/publication"]["pull_request"]["external_id"] == "456"
+            assert len(before["notification_ids"]) == (stage in {"SUCCEEDED", "BLOCKED"})
+
+            process.kill()
+            process.communicate(timeout=5)
+            assert process.returncode == -9
+            process = start_control_plane(port)
+            assert process.pid != old_pid
+            assert snapshot(client) == before
+
+            replay = client.post(
+                f"/v1/publisher/operations/{operation['operation_id']}/reports",
+                json=report_body,
+                headers={
+                    "Authorization": f"Bearer {pub.secret}",
+                    "Idempotency-Key": report_key,
+                },
+            )
+            assert replay.status_code == 200, replay.text
+            assert replay.json() == original.json()
+            assert snapshot(client) == before
+        evidence(
+            "Run, publication, deadlines, result and notification IDs survive SIGKILL and replay",
+            before,
+            run_id=world.run_id,
+            stage=stage,
+            stopped_pid=old_pid,
+            restarted_pid=process.pid,
+            publisher_report_key=report_key,
+        )
+    finally:
+        if process.poll() is None:
+            process.terminate()
+            process.communicate(timeout=10)
+
+
+@pytest.mark.ac("SF-19-AC03", "SF-19-AC04", "SF-19-AC06")
 def test_restart_confirms_result_and_notification_once(waiting, evidence):
     world, _, poll, _, pull, _, _, _ = waiting
     path = f"/v1/runs/{world.run_id}/result"
@@ -323,6 +489,14 @@ def test_restart_confirms_result_and_notification_once(waiting, evidence):
     assert snapshot["kind"] == "VERIFIED_DRAFT_PR"
     assert snapshot["draft_pr"]["head_sha"] == pull["head"]["sha"]
     assert snapshot["checks"][0]["provider_run_id"] == 100
+    finished = world.run()
+    cancel = world.post(
+        f"/v1/runs/{world.run_id}/cancel",
+        {"expected_run_revision": finished["state_revision"], "reason": "cancel after success"},
+    )
+    assert cancel.status_code == 409
+    assert world.run() == finished
+    assert world.get(path).json() == snapshot
     assert world.get(path, token=world.other_user_token).status_code == 404
     pull["head"]["sha"] = "a" * 40
     poll()
@@ -341,18 +515,27 @@ def test_restart_confirms_result_and_notification_once(waiting, evidence):
             session.execute(text("DELETE FROM verified_run_results"))
     evidence(
         "one immutable result and one notification after concurrent reconciliation",
-        {"results": 1, "notifications": 1, "head_sha": snapshot["draft_pr"]["head_sha"]},
+        {
+            "results": 1,
+            "notifications": 1,
+            "head_sha": snapshot["draft_pr"]["head_sha"],
+            "cancel_after_success_status": cancel.status_code,
+        },
     )
 
 
 @pytest.mark.ac("SF-19-AC04")
-@pytest.mark.parametrize("fault", ["head", "missing", "failure", "cancel"])
+@pytest.mark.parametrize("fault", ["candidate", "head", "missing", "failure", "cancel"])
 def test_final_gate_cannot_finalize_after_target_or_ci_changes(waiting, fault, evidence):
     world, _, poll, _, pull, _, check, stub = waiting
     poll()
     ready = world.run()
     assert ready["phase"] == "FINAL_GATE_READY"
-    if fault == "head":
+    if fault == "candidate":
+        # Inject loss of the current Candidate between the first pass and final confirmation.
+        with world.database.transaction() as session:
+            session.get(Run, world.run_id).current_candidate_id = None
+    elif fault == "head":
         pull["head"]["sha"] = "a" * 40
     elif fault == "missing":
         stub["checks"] = []
@@ -376,6 +559,9 @@ def test_final_gate_cannot_finalize_after_target_or_ci_changes(waiting, fault, e
     assert world.get(f"/v1/runs/{world.run_id}/result").status_code == 404
     if fault == "head":
         assert world.run()["stop_reason"] == "GITHUB_CI_TARGET_CHANGED"
+    if fault == "candidate":
+        assert world.run()["status"] == "BLOCKED"
+        assert world.run()["stop_reason"] == "PUBLICATION_GATE_STALE"
     if fault == "cancel":
         assert world.run()["status"] == "CANCELLED"
     evidence(
@@ -466,9 +652,10 @@ def test_current_pr_changes_do_not_modify_verified_result(waiting, monkeypatch, 
     )
 
 
+@pytest.mark.ac("SF-18-AC03")
 @pytest.mark.parametrize("waiting", [None, MERGE], indirect=True)
 def test_late_signed_check_is_preserved_for_previous_candidate_only(
-    waiting, publication, monkeypatch
+    waiting, publication, monkeypatch, evidence
 ):
     world, _, poll, _, pull, _, check, stub = waiting
     candidate_a = world.run()["current_candidate_id"]
@@ -531,3 +718,23 @@ def test_late_signed_check_is_preserved_for_previous_candidate_only(
     assert world.get(f"/v1/candidates/{candidate_b}/ci-history").json() == {"observations": []}
     assert world.run() == before
     assert world.run()["wait_context"]["checks"] == []
+    with world.database.transaction() as session:
+        assert (
+            session.scalar(
+                select(Gate.id).where(Gate.candidate_id == candidate_b, Gate.stage == "FINAL")
+            )
+            is None
+        )
+    assert world.get(f"/v1/runs/{world.run_id}/result").status_code == 404
+    evidence(
+        "late CI is retained only for the previous candidate and cannot pass the current gate",
+        {
+            "previous_candidate_id": candidate_a,
+            "current_candidate_id": candidate_b,
+            "old_provider_reported_sha": observation["provider_reported_sha"],
+            "old_observations": 1,
+            "eligible_current_checks": 0,
+            "current_final_gates": 0,
+            "result_status": 404,
+        },
+    )

@@ -205,6 +205,7 @@ def test_user_worker_other_tenant_and_ungranted_publisher_cannot_dispatch(public
     assert dump(world.database) == before
 
 
+@pytest.mark.ac("SF-23-AC06")
 @pytest.mark.parametrize("authorized", [False, True])
 def test_emergency_stop_blocks_unstarted_publication_but_preserves_external_report(
     publication, authorized
@@ -235,7 +236,7 @@ def test_emergency_stop_blocks_unstarted_publication_but_preserves_external_repo
 @pytest.mark.ac("SF-24-AC06")
 @pytest.mark.parametrize("unresolved", [False, True])
 def test_run_retention_protects_unknown_publication_and_purges_resolved_graph(
-    publication, unresolved
+    publication, unresolved, evidence
 ):
     from scripts.factory_maintenance import DAY, collect
     from software_factory.db import Database
@@ -272,5 +273,9 @@ def test_run_retention_protects_unknown_publication_and_purges_resolved_graph(
         rows = dump(world.database)
         for table in ("publication_operations", "publication_observations", "candidates", "gates"):
             assert any(row["run_id"] == world.run_id for row in rows[table]) == unresolved, table
+        evidence(
+            "Unresolved publication retains the graph while resolved publication can be purged",
+            {"unresolved": unresolved, "run_present": unresolved},
+        )
     finally:
         database.engine.dispose()

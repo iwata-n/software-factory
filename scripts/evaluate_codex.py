@@ -114,6 +114,18 @@ PROFILES = {
 }
 
 
+COMPAT_CHECK = "examples.evaluation.checks.check_compat::test_existing_label_api"
+
+
+def criterion_checks(task):
+    prefix = f"examples.evaluation.checks.check_{task}::"
+    tests = [prefix + name for name in PROFILES[task]["tests"]]
+    if task == "spaces":
+        return {"AC-1": tests[:4] + tests[6:], "AC-2": tests[3:6] + [COMPAT_CHECK]}
+    split = 1 if task == "empty" else 3
+    return {"AC-1": tests[:split], "AC-2": tests[split:] + [COMPAT_CHECK]}
+
+
 def available_port():
     with socket.socket() as connection:
         connection.bind(("127.0.0.1", 0))
@@ -223,7 +235,10 @@ def main():
     parser.add_argument("--actions-workflow-id", type=int)
     parser.add_argument("--deliver-slack", action="store_true")
     parser.add_argument("--fixture-base-sha")
-    parser.add_argument("--codex-manifest", default="config/codex_cli.json")
+    parser.add_argument(
+        "--codex-manifest",
+        default=os.environ.get("FACTORY_CODEX_MANIFEST", "config/codex_cli.json"),
+    )
     parser.add_argument(
         "--codex-binary",
         default=os.environ.get("FACTORY_CODEX_BINARY")
@@ -259,7 +274,9 @@ def main():
     output = args.output.resolve()
     output.mkdir(mode=0o700, parents=True, exist_ok=False)
     identity = source_manifest()
-    engine = CodexCLI.from_file(args.codex_binary, ROOT / args.codex_manifest)
+    engine = CodexCLI.from_file(
+        args.codex_binary, ROOT / args.codex_manifest, require_isolation=publish_live
+    )
     image = os.environ["FACTORY_RUNNER_IMAGE_DIGEST"]
     report = {
         "result": "IN_PROGRESS",
@@ -380,7 +397,7 @@ def main():
             }
             check_prefix = f"examples.evaluation.checks.{check_file}::"
             test_ids = [check_prefix + name for name in profile["tests"]]
-            test_ids += ["examples.evaluation.checks.check_compat::test_existing_label_api"]
+            test_ids.append(COMPAT_CHECK)
             expected_failures = {check_prefix + name for name in profile["failing"]}
             verification = {
                 "check_id": "unit_tests",
@@ -516,6 +533,29 @@ def main():
             }
             (output / "task-spec.json").write_text(json.dumps(spec, indent=2, ensure_ascii=False))
             (output / "policy.json").write_text(json.dumps(policy, indent=2, ensure_ascii=False))
+            mapping = criterion_checks(args.task)
+            if set(mapping) != {item["id"] for item in spec["task"]["acceptance_criteria"]} or (
+                {test for tests in mapping.values() for test in tests} != set(test_ids)
+            ):
+                raise RuntimeError("Evaluation acceptance checks do not cover the fixed profile")
+            (output / "fixture-evidence.json").write_text(
+                json.dumps(
+                    {
+                        "base_sha": fetched["sha"],
+                        "source_digest": fetched["source_digest"],
+                        "criterion_checks": mapping,
+                        "protected_files": protected,
+                        "verification": verification,
+                        "engine_manifest_hash": engine.manifest_hash,
+                        "runner_image_digest": image,
+                        "pricing_manifest": policy["pricing_manifest"],
+                        "run_budget_microusd": policy["run_budget_microusd"],
+                    },
+                    indent=2,
+                    ensure_ascii=False,
+                )
+                + "\n"
+            )
             task = post(user, f"/v1/projects/{project['project_id']}/tasks", spec)
             run_id = post(user, f"/v1/tasks/{task['task_id']}/runs", {"spec_version": 1})["run_id"]
             report["run_id"] = run_id
@@ -567,6 +607,8 @@ def main():
                 ]
                 if adapter == "pipeline":
                     argv += ["--reviewer", "codex_cli"]
+                if not engine.isolated:
+                    argv.append("--host-codex-evaluation")
                 environment = base_env | {
                     "FACTORY_WORKER_TOKEN": secret,
                     "FACTORY_RUNNER_IMAGE_DIGEST": image,

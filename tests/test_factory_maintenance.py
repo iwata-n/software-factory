@@ -33,9 +33,9 @@ pytestmark = pytest.mark.postgres
 
 
 @pytest.mark.ac("SF-24-AC06")
-def test_artifact_collection_at_boundaries(world, artifacts):
+def test_artifact_collection_at_boundaries(world, artifacts, evidence):
     root = world.client.app.state.service.artifacts.storage.root
-    evidence = artifacts.ready()
+    artifact_id = artifacts.ready()
     pending = artifacts.reserve().json()["id"]
     with world.database.transaction() as session:
         reserved = session.get(Artifact, pending)
@@ -58,7 +58,7 @@ def test_artifact_collection_at_boundaries(world, artifacts):
             "runs_purged": 0,
             "tasks_purged": 0,
         }
-        assert world.get(f"/v1/artifacts/{evidence}/content").content == b"hello"
+        assert world.get(f"/v1/artifacts/{artifact_id}/content").content == b"hello"
         with database.transaction() as session:
             session.execute(update(Job).values(state="SUCCEEDED"))
             session.execute(update(Attempt).values(state="SUCCEEDED"))
@@ -88,10 +88,10 @@ def test_artifact_collection_at_boundaries(world, artifacts):
         )
         assert response.status_code == 410
         assert world.get(f"/v1/runs/{world.run_id}/event-history").json() == {"events": []}
-        reply = world.get(f"/v1/artifacts/{evidence}/content")
+        reply = world.get(f"/v1/artifacts/{artifact_id}/content")
         assert reply.status_code == 404
         assert "EVIDENCE_RETENTION_EXPIRED" in reply.text
-        assert not (root / world.workspace_id / evidence).exists()
+        assert not (root / world.workspace_id / artifact_id).exists()
         with database.transaction() as session:
             assert (
                 session.scalar(
@@ -101,12 +101,22 @@ def test_artifact_collection_at_boundaries(world, artifacts):
                 )
                 == 2
             )
+        evidence(
+            "Reservation and finalized evidence expire at their respective boundaries",
+            {
+                "collection": collected,
+                "sse_status": response.status_code,
+                "artifact_status": reply.status_code,
+            },
+        )
     finally:
         database.engine.dispose()
 
 
 @pytest.mark.ac("SF-24-AC06")
-def test_retention_prunes_only_old_history_prefix_and_keeps_terminal_anchor(world, artifacts):
+def test_retention_prunes_only_old_history_prefix_and_keeps_terminal_anchor(
+    world, artifacts, evidence
+):
     root = world.client.app.state.service.artifacts.storage.root
     lease = artifacts.lease
     run_path = f"/v1/runs/{world.run_id}"
@@ -178,14 +188,18 @@ def test_retention_prunes_only_old_history_prefix_and_keeps_terminal_anchor(worl
             "runs_purged": 0,
             "tasks_purged": 0,
         }
+        evidence(
+            "Collection preserves the newer event and terminal history anchor",
+            {"run_id": world.run_id, "old_revision": old_revision, "retained_history": True},
+        )
     finally:
         database.engine.dispose()
 
 
-@pytest.mark.ac("SF-24-AC05")
-def test_encrypted_backup_restore(world, artifacts, tmp_path, monkeypatch, capsys):
+@pytest.mark.ac("SF-24-AC05", "SF-24-AC06")
+def test_encrypted_backup_restore(world, artifacts, tmp_path, monkeypatch, capsys, evidence):
     root = world.client.app.state.service.artifacts.storage.root
-    evidence = artifacts.ready()
+    artifact_id = artifacts.ready()
     certificate, key = tmp_path / "backup.crt", tmp_path / "backup.key"
     subprocess.run(
         [
@@ -208,9 +222,16 @@ def test_encrypted_backup_restore(world, artifacts, tmp_path, monkeypatch, capsy
         check=True,
     )
     destination = tmp_path / "generations"
+    generations = []
     for _ in range(8):
         result = backup(world.database, root, destination, certificate)
-    assert len(list(destination.glob("*.cms"))) == 7
+        generations.append(Path(result["backup"]))
+    assert not generations[0].exists()
+    assert set(destination.glob("*.cms")) == set(generations[1:])
+    evidence(
+        "Eight encrypted generations retain precisely the seven newest",
+        {"created": len(generations), "retained": len(list(destination.glob("*.cms")))},
+    )
     bundle = Path(result["backup"])
     assert bundle.stat().st_mode & 0o077 == 0
     assert result["artifact_bytes"] == 5
@@ -251,7 +272,7 @@ def test_encrypted_backup_restore(world, artifacts, tmp_path, monkeypatch, capsy
         report = restore(target, target_root, bundle, certificate, key)
         assert report["status"] == "STAGED_RECONCILIATION_REQUIRED"
         assert inventory(target) == inventory(world.database)
-        assert LocalArtifactStorage(target_root).read(world.workspace_id, evidence) == b"hello"
+        assert LocalArtifactStorage(target_root).read(world.workspace_id, artifact_id) == b"hello"
 
         from fastapi.testclient import TestClient
 
@@ -315,7 +336,7 @@ def test_encrypted_backup_restore(world, artifacts, tmp_path, monkeypatch, capsy
 
 
 @pytest.mark.ac("SF-24-AC06")
-def test_run_purge_preserves_command_receipt_for_ninety_more_days(world, artifacts):
+def test_run_purge_preserves_command_receipt_for_ninety_more_days(world, artifacts, evidence):
     root = world.client.app.state.service.artifacts.storage.root
     artifact = artifacts.reserve().json()["id"]
     uploaded = artifacts.upload(artifact, key="retention-upload")
@@ -381,5 +402,9 @@ def test_run_purge_preserves_command_receipt_for_ninety_more_days(world, artifac
             world.post(task_path + "/spec-versions", spec, key="retention-spec").status_code == 404
         )
         assert artifacts.upload(artifact, key="retention-upload").status_code == 404
+        evidence(
+            "Run and Task are purged at 90 days and command receipts expire separately",
+            {"collection": collected, "expired_upload_status": 404},
+        )
     finally:
         database.engine.dispose()

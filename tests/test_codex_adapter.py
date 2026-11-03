@@ -124,7 +124,7 @@ def execute(engine, job):
 
 
 @pytest.mark.ac("SF-20-AC02")
-def test_plan_uses_only_scoped_source_and_measured_estimated_usage(job):
+def test_plan_uses_only_scoped_source_and_measured_estimated_usage(job, evidence):
     engine = Engine()
     result = execute(engine, job)
     assert result.outcome == "EXECUTED" and result.result == PLAN
@@ -135,19 +135,39 @@ def test_plan_uses_only_scoped_source_and_measured_estimated_usage(job):
     assert receipt["calls"][0]["cached_input_tokens"] == 2
     assert receipt["pricing_manifest_hash"] == digest(job["snapshot"]["policy"]["pricing_manifest"])
     assert result.usage_microusd is None
+    evidence(
+        "PLAN uses only scoped source and produces versioned usage",
+        {
+            "prompt_keys": sorted(engine.calls[0]),
+            "result": result.outcome,
+            "amount": receipt["total_microusd"],
+        },
+    )
 
 
 @pytest.mark.ac("SF-20-AC02")
-def test_implementation_produces_real_patch_without_executing_generated_code(job):
+def test_implementation_produces_real_patch_without_executing_generated_code(job, evidence):
     job["kind"] = "IMPLEMENT"
-    result = execute(Engine(), job)
+    engine = Engine()
+    result = execute(engine, job)
+    assert engine.calls[0]["accepted_plan"] == PLAN
+    assert "repair_failures" not in engine.calls[0]
+    assert engine.calls[0]["source_files"] == {"src/example.py": "value = 1\n"}
     patch = next(a.body for a in result.artifacts if a.kind == "PATCH")
     assert b"-value = 1\n+value = 2\n" in patch and result.result["simulation"] is False
+    evidence(
+        "IMPLEMENT produces a patch from the accepted plan",
+        {
+            "bytes": len(patch),
+            "outcome": result.outcome,
+            "files": sorted(engine.calls[0]["source_files"]),
+        },
+    )
 
 
 @pytest.mark.parametrize("attack", ["policy", "manifest", "pricing", "source_digest", "sensitive"])
 @pytest.mark.ac("SF-20-AC05")
-def test_denied_or_invalid_context_never_calls_codex(job, attack):
+def test_denied_or_invalid_context_never_calls_codex(job, attack, evidence):
     if attack == "policy":
         job["snapshot"]["policy"]["allow_external_model"] = False
     elif attack == "manifest":
@@ -162,6 +182,10 @@ def test_denied_or_invalid_context_never_calls_codex(job, attack):
     result = execute(engine, job)
     assert not engine.calls and result.category == "POLICY"
     assert result.usage_deliveries[0]["total_microusd"] == 0
+    evidence(
+        "Denied model context has zero calls and zero estimated spend",
+        {"case": attack, "engine_calls": len(engine.calls), "reason": result.reason},
+    )
 
 
 @pytest.mark.parametrize(
@@ -176,12 +200,16 @@ def test_denied_or_invalid_context_never_calls_codex(job, attack):
     ],
 )
 @pytest.mark.ac("SF-20-AC02")
-def test_model_cannot_expand_policy_or_plan_or_modify_protected_files(job, path):
+def test_model_cannot_expand_policy_or_plan_or_modify_protected_files(job, path, evidence):
     job["kind"] = "IMPLEMENT"
     changes = dict(CHANGES, changes=[{"path": path, "content": "bad\n"}])
     result = execute(Engine(changes), job)
     assert result.category == "POLICY" and not result.artifacts
     assert result.usage_deliveries[0]["total_microusd"] == 47
+    evidence(
+        "Denied change produces no artifact",
+        {"path": path, "category": result.category, "reason": result.reason},
+    )
 
 
 def test_no_code_change_and_incomplete_acceptance_coverage_are_not_success(job):
@@ -202,7 +230,7 @@ def test_missing_usage_is_unknown_and_schema_failure_preserves_measured_usage(jo
 
 
 @pytest.mark.ac("SF-20-AC02")
-def test_repair_reads_granted_parent_candidate_instead_of_root_source(job):
+def test_repair_reads_granted_parent_candidate_instead_of_root_source(job, evidence):
     code, archive, _ = entry.pack([("src/example.py", "100644", b"value = 0\n")])
     job["kind"] = "REPAIR"
     job["input"] = {
@@ -232,6 +260,13 @@ def test_repair_reads_granted_parent_candidate_instead_of_root_source(job):
     assert engine.calls[0]["repair_failures"] == [{"id": digest(failure), "failure": failure}]
     assert adapter.result().result["addressed_failure_ids"] == [digest(failure)]
     assert requests == ["/v1/worker/leases/test/inputs/source-2/content"]
+    evidence(
+        "REPAIR reads the parent Candidate and returns only known failure IDs",
+        {
+            "requests": requests,
+            "addressed_failure_ids": adapter.result().result["addressed_failure_ids"],
+        },
+    )
 
 
 def test_patch_handles_creation_deletion_and_missing_final_newline(job):
@@ -259,7 +294,9 @@ def test_patch_handles_creation_deletion_and_missing_final_newline(job):
 
 @pytest.mark.parametrize("invalid", [False, True])
 @pytest.mark.ac("SF-20-AC02")
-def test_codex_review_binds_evidence_to_current_candidate_and_real_locations(job, invalid):
+def test_codex_review_binds_evidence_to_current_candidate_and_real_locations(
+    job, invalid, evidence
+):
     job["kind"] = "REVIEW"
     location = {
         "path": "src/example.py",
@@ -289,18 +326,33 @@ def test_codex_review_binds_evidence_to_current_candidate_and_real_locations(job
             CodexReviewer(Engine(reviewed)).for_job(job).review(context, Event())
         assert caught.value.usage_deliveries
     else:
-        result = CodexReviewer(Engine(reviewed)).for_job(job).review(context, Event())
+        engine = Engine(reviewed)
+        result = CodexReviewer(engine).for_job(job).review(context, Event())
+        (prompt,) = engine.calls
+        assert prompt["role"] == "REVIEW"
+        assert prompt["source_files"] == {"src/example.py": "value = 1\n"}
+        assert {"accepted_plan", "repair_failures", "target", "source_artifact_id"}.isdisjoint(
+            prompt
+        )
         assert result["criteria"][0]["evidence_artifact_ids"] == [
             "current-source",
             "$artifact/review-log",
         ]
         assert result.usage_deliveries[0]["total_microusd"] == 47
+    evidence(
+        "REVIEW accepts the current source line and rejects an out-of-range location",
+        {"line": location["end_line"], "accepted": not invalid},
+    )
 
 
 @pytest.mark.ac("SF-20-AC05")
-def test_archive_digest_is_verified_before_source_can_become_model_input(job):
+def test_archive_digest_is_verified_before_source_can_become_model_input(job, evidence):
     with pytest.raises(CodexError, match="MODEL_SOURCE_DIGEST_MISMATCH"):
         archive_files(base64.b64decode(job["source"]["archive"]), "0" * 64)
+    evidence(
+        "The archive cannot become model input under a mismatched digest",
+        {"mismatched_digest_rejected": True},
+    )
 
 
 @pytest.mark.ac("SF-20-AC01")
@@ -326,7 +378,7 @@ def test_capabilities_and_events_bind_one_execution_id_to_the_attempt(job):
 
 @pytest.mark.parametrize("claimed", [["unknown"], ["same", "same"]])
 @pytest.mark.ac("SF-20-AC02")
-def test_repair_rejects_ungrounded_or_duplicate_claims(job, claimed):
+def test_repair_rejects_ungrounded_or_duplicate_claims(job, claimed, evidence):
     job["kind"] = "REPAIR"
     failure = ["check", "unit", "FAIL_ONE", "high", "src/example.py", "value"]
     job["input"] = {
@@ -347,18 +399,30 @@ def test_repair_rejects_ungrounded_or_duplicate_claims(job, claimed):
     assert adapter.result().reason == "MODEL_REPAIR_FAILURE_IDS_INVALID"
     assert adapter.result().usage_deliveries
     assert not adapter.result().artifacts
+    evidence(
+        "REPAIR cannot invent or duplicate addressed failure IDs",
+        {
+            "ids": ids,
+            "reason": adapter.result().reason,
+            "artifacts": len(adapter.result().artifacts),
+        },
+    )
 
 
 @pytest.mark.ac("SF-20-AC03")
-def test_cancellation_before_codex_start_yields_result():
+def test_cancellation_before_codex_start_yields_result(evidence):
     adapter = CodexAdapter(Engine())
     adapter.cancel()
     assert adapter.result().outcome == "CANCELLED"
     assert adapter.engine.calls == []
+    evidence(
+        "Pre-start cancellation does not invoke the model",
+        {"outcome": adapter.result().outcome, "engine_calls": len(adapter.engine.calls)},
+    )
 
 
 @pytest.mark.ac("SF-20-AC03")
-def test_codex_signal_failure_is_not_reported_as_cancelled():
+def test_codex_signal_failure_is_not_reported_as_cancelled(evidence):
     class UnstoppableEngine(Engine):
         def cancel(self):
             raise CodexError("STOP_UNCONFIRMED", "INFRASTRUCTURE")
@@ -367,3 +431,7 @@ def test_codex_signal_failure_is_not_reported_as_cancelled():
     adapter.cancel()
     assert adapter.result().outcome == "FAILED"
     assert adapter.result().reason == "STOP_UNCONFIRMED"
+    evidence(
+        "Unconfirmed stop remains failed",
+        {"outcome": adapter.result().outcome, "reason": adapter.result().reason},
+    )

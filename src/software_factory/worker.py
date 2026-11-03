@@ -374,6 +374,11 @@ def main():
     parser.add_argument("--adapter", choices=["fake", "pipeline", "codex_cli"], default="fake")
     parser.add_argument("--reviewer", choices=["none", "codex_cli"], default="none")
     parser.add_argument(
+        "--host-codex-evaluation",
+        action="store_true",
+        help="Allow the fixed local evaluation harness to drain a loopback Worker on the host",
+    )
+    parser.add_argument(
         "--codex-manifest",
         default=os.environ.get("FACTORY_CODEX_MANIFEST", "config/codex_cli.json"),
     )
@@ -391,15 +396,26 @@ def main():
     )
     args = parser.parse_args()
     validate_api_url(args.api_url)
+    if args.host_codex_evaluation and (
+        not args.drain or urlparse(args.api_url).hostname not in {"127.0.0.1", "::1"}
+    ):
+        parser.error("Host Codex evaluation requires --drain and a loopback IP")
     token = os.environ.get("FACTORY_WORKER_TOKEN")
     if bool(token) == bool(args.credential_file):
         parser.error("Set exactly one of FACTORY_WORKER_TOKEN or --credential-file")
     credentials = WorkerCredentials(args.credential_file) if args.credential_file else None
     engine = None
     if args.adapter == "codex_cli" or args.reviewer == "codex_cli":
-        from .codex_engine import CodexCLI
+        from .codex_engine import CodexCLI, CodexError
 
-        engine = CodexCLI.from_file(args.codex_binary, args.codex_manifest)
+        try:
+            engine = CodexCLI.from_file(
+                args.codex_binary,
+                args.codex_manifest,
+                require_isolation=not args.host_codex_evaluation,
+            )
+        except CodexError as error:
+            parser.error(error.code)
     headers = {"Authorization": f"Bearer {token}"} if token else {}
     with (
         credentials.lock() if credentials else nullcontext(),

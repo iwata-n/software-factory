@@ -32,6 +32,8 @@ def classify_junit(body, expected_ids, execution_state, exit_code):
     }
     if execution_state in {"TIMEOUT", "START_FAILED"}:
         return result | {"status": "ERROR", "reason": execution_state}
+    if exit_code is not None and exit_code < 0:
+        return result | {"status": "ERROR", "reason": "PROCESS_SIGNALED"}
     if body is None:
         return result
     try:

@@ -745,6 +745,11 @@ def create_app(
                         "step_key": job.step_key,
                         "attempt_no": job.attempt_no,
                         "priority": job.priority,
+                        **(
+                            {"repair_round": job.payload.get("repair_round")}
+                            if job.kind == "REPAIR"
+                            else {}
+                        ),
                         "attempts": [
                             {
                                 "attempt_id": a.id,

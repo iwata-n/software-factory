@@ -129,6 +129,8 @@ def test_two_real_progressing_rounds_then_no_third_repair(pipeline, evidence):
     assert (run["status"], run["stop_reason"]) == ("BLOCKED", "REPAIR_LIMIT_REACHED")
     repairs = [j for j in rows(pipeline, Job) if j.kind == "REPAIR"]
     assert len(repairs) == 2 and sorted(j.payload["repair_round"] for j in repairs) == [1, 2]
+    graph = pipeline.world.get(f"/v1/runs/{run['run_id']}/graph").raise_for_status().json()
+    assert sorted(job["repair_round"] for job in graph["jobs"] if job["kind"] == "REPAIR") == [1, 2]
     assert len(rows(pipeline, Candidate)) == 3
     assert pipeline.world.get(f"/v1/candidates/{first}").json() == before
     assert not [j for j in rows(pipeline, Job) if j.kind == "PUBLISH_DRAFT"]

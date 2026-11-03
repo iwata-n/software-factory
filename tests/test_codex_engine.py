@@ -81,6 +81,8 @@ if mode=='badjson':
 if mode=='large':
  print('x'*10000);raise SystemExit(0)
 items={events()!r}
+if mode=='unknown':
+ items.insert(2,{{'type':'future.mandatory.event'}})
 if mode=='env':
  items[2]['item']['text']=json.dumps({{'value':','.join(sorted(os.environ))}})
 for item in items: print(json.dumps(item),flush=True)
@@ -115,7 +117,9 @@ def test_cli_runs_in_empty_directory_with_pinned_safe_flags(cli):
 
 
 @pytest.mark.ac("SF-20-AC05")
-def test_control_plane_github_and_api_credentials_are_not_in_cli_environment(cli, monkeypatch):
+def test_control_plane_github_and_api_credentials_are_not_in_cli_environment(
+    cli, monkeypatch, evidence
+):
     for key in [
         "FACTORY_DATABASE_URL",
         "FACTORY_USER_TOKEN",
@@ -129,6 +133,10 @@ def test_control_plane_github_and_api_credentials_are_not_in_cli_environment(cli
     names = cli("env").run({"task": "inspect env"}, Reply, Event()).value["value"].split(",")
     assert "CODEX_HOME" in names and "FACTORY_WORKER_TOKEN" not in names
     assert not {"GH_TOKEN", "GITHUB_TOKEN", "OPENAI_API_KEY", "CODEX_API_KEY"} & set(names)
+    evidence(
+        "CLI environment contains only permitted names",
+        {"environment_names": sorted(names)},
+    )
 
 
 @pytest.mark.parametrize(
@@ -140,32 +148,49 @@ def test_control_plane_github_and_api_credentials_are_not_in_cli_environment(cli
     ],
 )
 @pytest.mark.ac("SF-20-AC03")
-def test_process_failures_never_become_success_or_echo_stderr(cli, mode, code):
+def test_process_failures_never_become_success_or_echo_stderr(cli, mode, code, evidence):
     engine = cli(mode)
     with pytest.raises(CodexError) as caught:
         engine.run({"task": "safe"}, Reply, Event())
     assert caught.value.code == code
     assert "secret-canary" not in str(caught.value) and engine._process is None
+    evidence(
+        "The process failure is classified and the process handle is cleared",
+        {
+            "mode": mode,
+            "reason": caught.value.code,
+            "category": caught.value.category,
+            "running": engine._process is not None,
+        },
+    )
 
 
 @pytest.mark.ac("SF-20-AC03")
-def test_exited_cli_does_not_leave_running_child(cli, tmp_path):
+def test_exited_cli_does_not_leave_running_child(cli, tmp_path, evidence):
     assert cli("child").run({"task": "safe"}, Reply, Event()).value == {"value": "ok"}
     time.sleep(0.75)
     assert not (tmp_path / "child-survived").exists()
+    evidence(
+        "The child does not survive the CLI parent",
+        {"child_survived": (tmp_path / "child-survived").exists()},
+    )
 
 
 @pytest.mark.ac("SF-20-AC03")
-def test_timeout_stops_term_ignoring_cli(cli):
+def test_timeout_stops_term_ignoring_cli(cli, evidence):
     engine = cli("hang")
     started = time.monotonic()
     with pytest.raises(CodexError, match="CODEX_TIMEOUT"):
         engine.run({"task": "safe"}, Reply, Event(), timeout=0.1)
     assert time.monotonic() - started < 8 and engine._process is None
+    evidence(
+        "The TERM-ignoring CLI stops within the deadline",
+        {"elapsed_seconds": time.monotonic() - started, "running": engine._process is not None},
+    )
 
 
 @pytest.mark.ac("SF-20-AC03")
-def test_cancel_stops_running_cli_and_next_call_is_not_cancelled(cli):
+def test_cancel_stops_running_cli_and_next_call_is_not_cancelled(cli, evidence):
     engine, stopped = cli("hang"), Event()
     with ThreadPoolExecutor(1) as pool:
         pending = pool.submit(engine.run, {"task": "safe"}, Reply, stopped)
@@ -176,6 +201,10 @@ def test_cancel_stops_running_cli_and_next_call_is_not_cancelled(cli):
         with pytest.raises(CodexError, match="CODEX_CANCELLED"):
             pending.result(timeout=8)
     assert engine._process is None
+    evidence(
+        "Cancellation terminates a running CLI",
+        {"running": engine._process is not None},
+    )
 
 
 def test_concurrent_call_is_rejected_without_cancelling_owner(cli):
@@ -213,7 +242,7 @@ def test_binary_replacement_is_rejected_before_execution(cli):
     ],
 )
 @pytest.mark.ac("SF-20-AC03")
-def test_event_stream_rejects_missing_or_forged_success(attack):
+def test_event_stream_rejects_missing_or_forged_success(attack, evidence):
     items = events()
     if attack == "usage_missing":
         items.pop()
@@ -229,6 +258,10 @@ def test_event_stream_rejects_missing_or_forged_success(attack):
         items[2]["item"]["text"] = "not json"
     with pytest.raises(CodexError):
         parse_events(encoded(items))
+    evidence(
+        "The malformed stream is rejected",
+        {"attack": attack, "rejected": True},
+    )
 
 
 def test_invalid_final_json_keeps_real_usage_for_failure_settlement():
@@ -240,7 +273,7 @@ def test_invalid_final_json_keeps_real_usage_for_failure_settlement():
 
 
 @pytest.mark.ac("SF-20-AC05")
-def test_sensitive_context_and_pre_cancel_never_start_provider(cli):
+def test_sensitive_context_and_pre_cancel_never_start_provider(cli, evidence):
     engine = cli()
     with pytest.raises(CodexError, match="SENSITIVE_MODEL_INPUT"):
         engine.run({"content": "Bearer secret-canary"}, Reply, Event())
@@ -249,6 +282,10 @@ def test_sensitive_context_and_pre_cancel_never_start_provider(cli):
     with pytest.raises(CodexError, match="CODEX_CANCELLED"):
         engine.run({"task": "safe"}, Reply, stopped)
     assert engine._process is None
+    evidence(
+        "Sensitive input and pre-start cancellation prevent launch",
+        {"running": engine._process is not None},
+    )
 
 
 def test_json_schema_requires_nullable_and_defaulted_properties():
@@ -274,11 +311,15 @@ def test_json_schema_requires_nullable_and_defaulted_properties():
     ],
 )
 @pytest.mark.ac("SF-20-AC05")
-def test_quoted_source_credentials_are_rejected_before_serializing_context(cli, secret):
+def test_quoted_source_credentials_are_rejected_before_serializing_context(cli, secret, evidence):
     engine = cli()
     with pytest.raises(CodexError, match="SENSITIVE_MODEL_INPUT"):
         engine.run({"source_files": {"src/config.py": secret}}, Reply, Event())
     assert engine._process is None
+    evidence(
+        "Quoted secret pattern cannot reach the CLI",
+        {"running": engine._process is not None},
+    )
 
 
 def test_nonzero_exit_preserves_validated_usage(cli):
@@ -291,7 +332,7 @@ def test_nonzero_exit_preserves_validated_usage(cli):
 
 
 @pytest.mark.ac("SF-20-AC03")
-def test_cancel_during_manifest_check_does_not_launch_provider(cli, monkeypatch):
+def test_cancel_during_manifest_check_does_not_launch_provider(cli, monkeypatch, evidence):
     engine = cli()
     cancelled = Event()
 
@@ -307,10 +348,14 @@ def test_cancel_during_manifest_check_does_not_launch_provider(cli, monkeypatch)
         engine.run({"task": "safe"}, Reply, cancelled)
     assert caught.value.before_launch and caught.value.usage is None
     assert engine._process is None
+    evidence(
+        "Cancellation during manifest verification prevents process launch",
+        {"before_launch": caught.value.before_launch, "running": engine._process is not None},
+    )
 
 
 @pytest.mark.ac("SF-20-AC03")
-def test_cli_signal_failure_is_classified_as_unconfirmed(cli, monkeypatch):
+def test_cli_signal_failure_is_classified_as_unconfirmed(cli, monkeypatch, evidence):
     from types import SimpleNamespace
 
     engine = cli()
@@ -322,6 +367,10 @@ def test_cli_signal_failure_is_classified_as_unconfirmed(cli, monkeypatch):
     monkeypatch.setattr("software_factory.codex_engine.os.killpg", deny_signal)
     with pytest.raises(CodexError, match="^STOP_UNCONFIRMED$"):
         engine.cancel()
+    evidence(
+        "Signal rejection leaves physical stop unconfirmed",
+        {"classified_as_unconfirmed": True},
+    )
 
 
 def test_legacy_manifest_hash_remains_compatible(cli):
@@ -379,3 +428,23 @@ def test_linux_startup_diagnostic_does_not_replace_valid_turn():
         parse_events(encoded([items[0], warning]))
     with pytest.raises(CodexError, match="CODEX_TOOL_ACTIVITY_DENIED"):
         parse_events(encoded([*items[:2], warning, *items[2:]]))
+
+
+@pytest.mark.parametrize(
+    "role", [("--adapter", "codex_cli"), ("--adapter", "pipeline", "--reviewer", "codex_cli")]
+)
+def test_worker_requires_isolation_for_model_roles(monkeypatch, capsys, tmp_path, role):
+    import sys
+
+    from software_factory.worker import main
+
+    monkeypatch.setenv("FACTORY_WORKER_TOKEN", "synthetic")
+    monkeypatch.delenv("FACTORY_WORKER_CREDENTIAL_FILE", raising=False)
+    monkeypatch.delenv("FACTORY_CODEX_MANIFEST", raising=False)
+    monkeypatch.setattr(
+        sys, "argv", ["worker", *role, "--codex-binary", str(tmp_path / "must-not-open")]
+    )
+    with pytest.raises(SystemExit) as denied:
+        main()
+    assert denied.value.code == 2
+    assert "ISOLATED_CODEX_RUNNER_REQUIRED" in capsys.readouterr().err

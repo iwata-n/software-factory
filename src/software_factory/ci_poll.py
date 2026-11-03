@@ -125,12 +125,13 @@ class CIPoller:
         context = run.wait_context or {}
         if not context.get("quality_gate") or not context["required_ci"]:
             return None, None
-        if run.current_candidate_id != context["target"]["candidate_id"]:
-            return None, None
         if not self.service.repository_allowed(session, run):
             return None, None
         repo = owned(session, Repository, run.repository_id, workspace_id)
         if not self.matches_repository(repo, config):
+            return None, None
+        if run.current_candidate_id != context["target"]["candidate_id"]:
+            transition(session, run, "BLOCKED", "PUBLICATION_GATE_STALE")
             return None, None
         return run, context
 
@@ -224,6 +225,8 @@ class CIPoller:
     def current_publication(self, session, run, context):
         try:
             self.service.interventions.require_current_context(session, run)
+            local = owned(session, Gate, context["local_gate_id"], run.workspace_id)
+            _, target, _, _, _, current = self.service.gates.inputs(session, run)
         except DomainError:
             return False
         draft = session.scalar(
@@ -231,8 +234,6 @@ class CIPoller:
                 DraftPullRequest.workspace_id == run.workspace_id, DraftPullRequest.run_id == run.id
             )
         )
-        local = owned(session, Gate, context["local_gate_id"], run.workspace_id)
-        _, target, _, _, _, current = self.service.gates.inputs(session, run)
         return (
             draft is not None
             and draft_view(draft) == context["draft"]

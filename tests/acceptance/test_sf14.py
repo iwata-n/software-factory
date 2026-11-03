@@ -6,8 +6,9 @@ from sqlalchemy import select, text
 from sqlalchemy.exc import IntegrityError
 
 from software_factory.contracts import digest
-from software_factory.models import ApprovalDecision, Attempt, Job, Project
-from software_factory.service import Service
+from software_factory.db import db_now
+from software_factory.models import ApprovalDecision, Attempt, AuditEvent, Job, Principal, Project
+from software_factory.service import Service, token_hash
 from tests.test_control_plane import completion, submit
 
 from .helpers import jobs
@@ -148,7 +149,7 @@ def test_pending_plan_approval_has_fixed_target_deadline_and_no_execution_slot(
     )
 
 
-@pytest.mark.ac("SF-14-AC03", "SF-14-AC05", "C-03")
+@pytest.mark.ac("SF-14-AC03", "SF-14-AC05", "C-03", "SF-23-AC06")
 @pytest.mark.parametrize("choice", ["approve", "deny"])
 def test_current_approval_or_denial_is_recorded_and_replayed_once(approval_world, choice, evidence):
     world = approval_world
@@ -186,6 +187,17 @@ def test_current_approval_or_denial_is_recorded_and_replayed_once(approval_world
         )
     assert len(decisions) == 1 and decisions[0].reason == body["reason"]
     assert decisions[0].before_revision == body["expected_run_revision"]
+    with world.database.transaction() as session:
+        (audit,) = session.scalars(
+            select(AuditEvent).where(AuditEvent.operation == "approval.decide")
+        )
+        admin = session.scalar(
+            select(Principal.id).where(Principal.token_hash == token_hash(world.user_token))
+        )
+        assert audit.actor_id == admin and 0 < audit.created_at <= db_now(session)
+        assert audit.body["reason"] == body["reason"]
+        assert audit.body["before_revision"] == body["expected_run_revision"]
+        assert audit.body["after_revision"] == response.json()["run"]["state_revision"]
     evidence(
         "reasoned decision creates one next action with unchanged constraints",
         {"choice": choice, "response": response.json(), "decisions": len(decisions)},

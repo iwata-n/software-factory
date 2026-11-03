@@ -12,8 +12,12 @@ EXTERNAL_CRITERIA = {
     "SF-17-AC01": "publication-verification.json",
     "SF-17-AC02": "publication-verification.json",
     "SF-17-AC03": "publication-verification.json",
-    "SF-19-AC01": "sf19-verification.json",
+    "SF-18-AC06": "sf18-ci-matrix.json",
+    "SF-19-AC01": "sf19-restart-verification.json",
+    "SF-19-AC03": "sf19-verification.json",
+    "SF-19-AC05": "current-pr-drift.json",
     "SF-19-AC06": "sf19-verification.json",
+    "SF-21-AC03": "live-egress.json",
 }
 
 
@@ -82,9 +86,44 @@ def acceptance_scenarios() -> dict[str, list[str]]:
 
 
 def required_criteria() -> list[str]:
-    # Only tasks with complete acceptance modules enter the strict CI audit.
+    # A boundary criterion can be audited once its complete acceptance matrix is collected.
+    complete_boundary_criteria = {
+        "SF-18-AC01",
+        "SF-18-AC02",
+        "SF-18-AC03",
+        "SF-18-AC04",
+        "SF-18-AC05",
+        "SF-18-AC06",
+        "SF-19-AC01",
+        "SF-19-AC02",
+        "SF-19-AC03",
+        "SF-19-AC04",
+        "SF-19-AC05",
+        "SF-19-AC06",
+        "SF-20-AC02",
+        "SF-20-AC03",
+        "SF-20-AC05",
+        "SF-21-AC01",
+        "SF-21-AC02",
+        "SF-21-AC03",
+        "SF-21-AC04",
+        "SF-21-AC05",
+        "SF-21-AC06",
+        "SF-21-AC07",
+        "SF-22-AC01",
+        "SF-22-AC02",
+        "SF-22-AC03",
+        "SF-22-AC04",
+        "SF-22-AC05",
+        "SF-23-AC04",
+        "SF-24-AC06",
+    }
     implemented = {
         int(path.stem.removeprefix("test_sf"))
         for path in (ROOT / "tests/acceptance").glob("test_sf[0-9][0-9].py")
     }
-    return [ac for ac in task_criteria() if int(ac[3:5]) in implemented]
+    return [
+        ac
+        for ac in task_criteria()
+        if int(ac[3:5]) in implemented or ac in complete_boundary_criteria
+    ]

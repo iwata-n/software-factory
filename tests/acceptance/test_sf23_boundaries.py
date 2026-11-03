@@ -1,6 +1,8 @@
 """Run console foundation. Full SF-23 AC01 also needs SF-19 live evidence."""
 
 import json
+import signal
+import socket
 import sys
 from concurrent.futures import ThreadPoolExecutor
 from threading import Barrier
@@ -15,10 +17,11 @@ from sqlalchemy.exc import IntegrityError
 from software_factory import cli
 from software_factory.api import create_app
 from software_factory.db import db_now
-from software_factory.models import AuditEvent, Principal, Project, Run, RunEvent
+from software_factory.models import Attempt, AuditEvent, Principal, Project, Run, RunEvent
 from software_factory.service import Service, issue_token, token_hash
 from software_factory.worker_credentials import WorkerCredentials
 from tests.conftest import example_spec
+from tests.test_processes import start_control_plane
 
 
 def test_console_shell_loads_only_packaged_assets(world):
@@ -79,30 +82,56 @@ def test_run_index_paginates_timestamp_ties_and_matches_run_details(world):
 
 
 @pytest.mark.ac("SF-23-AC03")
-def test_event_stream_resumes_from_last_run_revision_after_restart(world):
+def test_event_stream_resumes_from_last_run_revision_after_restart(world, evidence):
     history = f"/v1/runs/{world.run_id}/event-history"
     path = f"/v1/runs/{world.run_id}/events?wait_seconds=0"
-    before = world.get(history).json()["events"]
-    first = world.get(path)
-    assert first.status_code == 200 and first.headers["content-type"].startswith(
-        "text/event-stream"
-    )
-    assert first.headers["cache-control"] == "no-store"
-    assert sse_revisions(first) == [(world.run_id, item["revision"]) for item in before]
-    assert world.claim().status_code == 200
+    headers = {"Authorization": f"Bearer {world.user_token}"}
+    with socket.socket() as listener:
+        listener.bind(("127.0.0.1", 0))
+        port = listener.getsockname()[1]
+    process = start_control_plane(port)
+    old_pid = process.pid
+    try:
+        with httpx.Client(base_url=f"http://127.0.0.1:{port}", headers=headers) as client:
+            before = client.get(history).raise_for_status().json()["events"]
+            first = client.get(path)
+            assert first.status_code == 200
+            assert first.headers["content-type"].startswith("text/event-stream")
+            assert first.headers["cache-control"] == "no-store"
+            assert sse_revisions(first) == [(world.run_id, item["revision"]) for item in before]
+            process.kill()
+            process.communicate(timeout=5)
+            assert process.returncode == -signal.SIGKILL
+            assert world.claim().status_code == 200
 
-    last = f"{world.run_id}:{before[-1]['revision']}"
-    headers = {"Authorization": f"Bearer {world.user_token}", "Last-Event-ID": last}
-    resumed = TestClient(create_app(world.database)).get(path, headers=headers)
-    after = world.get(history).json()["events"][len(before) :]
-    assert after
-    assert sse_revisions(resumed) == [(world.run_id, item["revision"]) for item in after]
-    headers["Last-Event-ID"] = f"{world.run_id}:{after[-1]['revision']}"
-    assert not sse_revisions(world.client.get(path, headers=headers))
+            process = start_control_plane(port)
+            assert process.pid != old_pid
+            last = f"{world.run_id}:{before[-1]['revision']}"
+            resumed = client.get(path, headers={"Last-Event-ID": last})
+            after = client.get(history).raise_for_status().json()["events"][len(before) :]
+            assert after and resumed.status_code == 200
+            assert sse_revisions(resumed) == [(world.run_id, item["revision"]) for item in after]
+            latest = f"{world.run_id}:{after[-1]['revision']}"
+            assert not sse_revisions(client.get(path, headers={"Last-Event-ID": latest}))
+        evidence(
+            "SSE resumes from the persisted cursor after a real Control Plane process restart",
+            {
+                "stopped_pid": old_pid,
+                "restarted_pid": process.pid,
+                "cursor": last,
+                "resumed_revisions": [item["revision"] for item in after],
+                "repeat_from_latest_count": 0,
+            },
+            run_id=world.run_id,
+        )
+    finally:
+        if process.poll() is None:
+            process.terminate()
+            process.communicate(timeout=10)
 
 
 @pytest.mark.ac("SF-23-AC03")
-def test_event_stream_scopes_cursor_and_reports_retained_history_gap(world):
+def test_event_stream_scopes_cursor_and_reports_retained_history_gap(world, evidence):
     path = f"/v1/runs/{world.run_id}/events?wait_seconds=0"
     headers = {"Authorization": f"Bearer {world.user_token}"}
     assert world.get(path, token=world.other_user_token).status_code == 404
@@ -129,6 +158,11 @@ def test_event_stream_scopes_cursor_and_reports_retained_history_gap(world):
         path, headers=headers | {"Last-Event-ID": f"{world.run_id}:{latest - 1}"}
     )
     assert sse_revisions(boundary) == [(world.run_id, latest)]
+    evidence(
+        "Foreign cursor is 404 and expired history is 410 with a recoverable retained boundary",
+        {"foreign_cursor": 404, "expired_cursor": expired.status_code, "latest_revision": latest},
+        run_id=world.run_id,
+    )
 
 
 def sse_revisions(response):
@@ -144,7 +178,9 @@ def sse_revisions(response):
 
 
 @pytest.mark.ac("SF-23-AC04")
-def test_rotation_preserves_worker_slot_and_fences_old_token_at_grace(world, clock, monkeypatch):
+def test_rotation_preserves_worker_slot_and_fences_old_token_at_grace(
+    world, clock, monkeypatch, evidence
+):
     claimed = world.claim().json()
     lease = claimed["lease"]
     path = f"/v1/worker/leases/{lease['id']}/heartbeat"
@@ -198,10 +234,21 @@ def test_rotation_preserves_worker_slot_and_fences_old_token_at_grace(world, clo
     with pytest.raises(IntegrityError, match="EVIDENCE_IMMUTABLE"):
         with world.database.transaction() as session:
             session.execute(update(AuditEvent).values(operation="overwrite"))
+    evidence(
+        "Rotation preserves the active lease, grace expires at 60 seconds and revoke is immediate",
+        {
+            "lease_id": lease["id"],
+            "worker_id": payload["worker_id"],
+            "grace_seconds": 60,
+            "old_token_after_grace": 401,
+            "both_tokens_after_revoke": 401,
+            "audit_operations": [item.operation for item in events],
+        },
+    )
 
 
 @pytest.mark.ac("SF-23-AC04")
-def test_unrotated_worker_token_expires_after_twenty_four_hours(world, clock):
+def test_unrotated_worker_token_expires_after_twenty_four_hours(world, clock, evidence):
     worker = world.make_worker()
     token = worker["worker_token"]
     assert worker["token_expires_at"] == clock.value + 86400
@@ -210,10 +257,14 @@ def test_unrotated_worker_token_expires_after_twenty_four_hours(world, clock):
     clock.advance(1)
     assert world.claim(token=token).status_code == 401
     assert world.post("/v1/worker/credentials/rotate", {}, token=token).status_code == 401
+    evidence(
+        "An unrotated credential expires exactly at 24 hours",
+        {"valid_before_expiry": 200, "expired_claim": 401, "expired_rotation": 401},
+    )
 
 
 @pytest.mark.ac("SF-23-AC04")
-def test_concurrent_rotation_issues_only_one_new_token(world):
+def test_concurrent_rotation_issues_only_one_new_token(world, evidence):
     barrier = Barrier(2)
 
     def rotate(_):
@@ -222,11 +273,69 @@ def test_concurrent_rotation_issues_only_one_new_token(world):
 
     with ThreadPoolExecutor(max_workers=2) as pool:
         responses = list(pool.map(rotate, range(2)))
-    assert sorted(response.status_code for response in responses) == [200, 409]
+    statuses = sorted(response.status_code for response in responses)
+    assert statuses == [200, 409]
+    evidence("Only one concurrent rotation succeeds", {"responses": statuses})
 
 
-@pytest.mark.ac("SF-23-AC05")
-def test_workspace_user_access_separates_read_run_operations_and_worker_administration(world):
+@pytest.mark.ac("SF-23-AC04")
+def test_rotation_races_active_heartbeat_and_claim_without_changing_slot(world, clock, evidence):
+    lease = world.claim().json()["lease"]
+    path = f"/v1/worker/leases/{lease['id']}/heartbeat"
+    barrier = Barrier(3)
+
+    def call(action):
+        barrier.wait(timeout=5)
+        return action()
+
+    clock.advance(1)
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        rotate = pool.submit(
+            call,
+            lambda: world.post("/v1/worker/credentials/rotate", {}, token=world.worker_token),
+        )
+        claim = pool.submit(call, world.claim)
+        heartbeat = pool.submit(
+            call,
+            lambda: world.post(path, {"fence": lease["fence"]}, token=world.worker_token),
+        )
+        rotated, claimed, renewed = (
+            future.result(timeout=10) for future in (rotate, claim, heartbeat)
+        )
+    assert (rotated.status_code, claimed.status_code, renewed.status_code) == (200, 204, 200)
+    current = rotated.json()
+    assert current["worker_id"] == world.worker_id
+    with world.database.transaction() as session:
+        (attempt,) = session.scalars(select(Attempt))
+        assert attempt.lease_id == lease["id"] and attempt.fence == lease["fence"]
+        (audit,) = session.scalars(
+            select(AuditEvent).where(AuditEvent.operation == "worker.credential.rotate")
+        )
+        assert audit.actor_id == world.worker_id
+    clock.advance(60)
+    assert world.post(path, {"fence": lease["fence"]}, token=world.worker_token).status_code == 401
+    assert (
+        world.post(path, {"fence": lease["fence"]}, token=current["worker_token"]).status_code
+        == 200
+    )
+    evidence(
+        "Concurrent rotation, heartbeat and claim retain exactly one Worker slot and fence",
+        {
+            "rotation": rotated.status_code,
+            "extra_claim": claimed.status_code,
+            "heartbeat": renewed.status_code,
+            "lease_count": 1,
+            "audit_count": 1,
+        },
+        worker_id=world.worker_id,
+        lease_id=lease["id"],
+    )
+
+
+@pytest.mark.ac("SF-23-AC05", "SF-23-AC06")
+def test_workspace_user_access_separates_read_run_operations_and_worker_administration(
+    world, evidence
+):
     viewer, operator = issue_token(), issue_token()
     with world.database.transaction() as session:
         for token, access in ((viewer, "VIEWER"), (operator, "OPERATOR")):
@@ -288,6 +397,8 @@ def test_workspace_user_access_separates_read_run_operations_and_worker_administ
         assert world.get(run_path, token=token).status_code == 200
         assert world.get(f"{root}/workers", token=token).status_code == 200
     assert world.run()["state_revision"] == revision
+    assert world.get(run_path, token=world.other_user_token).status_code == 404
+    assert world.get(f"{root}/workers", token=world.other_user_token).status_code == 404
     assert (
         world.post(enrollment_path, {"kinds": ["PLAN"]}, token=world.other_user_token).status_code
         == 404
@@ -309,6 +420,34 @@ def test_workspace_user_access_separates_read_run_operations_and_worker_administ
     assert world.post(revoke_path, {"reason": "evaluation"}).status_code == 200
     assert world.claim().status_code == 401
     assert world.claim(token=new_worker.json()["worker_token"]).status_code == 204
+    with world.database.transaction() as session:
+        (revocation,) = session.scalars(
+            select(AuditEvent).where(AuditEvent.operation == "worker.credential.revoke")
+        )
+        admin_id = session.scalar(
+            select(Principal.id).where(Principal.token_hash == token_hash(world.user_token))
+        )
+        assert revocation.actor_id == admin_id
+        assert revocation.body == {
+            "worker_id": world.worker_id,
+            "before_active": True,
+            "after_active": False,
+            "reason": "evaluation",
+        }
+        assert 0 < revocation.created_at <= db_now(session)
+    evidence(
+        "Operation authority is enforced per role and Workspace without exposing credentials",
+        {
+            "viewer_denied_operations": len(ordinary_mutations + administrative_mutations),
+            "operator_denied_admin_operations": len(administrative_mutations),
+            "worker_denied_user_operations": len(ordinary_mutations + administrative_mutations),
+            "foreign_workspace": 404,
+            "operator_cancel": 202,
+            "admin_enroll": 201,
+            "admin_revoke": 200,
+            "revoked_worker_claim": 401,
+        },
+    )
 
 
 @pytest.mark.ac("SF-23-AC06")
@@ -328,15 +467,42 @@ def test_emergency_stop_survives_restart_and_requires_current_workspace_revision
             )
         )
     assert world.post(path, stop, token=operator).status_code == 403
-    assert world.post(path, stop, key="stop").json()["revision"] == 1
-    assert world.post(path, stop, key="stop").json()["revision"] == 1
-    client = TestClient(create_app(world.database))
-    headers = {"Authorization": f"Bearer {world.user_token}"}
-    assert client.get(path, headers=headers).json()["stopped"] is True
-    assert world.claim().status_code == 204
+    with socket.socket() as listener:
+        listener.bind(("127.0.0.1", 0))
+        port = listener.getsockname()[1]
+    process = start_control_plane(port)
+    original_pid = process.pid
     release = {"stopped": False, "expected_revision": 0, "reason": "release rehearsal"}
-    assert world.post(path, release).status_code == 409
-    assert world.post(path, release | {"expected_revision": 1}).json()["revision"] == 2
+    headers = {"Authorization": f"Bearer {world.user_token}"}
+    try:
+        with httpx.Client(base_url=f"http://127.0.0.1:{port}", headers=headers) as client:
+            stopped = client.post(path, json=stop, headers={"Idempotency-Key": "stop"})
+            assert stopped.raise_for_status().json()["revision"] == 1
+            process.kill()
+            process.communicate(timeout=5)
+            assert process.returncode == -signal.SIGKILL
+            process = start_control_plane(port)
+            assert process.pid != original_pid
+            assert client.get(path).raise_for_status().json() == stopped.json()
+            replay = client.post(path, json=stop, headers={"Idempotency-Key": "stop"})
+            assert replay.raise_for_status().json() == stopped.json()
+            assert world.claim().status_code == 204
+            assert (
+                client.post(
+                    path, json=release, headers={"Idempotency-Key": "stale-release"}
+                ).status_code
+                == 409
+            )
+            reply = client.post(
+                path,
+                json=release | {"expected_revision": 1},
+                headers={"Idempotency-Key": "release"},
+            )
+            assert reply.raise_for_status().json()["revision"] == 2
+    finally:
+        if process.poll() is None:
+            process.terminate()
+            process.communicate(timeout=10)
     assert world.claim().status_code == 200
     with world.database.transaction() as session:
         admin_id = session.scalar(
@@ -379,7 +545,13 @@ def test_emergency_stop_survives_restart_and_requires_current_workspace_revision
             )
     evidence(
         "emergency stop and release are audited once with the original actor, reason and revision",
-        {"audit_rows": 2, "revisions": [1, 2], "mutation_rejected": True},
+        {
+            "audit_rows": 2,
+            "revisions": [1, 2],
+            "mutation_rejected": True,
+            "stopped_pid": original_pid,
+            "restarted_pid": process.pid,
+        },
     )
 
 
@@ -441,7 +613,7 @@ def test_claim_racing_workspace_stop_is_either_denied_or_cancelled(world):
 
 
 @pytest.mark.ac("SF-23-AC02")
-def test_worker_health_separates_overdue_expired_and_reported_stop(world, clock):
+def test_worker_health_separates_overdue_expired_and_reported_stop(world, clock, evidence):
     path = f"/v1/workspaces/{world.workspace_id}/workers"
     assert world.get(path, token=world.other_user_token).status_code == 404
     assert world.get(path, token=world.worker_token).status_code == 403
@@ -483,10 +655,22 @@ def test_worker_health_separates_overdue_expired_and_reported_stop(world, clock)
     current = worker()
     assert current["lease_status"] == current["stop_confirmation"] == "WORKER_REPORTED_STOP"
     assert current["last_heartbeat_at"] > initial["last_heartbeat_at"]
+    evidence(
+        "The same Worker shows heartbeat delay, lease expiry and an explicit stop separately",
+        {
+            "worker_states": [
+                row | {"auth_state": row["credential_status"]}
+                for row in (initial, overdue, expired, current)
+            ]
+        },
+        worker_id=world.worker_id,
+    )
 
 
 @pytest.mark.ac("SF-23-AC04")
-def test_worker_recovers_rotation_after_lost_response_and_grace_expiry(world, clock, tmp_path):
+def test_worker_recovers_rotation_after_lost_response_and_grace_expiry(
+    world, clock, tmp_path, evidence
+):
     private = tmp_path / "private"
     private.mkdir(mode=0o700)
     path = private / "worker.json"
@@ -518,11 +702,15 @@ def test_worker_recovers_rotation_after_lost_response_and_grace_expiry(world, cl
         assert len(rotations) == 1
     assert world.claim(token=rotations[0]).status_code == 200
     assert path.stat().st_mode & 0o777 == 0o600
+    evidence(
+        "Lost rotation response recovers after grace using the saved idempotency key",
+        {"issued_count": len(rotations), "file_mode": oct(path.stat().st_mode & 0o777)},
+        worker_id=world.worker_id,
+    )
 
 
 @pytest.mark.ac("SF-21-AC05", "SF-23-AC02")
-@pytest.mark.ac("SF-23-AC02")
-def test_unconfirmed_stop_revokes_worker_across_control_plane_restart(world):
+def test_unconfirmed_stop_revokes_worker_across_control_plane_restart(world, evidence):
     lease = world.claim().json()["lease"]
     result = world.post(
         f"/v1/worker/leases/{lease['id']}/fail",
@@ -554,3 +742,16 @@ def test_unconfirmed_stop_revokes_worker_across_control_plane_restart(world):
         )
         assert record.actor_id == worker["worker_id"]
         assert record.body["reason"] == "STOP_UNCONFIRMED"
+    evidence(
+        "An unconfirmed stop remains visible after restart and the old credential cannot claim",
+        {
+            "run_status": result.json()["run"]["status"],
+            "credential_status": worker["credential_status"],
+            "lease_status": worker["lease_status"],
+            "stop_confirmation": worker["stop_confirmation"],
+            "restarted_claim_status": 401,
+            "worker_states": [worker | {"auth_state": worker["credential_status"]}],
+        },
+        worker_id=worker["worker_id"],
+        lease_id=lease["id"],
+    )

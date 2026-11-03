@@ -1,5 +1,6 @@
 import copy
 import json
+import time
 from concurrent.futures import ThreadPoolExecutor
 from threading import Barrier
 from uuid import uuid4
@@ -9,9 +10,11 @@ import pytest
 from sqlalchemy import func, select, text
 from sqlalchemy.exc import IntegrityError
 
-from software_factory.models import Check, Principal, Run, Worker
+from software_factory.models import Check, Gate, Principal, Run, Worker
 from software_factory.pipeline_worker import PipelineAdapter
+from software_factory.sandbox import DockerRunner
 from software_factory.worker import Supervisor
+from tests.test_assembler import PATCH
 from tests.test_assembler import runner as runner
 
 from .helpers import dump, worker_client
@@ -158,7 +161,7 @@ def test_invalid_finding_references_reject_entire_completion(pipeline, fault, ex
     )
 
 
-@pytest.mark.ac("SF-11-AC05", "SF-11-AC06", "C-02")
+@pytest.mark.ac("SF-11-AC05", "SF-11-AC06", "SF-21-AC07", "C-02")
 def test_unmanaged_or_claimed_origin_cannot_promote_results(pipeline, evidence):
     pipeline.prepare()
     pipeline.assemble()
@@ -171,14 +174,107 @@ def test_unmanaged_or_claimed_origin_cannot_promote_results(pipeline, evidence):
     body = copy.deepcopy(report["body"])
     body["result"]["checks"][0]["status"] = "PASS"
     assert deliver(pipeline, report, body=body, key=str(uuid4())).status_code == 422
+    body = copy.deepcopy(report["body"])
+    body["result"]["runner_options"] = {"privileged": True, "network": "host"}
+    assert deliver(pipeline, report, body=body, key=str(uuid4())).status_code == 422
     assert dump(pipeline.world.database) == before
     with pipeline.world.database.transaction() as s:
         s.get(Worker, pipeline.managed.worker_id).managed = False
     assert deliver(pipeline, report, key=str(uuid4())).status_code == 403
     assert checks(pipeline) == []
+    with pipeline.world.database.transaction() as session:
+        assert session.scalar(select(Gate).where(Gate.run_id == pipeline.world.run_id)) is None
     evidence(
-        "implementer cannot claim verification; origin and PASS cannot be asserted in a report",
-        {"unmanaged_claim": 204, "origin_spoof": 422, "verdict_spoof": 422, "revoked_managed": 403},
+        "Unmanaged and forged verifier reports cannot create Check or Gate evidence",
+        {
+            "unmanaged_claim": 204,
+            "origin_spoof": 422,
+            "verdict_spoof": 422,
+            "runner_option_spoof": 422,
+            "revoked_managed": 403,
+            "gate_created": False,
+        },
+    )
+
+
+@pytest.mark.ac("SF-21-AC06")
+@pytest.mark.parametrize("outcome", ["success", "check_failure", "upload_failure"])
+def test_verifier_reclaims_candidate_volume_even_if_upload_fails(
+    pipeline, tmp_path, monkeypatch, evidence, outcome
+):
+    patch = PATCH.replace(b"+value = 2", b"+value = 3") if outcome == "check_failure" else PATCH
+    pipeline.prepare(patch)
+    assert pipeline.assemble()["accepted"]
+    world = pipeline.world
+    candidate_id = world.run()["current_candidate_id"]
+    candidate = world.get(f"/v1/candidates/{candidate_id}").json()
+    source_path = f"/v1/artifacts/{candidate['source_artifact_id']}/content"
+    source = world.get(source_path)
+    assert source.status_code == 200
+    with world.database.transaction() as session:
+        session.get(Worker, pipeline.managed.worker_id).capabilities = ["VERIFY", "adapter:fake"]
+
+    monkeypatch.setenv("FACTORY_RUNNER_STATE_ROOT", str(tmp_path / "verify-owners"))
+    isolated = DockerRunner(pipeline.runner.image_digest)
+    docker, volumes, uploaded = isolated.docker, [], []
+
+    def observe_docker(*args, **kwargs):
+        result = docker(*args, **kwargs)
+        if args[:2] == ("volume", "create") and not result.returncode:
+            volumes.append(args[-1])
+        return result
+
+    monkeypatch.setattr(isolated, "docker", observe_docker)
+    downstream, _ = worker_client(pipeline.managed)
+
+    def observe_upload(request):
+        if request.method == "PUT" and request.url.path.endswith("/content"):
+            uploaded.append(time.monotonic())
+            assert len(volumes) == 1
+            assert docker("volume", "inspect", volumes[0], timeout=5).returncode != 0
+            if outcome == "upload_failure":
+                return httpx.Response(503, json={"code": "INJECTED_UPLOAD_FAILURE"})
+        return downstream.send(request)
+
+    started = time.monotonic()
+    with (
+        downstream,
+        httpx.Client(
+            base_url="http://127.0.0.1", transport=httpx.MockTransport(observe_upload)
+        ) as client,
+    ):
+        supervisor = Supervisor(client, PipelineAdapter(isolated), heartbeat_interval=0.1)
+        if outcome == "upload_failure":
+            with pytest.raises(httpx.HTTPStatusError) as failed:
+                supervisor.run_once()
+            assert failed.value.response.status_code == 503
+        else:
+            assert supervisor.run_once()["accepted"]
+
+    assert uploaded and uploaded[0] - started < 60
+    assert docker("volume", "inspect", volumes[0], timeout=5).returncode != 0
+    assert not docker(
+        "ps", "-aq", "--filter", f"label=factory.namespace={isolated.namespace}", timeout=5
+    ).stdout
+    assert isolated.cleanup_orphans() == isolated.cleanup_orphans() == []
+    assert world.get(source_path).content == source.content
+    records = checks(pipeline)
+    assert [item["status"] for item in records] == {
+        "success": ["PASS"],
+        "check_failure": ["FAIL"],
+        "upload_failure": [],
+    }[outcome]
+    evidence(
+        "Verifier volume and containers are gone before upload and durable source is intact",
+        {
+            "outcome": outcome,
+            "first_upload_after_seconds": uploaded[0] - started,
+            "volume_removed": True,
+            "containers_remaining": 0,
+            "durable_source_unchanged": True,
+            "check_statuses": [item["status"] for item in records],
+        },
+        candidate_id=candidate_id,
     )
 
 

@@ -182,7 +182,7 @@ def test_client_cannot_choose_storage(artifacts, world, evidence, attack):
     evidence("unrecognized storage/ownership fields rejected", response.status_code, field=attack)
 
 
-@pytest.mark.ac("SF-09-AC04")
+@pytest.mark.ac("SF-09-AC04", "SF-21-AC02")
 @pytest.mark.parametrize(
     "attack", ["workspace_symlink", "file_symlink", "hardlink", "root_symlink"]
 )
