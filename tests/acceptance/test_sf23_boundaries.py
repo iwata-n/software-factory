@@ -6,6 +6,7 @@ from concurrent.futures import ThreadPoolExecutor
 from threading import Barrier
 from uuid import uuid4
 
+import httpx
 import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy import delete, select, update
@@ -15,6 +16,7 @@ from software_factory import cli
 from software_factory.api import create_app
 from software_factory.models import AuditEvent, Principal, Project, Run, RunEvent
 from software_factory.service import Service, issue_token, token_hash
+from software_factory.worker_credentials import WorkerCredentials
 from tests.conftest import example_spec
 
 
@@ -438,3 +440,37 @@ def test_worker_health_separates_overdue_expired_and_reported_stop(world, clock)
     current = worker()
     assert current["lease_status"] == current["stop_confirmation"] == "WORKER_REPORTED_STOP"
     assert current["last_heartbeat_at"] > initial["last_heartbeat_at"]
+
+
+def test_worker_recovers_rotation_after_lost_response_and_grace_expiry(world, clock, tmp_path):
+    private = tmp_path / "private"
+    private.mkdir(mode=0o700)
+    path = private / "worker.json"
+    credentials = WorkerCredentials(path)
+    credentials.save({"worker_id": world.worker_id, "worker_token": world.worker_token})
+    clock.advance(23 * 3600 + 1)
+    rotations = []
+
+    def send(request):
+        reply = world.client.request(request.method, request.url.path, headers=request.headers)
+        if request.method == "POST" and request.url.path.endswith("/rotate"):
+            assert reply.status_code == 200
+            rotations.append(reply.json()["worker_token"])
+            raise httpx.ReadError("lost rotation response", request=request)
+        return httpx.Response(reply.status_code, content=reply.content)
+
+    with httpx.Client(base_url="http://test", transport=httpx.MockTransport(send)) as client:
+        with credentials.lock():
+            with pytest.raises(httpx.ReadError):
+                credentials.prepare(client)
+            assert "pending_key" in credentials.read()
+        clock.advance(60)
+        assert world.claim().status_code == 401
+        restarted = WorkerCredentials(path)
+        with restarted.lock():
+            restarted.prepare(client)
+            assert client.headers["Authorization"] == "Bearer " + rotations[0]
+            assert restarted.read() == {"worker_id": world.worker_id, "worker_token": rotations[0]}
+        assert len(rotations) == 1
+    assert world.claim(token=rotations[0]).status_code == 200
+    assert path.stat().st_mode & 0o777 == 0o600

@@ -407,7 +407,7 @@ Gateは必須Jobが処理中なら待機を続ける。全必須Jobが終端ま�
 
 Worker一覧は最後の試行のHeartbeatとLease期限を表示する。標準15秒のHeartbeat間隔を2回超えた時点（30秒）で遅延、期限到達で実行権失効、停止報告を受けたときは報告済みと区別する。同一Workerの状態遷移と越境拒否をPostgreSQL、表示切替をChrome幅1440px/375pxのfixtureで確認した。
 
-0016でWorkerトークンに24時間の期限を設定し、更新後の旧トークンに60秒の猶予を設けた。明示失効は現・旧双方に適用される。更新はWorker IDとLeaseを維持し、同一キーの再送で追加発行しない。更新・失効は追記専用の監査に残す。0017でUserをVIEWER・OPERATOR・ADMINに分け、Workspace内のWorker登録と失効をADMIN限定にした。既存UserはADMINに移行する。APIの操作権限と越境拒否をPostgreSQLで検証した。Worker実行プロセスの自動更新と運用画面を含む権限別の通し検証は引き続き追跡する。
+0016でWorkerトークンに24時間の期限を設定し、更新後の旧トークンに60秒の猶予を設けた。明示失効は現・旧双方に適用される。更新はWorker IDとLeaseを維持し、同一キーの再送で追加発行しない。更新・失効は追記専用の監査に残す。0017でUserをVIEWER・OPERATOR・ADMINに分け、Workspace内のWorker登録と失効をADMIN限定にした。既存UserはADMINに移行する。APIの操作権限と越境拒否をPostgreSQLで検証した。資格情報ファイルを使うWorkerは期限1時間前から新規Claimの前に自動更新する。更新応答を消失し旧トークンの猶予後に再起動しても、同一Worker IDで復旧することをPostgreSQLで確認した。運用画面を含む権限別の通し検証は引き続き追跡する。
 
 | AC ID | 前提と操作 | 合格となる期待結果 | 検証方法と証拠 |
 |---|---|---|---|

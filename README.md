@@ -40,6 +40,8 @@ Workerの接続先は `FACTORY_API_URL` または `--api-url` で指定できま
 
 Workerトークンは発行から24時間で失効します。期限前に現在のBearerトークンと新しい `Idempotency-Key` を使って `POST /v1/worker/credentials/rotate` を呼び、応答の `worker_token` に差し替えます。Worker IDと実行枠は引き継がれ、旧トークンも更新後60秒間使えます。応答が失われた場合は、その猶予内に旧トークンと同じキーで再送できます。ローカル管理者が `python -m software_factory.cli revoke --principal-id <worker_id> --reason '<理由>'` を実行すると、両方のトークンが即時失効します。
 
+自動更新するWorkerは、登録時のJSON応答を所有者だけが読めるディレクトリ（0700）のファイル（0600）へ保存し、`python -m software_factory.worker --credential-file <path>` で起動します。資格情報ファイルと `FACTORY_WORKER_TOKEN` はどちらか一方を指定します。資格情報ファイルを使用するWorkerは、残り1時間以内で次のJobを受け取る前に更新します。更新途中で再起動した場合はファイルから復旧し、同じWorker IDを引き継ぎます。
+
 
 ## デモTaskの作成
 

@@ -832,6 +832,13 @@ def create_app(
         response.headers["Cache-Control"] = "no-store"
         return service.enroll(data.token, data.name)
 
+    @app.get("/v1/worker/credentials", tags=["Worker"])
+    def worker_credential_metadata(token: Token, response: Response):
+        response.headers["Cache-Control"] = "no-store"
+        return service.read(
+            token, lambda s, a: service.worker_credential_metadata(s, a, token), role="WORKER"
+        )
+
     @app.post("/v1/worker/credentials/rotate", tags=["Worker"])
     def rotate_worker_credential(token: Token, response: Response, key: Key = None):
         response.headers["Cache-Control"] = "no-store"

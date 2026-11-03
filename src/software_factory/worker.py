@@ -7,12 +7,14 @@ import os
 import shutil
 import time
 from concurrent.futures import Future
+from contextlib import nullcontext
 from threading import Thread
 from urllib.parse import urlparse
 
 import httpx
 
 from .adapters import AgentAdapter, AgentResult, FakeAgent
+from .worker_credentials import WorkerCredentials
 
 
 def validate_api_url(url: str) -> None:
@@ -355,19 +357,25 @@ def main():
             "codex-cli/CodexCLI.app/Contents/MacOS/codex"
         ),
     )
+    parser.add_argument(
+        "--credential-file", default=os.environ.get("FACTORY_WORKER_CREDENTIAL_FILE")
+    )
     args = parser.parse_args()
     validate_api_url(args.api_url)
     token = os.environ.get("FACTORY_WORKER_TOKEN")
-    if not token:
-        parser.error("FACTORY_WORKER_TOKEN is required")
+    if bool(token) == bool(args.credential_file):
+        parser.error("Set exactly one of FACTORY_WORKER_TOKEN or --credential-file")
+    credentials = WorkerCredentials(args.credential_file) if args.credential_file else None
     engine = None
     if args.adapter == "codex_cli" or args.reviewer == "codex_cli":
         from .codex_engine import CodexCLI
 
         engine = CodexCLI.from_file(args.codex_binary, args.codex_manifest)
-    with httpx.Client(
-        base_url=args.api_url, headers={"Authorization": f"Bearer {token}"}
-    ) as client:
+    headers = {"Authorization": f"Bearer {token}"} if token else {}
+    with (
+        credentials.lock() if credentials else nullcontext(),
+        httpx.Client(base_url=args.api_url, headers=headers) as client,
+    ):
         if args.adapter == "pipeline":
             from .pipeline_worker import PipelineAdapter
             from .sandbox import DockerRunner
@@ -390,6 +398,8 @@ def main():
         supervisor = Supervisor(client, adapter)
         while True:
             try:
+                if credentials:
+                    credentials.prepare(client)
                 result = supervisor.run_once(wait_seconds=0 if args.once or args.drain else 20)
                 if result:
                     print(json.dumps(result, ensure_ascii=False))

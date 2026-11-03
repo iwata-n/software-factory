@@ -1,8 +1,6 @@
 """Transactional application commands; external execution never occurs under DB locks."""
 
-import base64
 import hashlib
-import hmac
 import os
 import secrets
 from collections.abc import Callable
@@ -58,6 +56,7 @@ from .resolver import (
 )
 from .security import redact
 from .slack_delivery import enqueue_result
+from .worker_credentials import rotated_token
 
 LEASE_SECONDS = 90
 WORKER_TOKEN_SECONDS = 24 * 60 * 60
@@ -844,16 +843,22 @@ class Service:
                 "protocol_version": 1,
             }
 
+    def worker_credential_metadata(self, session, actor, token):
+        current = actor.token_hash == token_hash(token)
+        expires = actor.token_expires_at if current else actor.previous_token_expires_at
+        return {
+            "worker_id": actor.id,
+            "current": current,
+            "expires_in_seconds": max(0, expires - db_now(session)) if expires is not None else 0,
+        }
+
     def rotate_worker_token(self, token: str, key: str | None) -> dict:
         with self.db.transaction() as session:
             actor = self.locked_principal(session, token, "WORKER")
             if not key or len(key) > 200 or redact(key, (token,)) != key:
                 raise DomainError(422, "IDEMPOTENCY_KEY_REQUIRED")
             # A lost response can be replayed during grace without storing either secret.
-            derived = hmac.digest(
-                token.encode(), b"software-factory/worker-rotation/v1\0" + key.encode(), "sha256"
-            )
-            secret = base64.urlsafe_b64encode(derived).decode().rstrip("=")
+            secret = rotated_token(token, key)
             if actor.token_hash != token_hash(token):
                 if actor.token_hash != token_hash(secret):
                     raise DomainError(409, "WORKER_ROTATION_REQUIRES_CURRENT_TOKEN")
