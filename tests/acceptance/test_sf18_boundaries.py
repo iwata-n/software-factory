@@ -310,7 +310,7 @@ def test_repaired_candidate_still_stops_with_ci_timeout(pipeline, clock, evidenc
     evidence("A repaired Candidate has the same CI timeout semantics", run)
 
 
-@pytest.mark.ac("SF-19-AC03", "SF-19-AC06")
+@pytest.mark.ac("SF-19-AC03", "SF-19-AC04", "SF-19-AC06")
 def test_restart_confirms_result_and_notification_once(waiting, evidence):
     world, _, poll, _, pull, _, _, _ = waiting
     path = f"/v1/runs/{world.run_id}/result"
@@ -323,6 +323,14 @@ def test_restart_confirms_result_and_notification_once(waiting, evidence):
     assert snapshot["kind"] == "VERIFIED_DRAFT_PR"
     assert snapshot["draft_pr"]["head_sha"] == pull["head"]["sha"]
     assert snapshot["checks"][0]["provider_run_id"] == 100
+    finished = world.run()
+    cancel = world.post(
+        f"/v1/runs/{world.run_id}/cancel",
+        {"expected_run_revision": finished["state_revision"], "reason": "cancel after success"},
+    )
+    assert cancel.status_code == 409
+    assert world.run() == finished
+    assert world.get(path).json() == snapshot
     assert world.get(path, token=world.other_user_token).status_code == 404
     pull["head"]["sha"] = "a" * 40
     poll()
@@ -341,7 +349,12 @@ def test_restart_confirms_result_and_notification_once(waiting, evidence):
             session.execute(text("DELETE FROM verified_run_results"))
     evidence(
         "one immutable result and one notification after concurrent reconciliation",
-        {"results": 1, "notifications": 1, "head_sha": snapshot["draft_pr"]["head_sha"]},
+        {
+            "results": 1,
+            "notifications": 1,
+            "head_sha": snapshot["draft_pr"]["head_sha"],
+            "cancel_after_success_status": cancel.status_code,
+        },
     )
 
 
