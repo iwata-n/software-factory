@@ -278,6 +278,17 @@ class Attempt(Tenant, Base):
     input_digest: Mapped[str | None] = mapped_column(String(64), nullable=True)
 
 
+class VerifiedRunResult(Tenant, Base):
+    __tablename__ = "verified_run_results"
+    __table_args__ = (
+        UniqueConstraint("workspace_id", "run_id"),
+        ForeignKeyConstraint(["workspace_id", "run_id"], ["runs.workspace_id", "runs.id"]),
+    )
+    run_id: Mapped[str] = mapped_column(String(36))
+    body: Mapped[dict] = mapped_column(JSON)
+    created_at: Mapped[float] = mapped_column(Float)
+
+
 class RunEvent(Tenant, Base):
     __tablename__ = "run_events"
     __table_args__ = (

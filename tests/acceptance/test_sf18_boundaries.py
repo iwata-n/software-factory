@@ -4,12 +4,13 @@ from uuid import uuid4
 import httpx
 import pytest
 from pydantic import SecretStr
-from sqlalchemy import select
+from sqlalchemy import select, text
+from sqlalchemy.exc import IntegrityError
 
 from software_factory.ci_poll import CIPoller
 from software_factory.ci_webhook import GitHubWebhook, save_delivery
 from software_factory.github_ci import check_status
-from software_factory.models import Gate, Run, RunEvent
+from software_factory.models import Gate, OutboxEvent, Run, RunEvent, VerifiedRunResult
 from software_factory.service import Service
 from tests.test_assembler import runner as runner
 from tests.test_publications import publication as publication
@@ -81,6 +82,8 @@ def waiting(publication, clock, request):
         assert req.method == "GET" and req.url.host == "api.github.com"
         assert req.headers["Authorization"] == "Bearer read-fixture-not-a-real-token"
         stub["reads"] += 1
+        if on_read := stub.pop("on_read", None):
+            on_read()
         if stub["status"] != 200:
             return httpx.Response(stub["status"])
         root = f"/repos/{config.github_repository}"
@@ -92,10 +95,12 @@ def waiting(publication, clock, request):
         assert req.url.params["filter"] == "all"
         return httpx.Response(200, json={"check_runs": stub["checks"]})
 
-    def poll():
+    def poll(checkpoint=None):
         # Each tick uses fresh Service, Poller and HTTP client instances to cover restart.
         with httpx.Client(transport=httpx.MockTransport(respond)) as client:
-            CIPoller(Service(world.database), integrations, tokens).poll(client)
+            CIPoller(Service(world.database, checkpoint=checkpoint), integrations, tokens).poll(
+                client
+            )
 
     def signal(delivery_id=None, action="completed"):
         body = (
@@ -212,7 +217,7 @@ def test_delayed_signal_cannot_restore_old_pass_or_duplicate_final_gate(waiting,
     stub["checks"] = [check, check | {"id": 101}]
     with ThreadPoolExecutor(max_workers=2) as pool:
         list(pool.map(lambda _: poll(), range(2)))
-    assert world.run()["phase"] == "FINAL_GATE_READY"
+    assert world.run()["phase"] in {"FINAL_GATE_READY", "COMPLETE"}
     with world.database.transaction() as session:
         (final,) = list(session.scalars(select(Gate).where(Gate.stage == "FINAL")))
         (event,) = list(
@@ -283,3 +288,89 @@ def test_repaired_candidate_still_stops_with_ci_timeout(pipeline, clock, evidenc
     run = world.run()
     assert (run["status"], run["stop_reason"]) == ("BLOCKED", "CI_TIMEOUT")
     evidence("A repaired Candidate has the same CI timeout semantics", run)
+
+
+def test_restart_confirms_result_and_notification_once(waiting):
+    world, _, poll, _, pull, _, _, _ = waiting
+    path = f"/v1/runs/{world.run_id}/result"
+    poll()
+    assert world.get(path).status_code == 404
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        list(pool.map(lambda _: poll(), range(2)))
+    assert world.run()["status"] == "SUCCEEDED"
+    snapshot = world.get(path).json()
+    assert snapshot["kind"] == "VERIFIED_DRAFT_PR"
+    assert snapshot["draft_pr"]["head_sha"] == pull["head"]["sha"]
+    assert snapshot["checks"][0]["provider_run_id"] == 100
+    assert world.get(path, token=world.other_user_token).status_code == 404
+    pull["head"]["sha"] = "a" * 40
+    poll()
+    assert world.get(path).json() == snapshot
+    with world.database.transaction() as session:
+        (result,) = list(session.scalars(select(VerifiedRunResult)))
+        assert result.id == snapshot["result_id"]
+        (notification,) = list(
+            session.scalars(select(OutboxEvent).where(OutboxEvent.kind == "SLACK_RUN_RESULT"))
+        )
+        assert notification.body["status"] == "SUCCEEDED"
+        assert notification.body["candidate_id"] == snapshot["candidate_id"]
+        assert notification.body["ci_urls"] == [snapshot["checks"][0]["url"]]
+    with pytest.raises(IntegrityError, match="EVIDENCE_IMMUTABLE"):
+        with world.database.transaction() as session:
+            session.execute(text("DELETE FROM verified_run_results"))
+
+
+@pytest.mark.parametrize("fault", ["head", "missing", "failure", "cancel"])
+def test_final_gate_cannot_finalize_after_target_or_ci_changes(waiting, fault):
+    world, _, poll, _, pull, _, check, stub = waiting
+    poll()
+    ready = world.run()
+    assert ready["phase"] == "FINAL_GATE_READY"
+    if fault == "head":
+        pull["head"]["sha"] = "a" * 40
+    elif fault == "missing":
+        stub["checks"] = []
+    elif fault == "failure":
+        stub["checks"] = [check | {"id": 101, "conclusion": "failure"}]
+    else:
+
+        def cancel():
+            response = world.post(
+                f"/v1/runs/{world.run_id}/cancel",
+                {
+                    "expected_run_revision": ready["state_revision"],
+                    "reason": "cancel during GitHub read",
+                },
+            )
+            assert response.status_code == 202
+
+        stub["on_read"] = cancel
+    poll()
+    assert world.run()["status"] != "SUCCEEDED"
+    assert world.get(f"/v1/runs/{world.run_id}/result").status_code == 404
+    if fault == "head":
+        assert world.run()["stop_reason"] == "GITHUB_CI_TARGET_CHANGED"
+    if fault == "cancel":
+        assert world.run()["status"] == "CANCELLED"
+
+
+def test_result_outbox_and_terminal_status_roll_back_together(waiting):
+    world, clock, poll, _, _, _, _, _ = waiting
+    poll()
+
+    def crash(point):
+        if point == "verified_result.saved":
+            raise RuntimeError("injected result commit failure")
+
+    with pytest.raises(RuntimeError, match="injected result commit failure"):
+        poll(checkpoint=crash)
+    assert world.run()["phase"] == "FINAL_GATE_READY"
+    with world.database.transaction() as session:
+        assert session.scalar(select(VerifiedRunResult)) is None
+        assert (
+            session.scalar(select(OutboxEvent).where(OutboxEvent.kind == "SLACK_RUN_RESULT"))
+            is None
+        )
+    clock.value += 60
+    poll()
+    assert world.run()["status"] == "SUCCEEDED"

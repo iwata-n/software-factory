@@ -58,6 +58,7 @@ from .models import (
     SlackDelivery,
     SpecVersion,
     Task,
+    VerifiedRunResult,
     Worker,
 )
 from .operations import operations_router
@@ -250,6 +251,22 @@ def create_app(
     @app.get("/v1/runs/{run_id}", tags=["Runs"])
     def run_get(run_id: str, token: Token):
         return service.read(token, lambda s, a: run_view(owned(s, Run, run_id, a.workspace_id)))
+
+    @app.get("/v1/runs/{run_id}/result", tags=["Runs"])
+    def run_result(run_id: str, token: Token):
+        def query(session, actor):
+            run = owned(session, Run, run_id, actor.workspace_id)
+            result = session.scalar(
+                select(VerifiedRunResult).where(
+                    VerifiedRunResult.workspace_id == run.workspace_id,
+                    VerifiedRunResult.run_id == run.id,
+                )
+            )
+            if result is None:
+                raise DomainError(404, "NOT_FOUND")
+            return {"result_id": result.id, "verified_at": result.created_at, **result.body}
+
+        return service.read(token, query)
 
     @app.get("/v1/runs/{run_id}/notifications", tags=["Integrations"])
     def run_notifications(run_id: str, token: Token):

@@ -344,7 +344,7 @@ Gateは必須Jobが処理中なら待機を続ける。全必須Jobが終端ま�
 
 ### SF-19 公開結果UNKNOWNの復旧とRun成功
 
-先行実装の範囲は公開UNKNOWNの読み取り照合、期限・履歴の永続化、取消競合。最終成功判定の実CI結線は、SF-18の正規化済み必須CIと現在PR/headの再照合契約の確定に依存する。契約確定後に成功snapshot、Outbox、現在PRとの表示分離、および対応するE2Eを結線する。
+公開UNKNOWNの読み取り照合、期限・履歴の永続化、取消競合を実装した。CIポーラーはFinal Gate合格後にGitHubの現在のPR/headと必須CIを再照合する。その観測を現在のRun revision・候補・Local Gateと照合し、成功snapshot（0015）、Run終端、監査イベント、Slack通知Outboxを同時に確定する。成功時の記録は `GET /v1/runs/{run_id}/result` で参照できる。現在PRとの表示分離と実GitHubでのE2Eは引き続き追跡する。
 
 依存SF-18。試験追加先は `tests/acceptance/test_sf19.py`。UNKNOWN照合はbranch、操作識別子、Repository、Run、Candidate/headを使う。単なるPRタイトル一致で復旧しない。
 

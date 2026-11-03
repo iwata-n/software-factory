@@ -8,11 +8,21 @@ from sqlalchemy import func, select
 
 from .db import db_now
 from .github_ci import CIReadError, GitHubCIReader
-from .models import CIWebhookDelivery, Repository, Run
-from .service import event, owned
+from .models import (
+    CIWebhookDelivery,
+    DraftPullRequest,
+    Gate,
+    Repository,
+    Run,
+    VerifiedRunResult,
+    new_id,
+)
+from .publications import draft_view
+from .service import DomainError, event, owned, transition
+from .slack_delivery import enqueue_result
 
 POLL_SECONDS = 60
-WAITING = (Run.status == "WAITING_EXTERNAL", Run.phase == "WAIT_CI")
+WAITING = (Run.status == "WAITING_EXTERNAL", Run.phase.in_(["WAIT_CI", "FINAL_GATE_READY"]))
 
 
 def configured_read_tokens():
@@ -116,7 +126,7 @@ class CIPoller:
                 return None
             now = db_now(session)
             if now >= context["deadline_at"]:
-                self.service.gates.final(session, run)
+                self.expire(session, run)
                 return None
             poll = context.get("github_ci_poll", {})
             if now < max(poll.get("retry_at", 0), context.get("next_reconcile_at", 0)):
@@ -130,11 +140,13 @@ class CIPoller:
                 )
             )
             triggered = signal is not None and signal > poll.get("signal", -1)
-            if now < poll.get("next_at", 0) and not triggered:
+            if poll.get("phase") == run.phase and now < poll.get("next_at", 0) and not triggered:
                 return None
             run.wait_context = context | {
                 "github_ci_poll": {
                     "claim": str(uuid4()),
+                    "phase": run.phase,
+                    "revision": run.state_revision,
                     "next_at": now + POLL_SECONDS,
                     "signal": signal if signal is not None else -1,
                 }
@@ -150,12 +162,18 @@ class CIPoller:
                 for key in ("github_ci_poll", "draft", "target", "required_ci", "deadline_at")
             ):
                 return
+            claim = claimed["github_ci_poll"]
+            if (run.phase, run.state_revision) != (claim["phase"], claim["revision"]):
+                return
             if db_now(session) >= context["deadline_at"]:
-                self.service.gates.final(session, run)
+                self.expire(session, run)
                 return
             previous = [check for check in context["checks"] if "provider_run_id" in check]
             if error is None and stale_snapshot(previous, checks):
                 error = "GITHUB_CI_STALE_SNAPSHOT"
+            if error == "GITHUB_CI_TARGET_CHANGED" and run.phase == "FINAL_GATE_READY":
+                transition(session, run, "BLOCKED", error)
+                return
             if error is not None:
                 poll = context["github_ci_poll"]
                 run.wait_context = context | {
@@ -165,4 +183,71 @@ class CIPoller:
                 return
             if checks != context["checks"]:
                 event(session, run, "GITHUB_CI_RECONCILED", {"check_count": len(checks)})
-            self.service.gates.final(session, run, checks)
+            confirming = run.phase == "FINAL_GATE_READY"
+            if confirming and not self.current_publication(session, run, context):
+                transition(session, run, "BLOCKED", "PUBLICATION_GATE_STALE")
+                return
+            run.phase = "WAIT_CI"
+            gate = self.service.gates.final(session, run, checks)
+            if confirming and gate is not None and gate.status == "PASS":
+                self.save_result(session, run, context, gate, checks)
+
+    def expire(self, session, run):
+        run.phase = "WAIT_CI"
+        self.service.gates.final(session, run)
+
+    def current_publication(self, session, run, context):
+        try:
+            self.service.interventions.require_current_context(session, run)
+        except DomainError:
+            return False
+        draft = session.scalar(
+            select(DraftPullRequest).where(
+                DraftPullRequest.workspace_id == run.workspace_id, DraftPullRequest.run_id == run.id
+            )
+        )
+        local = owned(session, Gate, context["local_gate_id"], run.workspace_id)
+        _, target, _, _, _, current = self.service.gates.inputs(session, run)
+        return (
+            draft is not None
+            and draft_view(draft) == context["draft"]
+            and local.run_id == run.id
+            and local.stage == "LOCAL"
+            and local.status == current.status == "PASS"
+            and local.target == target == context["target"]
+            and local.evidence_digest == current.evidence_digest
+        )
+
+    def save_result(self, session, run, context, gate, checks):
+        result_checks = [check for check in checks if check["id"] in gate.evidence_ids]
+        snapshot = {
+            "kind": "VERIFIED_DRAFT_PR",
+            "candidate_id": run.current_candidate_id,
+            "target": gate.target,
+            "policy_version": gate.policy_version,
+            "local_gate_id": context["local_gate_id"],
+            "final_gate_id": gate.id,
+            "evidence_digest": gate.evidence_digest,
+            "draft_pr": context["draft"],
+            "required_ci": context["required_ci"],
+            "checks": result_checks,
+        }
+        result = VerifiedRunResult(
+            id=new_id(),
+            workspace_id=run.workspace_id,
+            run_id=run.id,
+            body=snapshot,
+            created_at=db_now(session),
+        )
+        session.add(result)
+        run.status, run.phase, run.stop_reason = "SUCCEEDED", "COMPLETE", None
+        run.wait_context = None
+        event(session, run, "VERIFIED_DRAFT_PR", {"result_id": result.id, "gate_id": gate.id})
+        enqueue_result(
+            session,
+            run,
+            pr_url=context["draft"]["url"],
+            ci_urls=[check["url"] for check in result_checks],
+        )
+        session.flush()
+        self.service.checkpoint("verified_result.saved")

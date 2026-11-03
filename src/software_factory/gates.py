@@ -450,7 +450,7 @@ class GateCommands:
         if stop:
             transition(session, run, "BLOCKED", stop)
         elif decision.status == "PASS":
-            # SF-19 verifies publication reconciliation before assigning Run SUCCEEDED.
+            # The CI poller confirms the current publication before completing the Run.
             run.phase = "FINAL_GATE_READY"
         elif decision.status == "ERROR":
             count = context.get("infra_attempt", 1)

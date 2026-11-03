@@ -22,6 +22,9 @@ GITHUB_REF = re.compile(
     r"(?:/job/[0-9]+)?)",
     re.ASCII,
 )
+GITHUB_CHECK_REF = re.compile(
+    r"https://api\.github\.com/repos/[\w.-]+/[\w.-]+/check-runs/[0-9]+", re.ASCII
+)
 STOP_CODE = re.compile(r"[A-Z][A-Z0-9_]{0,79}")
 
 
@@ -46,7 +49,11 @@ def enqueue_result(session, run: Run, *, pr_url: str | None = None, ci_urls=()) 
                 "reason": (run.stop_reason if STOP_CODE.fullmatch(run.stop_reason or "") else None),
                 "next_action": "Review the blocked Run" if run.status == "BLOCKED" else None,
                 "pr_url": pr_url if pr_url and GITHUB_REF.fullmatch(pr_url) else None,
-                "ci_urls": [url for url in ci_urls if GITHUB_REF.fullmatch(url)][:20],
+                "ci_urls": [
+                    url
+                    for url in ci_urls
+                    if GITHUB_REF.fullmatch(url) or GITHUB_CHECK_REF.fullmatch(url)
+                ][:20],
             },
         )
     )
