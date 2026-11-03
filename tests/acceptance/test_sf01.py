@@ -101,6 +101,13 @@ def test_previous_revision_data_survives_upgrade(database, evidence, revision):
             body = example_spec(rid)
             records = {
                 "workspaces": {"id": wid, "name": "legacy"},
+                "principals": {
+                    "id": str(uuid4()),
+                    "workspace_id": wid,
+                    "role": "WORKER",
+                    "token_hash": "b" * 64,
+                    "active": True,
+                },
                 "projects": {
                     "id": pid,
                     "workspace_id": wid,
@@ -162,6 +169,7 @@ def test_previous_revision_data_survives_upgrade(database, evidence, revision):
                     else not after[name]
                 )
         assert after["repositories"][0]["active"] is True
+        assert after["principals"][0]["credential_revision"] == 0
         command.upgrade(Config("alembic.ini"), "head")
         assert dump(old) == after
         command.check(Config("alembic.ini"))

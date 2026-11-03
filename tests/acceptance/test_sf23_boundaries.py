@@ -228,6 +228,13 @@ def test_rotation_preserves_worker_slot_and_fences_old_token_at_grace(
         assert [item.operation for item in events].count("worker.credential.rotate") == 2
         revoke = next(item for item in events if item.operation == "principal.revoke")
         assert revoke.body["reason"] == "test"
+        assert (revoke.body["before_revision"], revoke.body["after_revision"]) == (2, 3)
+        assert worker.credential_revision == 3
+        assert {
+            (item.body["before_revision"], item.body["after_revision"])
+            for item in events
+            if item.operation == "worker.credential.rotate"
+        } == {(0, 1), (1, 2)}
         assert all(
             token not in json.dumps([item.body for item in events]) for token in (new_token, latest)
         )
@@ -417,7 +424,8 @@ def test_workspace_user_access_separates_read_run_operations_and_worker_administ
     assert enrolled.json()["enrollment_token"] not in world.get(f"{root}/workers").text
     assert new_worker.json()["worker_token"] not in world.get(f"{root}/workers").text
     assert world.post(f"{run_path}/cancel", action, token=operator).status_code == 202
-    assert world.post(revoke_path, {"reason": "evaluation"}).status_code == 200
+    assert world.post(revoke_path, {"reason": "evaluation"}, key="revoke").status_code == 200
+    assert world.post(revoke_path, {"reason": "evaluation"}, key="revoke").status_code == 200
     assert world.claim().status_code == 401
     assert world.claim(token=new_worker.json()["worker_token"]).status_code == 204
     with world.database.transaction() as session:
@@ -432,6 +440,8 @@ def test_workspace_user_access_separates_read_run_operations_and_worker_administ
             "worker_id": world.worker_id,
             "before_active": True,
             "after_active": False,
+            "before_revision": 0,
+            "after_revision": 1,
             "reason": "evaluation",
         }
         assert 0 < revocation.created_at <= db_now(session)

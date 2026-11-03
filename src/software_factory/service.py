@@ -810,7 +810,10 @@ class Service:
         owned(session, Worker, worker_id, workspace_id)
         principal = owned(session, Principal, worker_id, workspace_id)
         before = principal.active
-        principal.active = False
+        before_revision = principal.credential_revision
+        if before:
+            principal.active = False
+            principal.credential_revision += 1
         session.add(
             AuditEvent(
                 workspace_id=workspace_id,
@@ -820,6 +823,8 @@ class Service:
                     "worker_id": worker_id,
                     "before_active": before,
                     "after_active": False,
+                    "before_revision": before_revision,
+                    "after_revision": principal.credential_revision,
                     "reason": reason,
                 },
                 created_at=db_now(session),
@@ -890,6 +895,8 @@ class Service:
             now = db_now(session)
             if (actor.previous_token_expires_at or 0) > now:
                 raise DomainError(409, "WORKER_ROTATION_GRACE_ACTIVE")
+            before_revision = actor.credential_revision
+            actor.credential_revision += 1
             actor.previous_token_hash = actor.token_hash
             actor.previous_token_expires_at = now + WORKER_ROTATION_GRACE_SECONDS
             actor.token_hash = token_hash(secret)
@@ -901,6 +908,8 @@ class Service:
                     operation="worker.credential.rotate",
                     body={
                         "worker_id": actor.id,
+                        "before_revision": before_revision,
+                        "after_revision": actor.credential_revision,
                         "previous_token_expires_at": actor.previous_token_expires_at,
                         "token_expires_at": actor.token_expires_at,
                     },
