@@ -56,6 +56,7 @@ class Principal(Tenant, Base):
     user_access: Mapped[str] = mapped_column(String(20), default="ADMIN", server_default="ADMIN")
     token_hash: Mapped[str] = mapped_column(String(64), unique=True)
     active: Mapped[bool] = mapped_column(Boolean, default=True)
+    credential_revision: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
     token_expires_at: Mapped[float | None] = mapped_column(Float, nullable=True)
     previous_token_hash: Mapped[str | None] = mapped_column(String(64))
     previous_token_expires_at: Mapped[float | None] = mapped_column(Float, nullable=True)

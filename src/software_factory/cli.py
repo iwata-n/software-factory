@@ -205,13 +205,20 @@ def main():
             principal.token_expires_at = now + WORKER_TOKEN_SECONDS if is_worker else None
             principal.previous_token_hash = None
             principal.previous_token_expires_at = None
+            before_revision = principal.credential_revision
+            principal.credential_revision += 1
             principal.active = True
             session.add(
                 AuditEvent(
                     workspace_id=principal.workspace_id,
                     actor_id="local-admin",
                     operation=f"{kind}.credential.reissue",
-                    body={f"{kind}_id": principal.id, "reason": redact(args.reason)},
+                    body={
+                        f"{kind}_id": principal.id,
+                        "before_revision": before_revision,
+                        "after_revision": principal.credential_revision,
+                        "reason": redact(args.reason),
+                    },
                     created_at=now,
                 )
             )
@@ -241,7 +248,10 @@ def main():
             service.lock_workspace(session, principal.workspace_id)
             session.refresh(principal)
             previous_active = principal.active
-            principal.active = False
+            before_revision = principal.credential_revision
+            if previous_active:
+                principal.active = False
+                principal.credential_revision += 1
             session.add(
                 AuditEvent(
                     workspace_id=principal.workspace_id,
@@ -251,6 +261,8 @@ def main():
                         "principal_id": principal.id,
                         "before_active": previous_active,
                         "after_active": False,
+                        "before_revision": before_revision,
+                        "after_revision": principal.credential_revision,
                         "reason": redact(args.reason),
                     },
                     created_at=db_now(session),

@@ -301,8 +301,8 @@ def restore(database, root, bundle, certificate, key):
                 )
             session.execute(
                 update(Principal)
-                .where(Principal.role.in_(["WORKER", "PUBLISHER"]))
-                .values(active=False)
+                .where(Principal.role.in_(["WORKER", "PUBLISHER"]), Principal.active.is_(True))
+                .values(active=False, credential_revision=Principal.credential_revision + 1)
             )
             session.execute(
                 update(Enrollment).where(Enrollment.consumed_at.is_(None)).values(consumed_at=now)
