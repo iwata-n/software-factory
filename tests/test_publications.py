@@ -232,6 +232,7 @@ def test_emergency_stop_blocks_unstarted_publication_but_preserves_external_repo
     assert world.run()["status"] == "CANCELLED"
 
 
+@pytest.mark.ac("SF-24-AC06")
 @pytest.mark.parametrize("unresolved", [False, True])
 def test_run_retention_protects_unknown_publication_and_purges_resolved_graph(
     publication, unresolved

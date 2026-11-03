@@ -32,19 +32,25 @@ from tests.conftest import example_spec
 pytestmark = pytest.mark.postgres
 
 
+@pytest.mark.ac("SF-24-AC06")
 def test_artifact_collection_at_boundaries(world, artifacts):
     root = world.client.app.state.service.artifacts.storage.root
     evidence = artifacts.ready()
     pending = artifacts.reserve().json()["id"]
     with world.database.transaction() as session:
-        now = db_now(session)
-        session.execute(update(Artifact).where(Artifact.id == pending).values(expires_at=now))
+        reserved = session.get(Artifact, pending)
+        now = reserved.expires_at
+        assert now - reserved.created_at == 3600
         session.execute(update(RunEvent).values(created_at=now - 30 * DAY))
         last_revision = session.get(Run, world.run_id).state_revision
     database = Database(
-        world.database.engine.url.render_as_string(hide_password=False), clock=lambda: now
+        world.database.engine.url.render_as_string(hide_password=False), clock=lambda: now - 0.001
     )
     try:
+        assert collect(database, root)["marked_deleted"] == 0
+        with database.transaction() as session:
+            assert session.get(Artifact, pending).status == "RESERVED"
+        database.sessions.configure(info={"clock": lambda: now})
         # A live run protects finalized evidence even when its events are old.
         assert collect(database, root) == {
             "marked_deleted": 1,
@@ -99,6 +105,7 @@ def test_artifact_collection_at_boundaries(world, artifacts):
         database.engine.dispose()
 
 
+@pytest.mark.ac("SF-24-AC06")
 def test_retention_prunes_only_old_history_prefix_and_keeps_terminal_anchor(world, artifacts):
     root = world.client.app.state.service.artifacts.storage.root
     lease = artifacts.lease
@@ -175,6 +182,7 @@ def test_retention_prunes_only_old_history_prefix_and_keeps_terminal_anchor(worl
         database.engine.dispose()
 
 
+@pytest.mark.ac("SF-24-AC05")
 def test_encrypted_backup_restore(world, artifacts, tmp_path, monkeypatch, capsys):
     root = world.client.app.state.service.artifacts.storage.root
     evidence = artifacts.ready()
@@ -306,6 +314,7 @@ def test_encrypted_backup_restore(world, artifacts, tmp_path, monkeypatch, capsy
         admin.engine.dispose()
 
 
+@pytest.mark.ac("SF-24-AC06")
 def test_run_purge_preserves_command_receipt_for_ninety_more_days(world, artifacts):
     root = world.client.app.state.service.artifacts.storage.root
     artifact = artifacts.reserve().json()["id"]
