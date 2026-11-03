@@ -39,6 +39,7 @@ ROOT = Path(__file__).resolve().parents[1]
 REMOTE = "https://github.com/iwata-n/software-factory.git"
 REPOSITORY = "iwata-n/software-factory"
 TARGET = "examples/evaluation/app.py"
+EVALUATION_WORKFLOW = ".github/workflows/factory-evaluation.yml"
 
 
 def process_json(argv, *, environment=None):
@@ -46,7 +47,7 @@ def process_json(argv, *, environment=None):
 
 
 def github(path):
-    return process_json(["gh", "api", "repos/" + REPOSITORY + "/" + path])
+    return process_json(["gh", "api", ("repos/" + REPOSITORY + "/" + path).rstrip("/")])
 
 
 def port():
@@ -150,11 +151,70 @@ class FixtureReviewer:
         }
 
 
+def verify_live_ci(user, run_id, publication, state, output, identity, restart_control_plane):
+    deadline = time.monotonic() + 900
+    while time.monotonic() < deadline:
+        run = state()
+        if run["status"] == "SUCCEEDED":
+            break
+        if run["status"] != "WAITING_EXTERNAL" or run["phase"] not in {
+            "WAIT_CI",
+            "FINAL_GATE_READY",
+        }:
+            raise RuntimeError(f"Unexpected evaluation state: {run['status']} / {run['phase']}")
+        time.sleep(2)
+    else:
+        raise RuntimeError("Live GitHub CI did not finish within 900 seconds")
+
+    def receipt():
+        result = user.get(f"/v1/runs/{run_id}/result")
+        result.raise_for_status()
+        notifications = user.get(f"/v1/runs/{run_id}/notifications")
+        notifications.raise_for_status()
+        return result.json(), notifications.json()
+
+    result, notifications = receipt()
+    draft = publication["pull_request"]
+    (check,) = result["checks"]
+    (notification,) = notifications["notifications"]
+    assert result["kind"] == "VERIFIED_DRAFT_PR"
+    assert result["draft_pr"] == draft
+    assert check["status"] == "PASS" and check["tested_sha"] == draft["head_sha"]
+    assert notification["run_status"] == "SUCCEEDED" and notification["state"] == "PENDING"
+    restart_control_plane()
+    assert state()["status"] == "SUCCEEDED" and receipt() == (result, notifications)
+    (output / "evaluation.json").write_text(
+        json.dumps(
+            {
+                "evaluation": "SF18_LIVE_GITHUB_POLL",
+                "revision": identity["revision"],
+                "run_id": run_id,
+                "local_agent_and_reviewer": "fixture",
+                "ci_input_origin": "actual_github",
+                "notification": notification,
+                "result": result,
+            },
+            indent=2,
+            ensure_ascii=False,
+        )
+    )
+    print(json.dumps({"run_id": run_id, "pr": draft["url"], "ci": check["url"]}), flush=True)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--base-ref", required=True)
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--actions-workflow-id", type=int)
+    parser.add_argument("--fixture-base-sha")
     args = parser.parse_args()
+    live_ci = args.actions_workflow_id is not None
+    if live_ci != bool(args.fixture_base_sha):
+        parser.error("--actions-workflow-id and --fixture-base-sha must be specified together")
+    if live_ci and (
+        args.actions_workflow_id <= 0 or not args.base_ref.startswith("codex/factory-evaluation/")
+    ):
+        parser.error("live CI requires a positive workflow ID and an evaluation-only base ref")
     url = make_url(os.environ["FACTORY_DATABASE_URL"])
     if not str(url.query.get("host", "")).startswith("/private/tmp/factory-pg-"):
         raise SystemExit("use with_postgres.py and its disposable PostgreSQL")
@@ -162,8 +222,8 @@ def main():
         raise SystemExit("commit the evaluated implementation and fixtures before this evaluation")
     identity = source_manifest()
     remote_sha = github("git/ref/heads/" + args.base_ref)["object"]["sha"]
-    if remote_sha != identity["base_sha"]:
-        raise SystemExit("evaluation base ref must point at this exact implementation commit")
+    if remote_sha != (args.fixture_base_sha or identity["base_sha"]):
+        raise SystemExit("evaluation base ref does not match the fixed SHA")
     output = args.output.resolve()
     output.mkdir(mode=0o700, parents=True, exist_ok=False)
     command.upgrade(Config(str(ROOT / "alembic.ini")), "head")
@@ -236,6 +296,10 @@ def main():
                 p.relative_to(ROOT).as_posix(): hashlib.sha256(p.read_bytes()).hexdigest()
                 for p in checks.glob("*.py")
             }
+            if live_ci:
+                protected[EVALUATION_WORKFLOW] = hashlib.sha256(
+                    (ROOT / EVALUATION_WORKFLOW).read_bytes()
+                ).hexdigest()
             policy = {
                 "allowed_write_paths": [TARGET],
                 "protected_paths": [
@@ -283,6 +347,16 @@ def main():
                     for name in ("publication-transport-a", "publication-transport-b")
                 ],
             }
+            if live_ci:
+                policy["required_ci_checks"] = [
+                    {
+                        "provider": "github",
+                        "app_id": 15368,
+                        "check_name": "factory-eval-empty",
+                        "github_workflow_id": args.actions_workflow_id,
+                        "github_workflow_path": EVALUATION_WORKFLOW,
+                    }
+                ]
             project = post(
                 user,
                 f"/v1/workspaces/{account['workspace_id']}/projects",
@@ -437,6 +511,49 @@ def main():
             managed_stages()
             result, publication = publish()
             assert result["state"] == "SUCCEEDED" and state()["phase"] == "WAIT_CI"
+            if live_ci:
+                integration_id = str(uuid4())
+                webhook_secret = uuid4().hex + uuid4().hex
+                provider_token = subprocess.check_output(
+                    ["gh", "auth", "token", "--hostname", "github.com"], text=True
+                ).strip()
+                known_secrets.extend([webhook_secret, provider_token])
+                cp_environment["FACTORY_GITHUB_WEBHOOKS"] = json.dumps(
+                    {
+                        integration_id: {
+                            "workspace_id": account["workspace_id"],
+                            "repository_id": repository["repository_id"],
+                            "github_repository_id": github("")["id"],
+                            "github_repository": REPOSITORY,
+                            "secret": webhook_secret,
+                        }
+                    }
+                )
+                cp_environment["FACTORY_GITHUB_CI_READ_TOKENS"] = json.dumps(
+                    {integration_id: provider_token}
+                )
+
+                def restart_control_plane():
+                    process = processes.pop()
+                    process.terminate()
+                    process.wait(timeout=10)
+                    log = files.enter_context((output / "control-plane-live-ci.log").open("ab"))
+                    processes.append(
+                        subprocess.Popen(
+                            [sys.executable, "-m", "software_factory.cli", "serve"],
+                            env=cp_environment,
+                            cwd=ROOT,
+                            stdout=log,
+                            stderr=log,
+                        )
+                    )
+                    wait_ready(cp_url + "/healthz", processes[-1])
+
+                restart_control_plane()
+                verify_live_ci(
+                    user, run_id, publication, state, output, identity, restart_control_plane
+                )
+                return
             first_publication = publication
             database = Database()
             service = Service(database)
