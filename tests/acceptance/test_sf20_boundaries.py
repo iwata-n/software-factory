@@ -1,12 +1,16 @@
 """SF-20 local evidence. Live Codex and runner evidence is collected separately."""
 
+import time
+
 import pytest
 
-from software_factory.codex_adapter import delivery
+from software_factory.codex_adapter import CodexAdapter, delivery
 from software_factory.codex_engine import parse_events
 from software_factory.contracts import ModelCallUsage, digest
 from software_factory.metering import price_call
 from software_factory.models import Project, Run, Worker
+from tests.test_codex_adapter import job as job
+from tests.test_codex_engine import cli as cli
 from tests.test_codex_engine import encoded, events
 from tests.test_control_plane import completion, submit
 
@@ -111,3 +115,75 @@ def test_codex_turn_counts_and_budget_estimate_are_recorded_separately(world, ev
         attempt_id=attempt_id,
         input_origin="recorded_cli_event_fixture",
     )
+
+
+@pytest.mark.ac("SF-20-AC03")
+@pytest.mark.parametrize(
+    ("mode", "expected", "reason", "category"),
+    [
+        ("badjson", "FAILED", "CODEX_EVENT_SCHEMA_INVALID", "INCONCLUSIVE"),
+        ("unknown", "FAILED", "CODEX_EVENT_SCHEMA_INVALID", "INCONCLUSIVE"),
+        ("metered-exit", "FAILED", "CODEX_PROCESS_FAILED", "INFRASTRUCTURE"),
+        ("timeout", "FAILED", "CODEX_TIMEOUT", "INFRASTRUCTURE"),
+        ("cancel", "CANCELLED", None, None),
+        ("unconfirmed", "FAILED", "STOP_UNCONFIRMED", "INFRASTRUCTURE"),
+    ],
+)
+def test_adapter_classifies_cli_process_failure(
+    job, cli, evidence, monkeypatch, mode, expected, reason, category
+):
+    from software_factory.codex_engine import CodexError
+
+    running = mode in {"timeout", "cancel", "unconfirmed"}
+    engine = cli("hang" if running else mode)
+    job["snapshot"]["agent_configuration"]["engine_manifest_hash"] = engine.manifest_hash
+    if mode == "timeout":
+        job["execution"]["timeout_seconds"] = 0.2
+    adapter = CodexAdapter(engine)
+    adapter.start(job)
+    observed_process = None
+    try:
+        if mode in {"cancel", "unconfirmed"}:
+            deadline = time.monotonic() + 3
+            while engine._process is None and time.monotonic() < deadline:
+                time.sleep(0.01)
+            observed_process = engine._process
+            assert observed_process is not None and observed_process.poll() is None
+
+            def unconfirmed_stop():
+                raise CodexError("STOP_UNCONFIRMED", "INFRASTRUCTURE")
+
+            with monkeypatch.context() as patch:
+                if mode == "unconfirmed":
+                    patch.setattr(engine, "cancel", unconfirmed_stop)
+                adapter.cancel()
+
+        adapter._thread.join(timeout=8)
+        assert not adapter._thread.is_alive()
+        result = adapter.result()
+        assert result is not None
+        assert (result.outcome, result.reason, result.category) == (expected, reason, category)
+        assert result.result == {} and not result.artifacts
+        assert bool(result.usage_deliveries) == (mode == "metered-exit")
+        if mode == "unconfirmed":
+            assert observed_process.poll() is None
+        else:
+            assert engine._process is None
+            if observed_process is not None:
+                assert observed_process.poll() is not None
+        evidence(
+            "CLI failure or cancellation is classified without publishing output",
+            {
+                "outcome": result.outcome,
+                "reason": result.reason,
+                "category": result.category,
+                "usage_receipts": len(result.usage_deliveries),
+                "process_stopped": engine._process is None,
+            },
+            failure_mode=mode,
+        )
+    finally:
+        if adapter._thread.is_alive():
+            adapter.cancel()
+        if engine._process is not None:
+            engine.cancel()

@@ -81,6 +81,8 @@ if mode=='badjson':
 if mode=='large':
  print('x'*10000);raise SystemExit(0)
 items={events()!r}
+if mode=='unknown':
+ items.insert(2,{{'type':'future.mandatory.event'}})
 if mode=='env':
  items[2]['item']['text']=json.dumps({{'value':','.join(sorted(os.environ))}})
 for item in items: print(json.dumps(item),flush=True)
