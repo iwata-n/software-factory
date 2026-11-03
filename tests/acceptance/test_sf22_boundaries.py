@@ -8,6 +8,8 @@ from fastapi.testclient import TestClient
 from sqlalchemy import func, select
 
 from software_factory.api import create_app
+from software_factory.jira_input import JiraMapping
+from software_factory.jira_relay import import_issue
 from software_factory.models import (
     JiraIssueRevision,
     OutboxEvent,
@@ -264,3 +266,74 @@ def test_ambiguous_5xx_is_reconciled_and_never_reposted(world):
     (delivery,) = notifications(world)
     assert delivery["reason"] == "AMBIGUOUS_RESPONSE"
     assert delivery["attempts"] == 1
+
+
+@pytest.mark.ac("SF-22-AC01", "SF-22-AC02")
+def test_jira_rest_relay_imports_adf_and_rejects_wrong_project(world, jira):
+    relay, settings = jira
+    mapping = JiraMapping.model_validate(settings)
+    spec = example_spec(world.repository_id)
+    document = {
+        "type": "doc",
+        "version": 1,
+        "content": [{"type": "codeBlock", "content": [{"type": "text", "text": json.dumps(spec)}]}],
+    }
+    calls = []
+    provider = {
+        "id": "10099",
+        "key": "SWF-123",
+        "fields": {
+            "project": {"key": "SWF"},
+            "updated": "2026-11-03T10:00:00.001+0900",
+            FIELD: document,
+        },
+    }
+
+    def respond(request):
+        calls.append(request.method)
+        if request.method == "GET":
+            assert str(request.url).startswith(SITE + "/rest/api/3/issue/SWF-123?")
+            assert request.url.params["fields"] == f"project,updated,{FIELD}"
+            assert request.headers["Authorization"].startswith("Basic ")
+            return httpx.Response(200, json=provider)
+        assert request.url.host == "127.0.0.1"
+        assert request.headers["Authorization"] == f"Bearer {JIRA_TOKEN}"
+        result = relay.post(request.url.path, content=request.content, headers=request.headers)
+        return httpx.Response(result.status_code, content=result.content)
+
+    with httpx.Client(transport=httpx.MockTransport(respond)) as client:
+
+        def run(key):
+            return import_issue(
+                client,
+                mapping,
+                key,
+                "http://127.0.0.1:8000",
+                "jira@example.test",
+                "fixture-jira-token",
+                JIRA_TOKEN,
+            )
+
+        with pytest.raises(ValueError, match="configured Jira project"):
+            run("OTHER-123")
+        assert not calls
+        first = run("SWF-123")
+        assert first["state"] == "IMPORTED" and first["spec_version"] == 1
+        assert first["issue_url"] == SITE + "/browse/SWF-123"
+        assert run("SWF-123") == first
+        provider["fields"]["project"]["key"] = "OTHER"
+        with pytest.raises(ValueError, match="Invalid Jira issue response"):
+            run("SWF-123")
+        assert calls == ["GET", "POST", "GET", "POST", "GET"]
+    with world.database.transaction() as session:
+        rows = session.scalars(select(JiraIssueRevision)).all()
+        assert len(rows) == 1 and rows[0].task_id == first["task_id"]
+
+
+@pytest.mark.ac("SF-22-AC03")
+def test_jira_mapping_cannot_elevate_viewer(world, jira):
+    _, mapping = jira
+    with world.database.transaction() as session:
+        session.get(Principal, mapping["principal_id"]).user_access = "VIEWER"
+    result = receive(jira, input_for(world, 1))
+    assert result.status_code == 403 and result.json()["code"] == "JIRA_INTEGRATION_REVOKED"

@@ -155,7 +155,7 @@ uv run factory reconcile
 
 失効したTokenは新規要求を拒否します。実行中Workerの物理停止は断定せず、Lease失効または停止報告を記録します。失効Attemptの未確定消費は予約額を消費済みとして記録します。費用は整数のmicro USDによる模擬集計で、Providerの実課金を抑える保証ではありません。
 
-基盤内ではWorkspace行を短時間ロックし、同一Workspaceの変更操作を直列化します。Long Pollingの待機はDBトランザクションの外で行います。Outboxは保存のみで、JiraやSlackへの配送はSF-22の対象です。
+基盤内ではWorkspace行を短時間ロックし、同一Workspaceの変更操作を直列化します。Long Pollingの待機はDBトランザクションの外で行います。Run結果はOutboxに保存し、Slack配送は別プロセスで処理します。
 
 Repositoryの取消は既存Runのsnapshotより優先し、新規Claim・公開認可を停止します。ResolverはRun Compilerの外側に置き、解決待ちにDBトランザクションを維持しません。remote_url未指定の既存Repositoryは管理者登録済みSHAを使います。remote_urlがある場合はHTTP Source Runnerを必須とし、未設定時に登録済みSHAへ黙って退避しません。Planのsymlink検査には信頼されたWorkerの読取専用調査結果を使い、Agentの自己申告から許可範囲を増やしません。
 
@@ -316,6 +316,24 @@ GitHub Actions（App ID `15368`）の必須チェックには、Policy の `requ
     EXPECTED_HEAD: ${{ github.event.pull_request.head.sha }}
   run: test "$(git rev-parse HEAD)" = "$EXPECTED_HEAD"
 ```
+
+## Jira取り込みとSlack配送
+
+Jira Cloudの対象Projectに専用の複数行テキスト欄を用意し、TaskSpecのJSONを入力します。Control Planeと取り込みプロセスに同じ設定を渡します。
+
+```sh
+export FACTORY_JIRA_MAPPING='{"integration_id":"swf","site":"https://example.atlassian.net","project_key":"SWF","workspace_id":"WORKSPACE_ID","project_id":"FACTORY_PROJECT_ID","principal_id":"OPERATOR_PRINCIPAL_ID","field_id":"customfield_12345"}'
+```
+
+`FACTORY_JIRA_RELAY_TOKEN`（32文字以上）は秘密情報として両プロセスに設定します。取り込みプロセスにだけ、課題の読み取り権限を持つ `FACTORY_JIRA_EMAIL` と `FACTORY_JIRA_API_TOKEN` を設定します。
+
+```sh
+uv run python -m software_factory.jira_relay SWF-123 --api-url http://127.0.0.1:8000
+```
+
+返された `task_id` と `spec_version` を使い、認証付きの `POST /v1/tasks/{task_id}/runs` でRunを開始します。同じJira課題の更新は同じTaskの新しいSpecとして取り込まれます。
+
+Slack配送プロセスには対象のFactory Workspace IDを `FACTORY_SLACK_WORKSPACE_ID`、送信先チャンネルIDを `FACTORY_SLACK_CHANNEL_ID`、Bot認証を `FACTORY_SLACK_BOT_TOKEN` として設定します。Control Planeと同じDBを指定し、`uv run python -m software_factory.slack_delivery` を定期実行すると、配送期限に達した通知を処理します。応答が不明な配送を照合するため、Botには対象チャンネルの履歴の読み取りも許可します。
 
 ## バックアップと復元
 

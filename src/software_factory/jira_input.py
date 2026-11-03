@@ -48,7 +48,36 @@ def configured_jira() -> tuple[JiraMapping, str] | None:
     return mapping, secret
 
 
+def structured_field_text(raw):
+    """Decode plain text blocks from Jira Cloud multiline custom fields."""
+    if not isinstance(raw, dict) or raw.get("type") != "doc":
+        return raw
+    blocks = raw.get("content")
+    if raw.get("version") != 1 or not isinstance(blocks, list):
+        return None
+    paragraphs = []
+    for block in blocks:
+        if not isinstance(block, dict) or block.get("type") not in ("paragraph", "codeBlock"):
+            return None
+        content = block.get("content", [])
+        if not isinstance(content, list):
+            return None
+        lines = []
+        for node in content:
+            if not isinstance(node, dict):
+                return None
+            if node.get("type") == "text" and isinstance(node.get("text"), str):
+                lines.append(node["text"])
+            elif node.get("type") == "hardBreak":
+                lines.append("\n")
+            else:
+                return None
+        paragraphs.append("".join(lines))
+    return "\n".join(paragraphs)
+
+
 def normalize(raw, secret: str) -> tuple[str, TaskSpec | None]:
+    raw = structured_field_text(raw)
     if isinstance(raw, str):
         try:
             raw = json.loads(raw)
@@ -84,6 +113,7 @@ def receive(service: Service, mapping: JiraMapping, delivery: JiraInput, secret:
             not actor
             or not actor.active
             or actor.role != "USER"
+            or actor.user_access not in {"OPERATOR", "ADMIN"}
             or actor.workspace_id != mapping.workspace_id
         ):
             raise DomainError(403, "JIRA_INTEGRATION_REVOKED")
