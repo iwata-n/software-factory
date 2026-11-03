@@ -143,6 +143,72 @@ def verify_live_ci_matrix(matrix, manifest):
     return sorted(urls)
 
 
+def verify_control_plane_restart(report, publisher, manifest):
+    phases = report["stages"]
+    evaluation = report["evaluation"]
+    terminal = phases["SUCCEEDED"]
+    waiting = phases["WAIT_CI"]
+    unknown = phases["PUBLISH_UNKNOWN"]
+    result = evaluation["result"]
+    draft = result["draft_pr"]
+    (check,) = result["checks"]
+    if (
+        report["revision"] != manifest["revision"]
+        or evaluation["revision"] != manifest["revision"]
+        or report["run_id"] != publisher["run_id"]
+        or evaluation["run_id"] != report["run_id"]
+        or set(phases) != {"PUBLISH_UNKNOWN", "WAIT_CI", "SUCCEEDED"}
+        or unknown["next_reconcile_at"] is None
+        or unknown["pull_request"] is not None
+        or waiting["ci_deadline_at"] is None
+        or waiting["pull_request"] != publisher["pull_request"]
+        or terminal["pull_request"] != publisher["pull_request"]
+        or terminal["result_id"] != result["result_id"]
+        or result["kind"] != "VERIFIED_DRAFT_PR"
+        or evaluation["ci_input_origin"] != "actual_github"
+        or draft["url"] != publisher["pull_request"]
+        or draft["head_sha"] != publisher["head_sha"]
+        or check["status"] != "PASS"
+        or not check["origin_verified"]
+        or check["tested_sha"] != draft["head_sha"]
+        or unknown["notification_keys"]
+        or waiting["notification_keys"]
+        or terminal["notification_keys"] != [evaluation["notification"]["delivery_key"]]
+        or report["after_replay_digest"] != terminal["after_digest"]
+        or not re.fullmatch(r"publish-report:[a-f0-9]{64}", report["publisher_report_key"])
+    ):
+        raise ValueError("Control Plane restart, CI, or notification evidence does not match")
+    for sample in phases.values():
+        stopped_pid, started_pid = sample["pids"]
+        if (
+            stopped_pid <= 0
+            or started_pid <= 0
+            or stopped_pid == started_pid
+            or sample["exit_code"] != -9
+            or sample["operation_key"] != publisher["operation_key"]
+            or not re.fullmatch(r"[a-f0-9]{64}", sample["before_digest"])
+            or sample["before_digest"] != sample["after_digest"]
+        ):
+            raise ValueError("Control Plane process or durable snapshot evidence does not match")
+    job = json.loads(
+        subprocess.check_output(
+            [
+                "gh",
+                "api",
+                f"repos/iwata-n/software-factory/actions/jobs/{int(check['provider_run_id'])}",
+            ],
+            timeout=15,
+        )
+    )
+    if (
+        job["conclusion"] != "success"
+        or job["head_sha"] != draft["head_sha"]
+        or job["html_url"] != check["url"]
+    ):
+        raise ValueError("GitHub CI job differs from the restored successful result")
+    return [draft["url"], check["url"]]
+
+
 def audit(directory: Path, *, allow_ci_pending: bool = False) -> dict:
     manifest = json.loads((directory / "manifest.json").read_text())
     current = source_manifest()
@@ -300,6 +366,26 @@ def audit(directory: Path, *, allow_ci_pending: bool = False) -> dict:
             external_urls=[report["pull_request"]],
             external_verification={"filename": restart.name, "sha256": sha(restart.read_bytes())},
             evidence_paths=list(dict.fromkeys([*record["evidence_paths"], restart.name])),
+        )
+        path.write_text(json.dumps(record, indent=2, ensure_ascii=False))
+    control_restart = directory / EXTERNAL_CRITERIA["SF-19-AC06"]
+    if control_restart.exists():
+        if not restart.exists():
+            raise ValueError("Control Plane restart evidence requires the matching Publisher proof")
+        urls = verify_control_plane_restart(
+            json.loads(control_restart.read_text()), report, manifest
+        )
+        path, record = records["SF-19-AC06"]
+        record.update(
+            result="PASS",
+            external_urls=urls,
+            external_verification={
+                "filename": control_restart.name,
+                "sha256": sha(control_restart.read_bytes()),
+            },
+            evidence_paths=list(
+                dict.fromkeys([*record["evidence_paths"], restart.name, control_restart.name])
+            ),
         )
         path.write_text(json.dumps(record, indent=2, ensure_ascii=False))
     for ac, (_, record) in records.items():

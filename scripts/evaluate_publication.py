@@ -30,6 +30,7 @@ from sqlalchemy import MetaData, select, text
 from sqlalchemy.engine import make_url
 
 from software_factory.adapters import AgentResult, Capabilities, FakeAgent, ProducedArtifact
+from software_factory.contracts import digest
 from software_factory.db import Database
 from software_factory.models import CIWebhookDelivery, PublicationOperation, Run, RunEvent
 from software_factory.pipeline_worker import PipelineAdapter
@@ -417,7 +418,7 @@ def matching_live_drafts(operation):
     return github(f"pulls?{params}")
 
 
-def verify_live_restart(output, identity, publisher, run_id, cp_url, publish):
+def verify_live_restart(output, identity, publisher, run_id, cp_url, publish, on_unknown=None):
     github_token = subprocess.check_output(
         ["gh", "auth", "token", "--hostname", "github.com"], text=True
     ).strip()
@@ -431,6 +432,8 @@ def verify_live_restart(output, identity, publisher, run_id, cp_url, publish):
     assert restarted["state"] == "UNKNOWN"
     (unknown,) = publication["operations"]
     assert unknown["state"] == "UNKNOWN" and unknown["next_reconcile_at"] is not None
+    if on_unknown is not None:
+        on_unknown()
     with httpx.Client(
         base_url=cp_url,
         trust_env=False,
@@ -484,6 +487,7 @@ def verify_live_restart(output, identity, publisher, run_id, cp_url, publish):
     }
     (output / "evaluation.json").write_text(json.dumps(evidence, indent=2) + "\n")
     print(json.dumps(evidence), flush=True)
+    return publication
 
 
 def verify_live_restore(output, identity, account, publisher, run_id, cp_url, cp_environment):
@@ -650,12 +654,13 @@ def main():
     parser.add_argument("--fixture-base-sha")
     parser.add_argument("--restore-publication", action="store_true")
     parser.add_argument("--restart-publisher", action="store_true")
+    parser.add_argument("--restart-control-plane", action="store_true")
     parser.add_argument("--drift-current-pr", action="store_true")
     parser.add_argument("--expect-ci-failure", action="store_true")
     parser.add_argument("--live-webhook", action="store_true")
     args = parser.parse_args()
     live_ci = args.actions_workflow_id is not None
-    recovery = args.restore_publication or args.restart_publisher
+    recovery = args.restore_publication or args.restart_publisher or args.restart_control_plane
     if (
         recovery or args.expect_ci_failure or args.live_webhook or args.drift_current_pr
     ) and not live_ci:
@@ -663,7 +668,7 @@ def main():
     if recovery and (
         args.expect_ci_failure
         or args.live_webhook
-        or (args.restore_publication and args.restart_publisher)
+        or sum((args.restore_publication, args.restart_publisher, args.restart_control_plane)) > 1
     ):
         parser.error("select one rehearsal at a time")
     if args.drift_current_pr and (recovery or args.expect_ci_failure or args.live_webhook):
@@ -900,6 +905,60 @@ def main():
                 'return ", ".join(items) if items else "データがありません"',
             )
             fixture = FixtureAgent(before, first)
+
+            def restart_control_plane():
+                process = processes[-1]
+                if args.restart_control_plane:
+                    process.kill()
+                else:
+                    process.terminate()
+                process.wait(timeout=10)
+                log = files.enter_context((output / "control-plane-restarts.log").open("ab"))
+                processes[-1] = subprocess.Popen(
+                    [sys.executable, "-m", "software_factory.cli", "serve"],
+                    env=cp_environment,
+                    cwd=ROOT,
+                    stdout=log,
+                    stderr=log,
+                )
+                wait_ready(cp_url + "/healthz", processes[-1])
+                return [process.pid, processes[-1].pid], process.returncode
+
+            restart_samples = {}
+
+            def snapshot():
+                values = {}
+                for name in ("", "/publication", "/result", "/notifications", "/event-history"):
+                    reply = user.get(f"/v1/runs/{run_id}{name}")
+                    assert reply.status_code == (
+                        404 if name == "/result" and values[""]["status"] != "SUCCEEDED" else 200
+                    ), reply.text
+                    values[name] = reply.json()
+                return values
+
+            def capture_restart():
+                before = snapshot()
+                pids, exit_code = restart_control_plane()
+                after = snapshot()
+                assert exit_code == -signal.SIGKILL and pids[0] != pids[1]
+                assert after == before
+                run = before[""]
+                (operation,) = before["/publication"]["operations"]
+                restart_samples[run["phase"] if run["status"] != "SUCCEEDED" else "SUCCEEDED"] = {
+                    "pids": pids,
+                    "exit_code": exit_code,
+                    "before_digest": digest(before),
+                    "after_digest": digest(after),
+                    "operation_key": operation["operation_key"],
+                    "next_reconcile_at": operation["next_reconcile_at"],
+                    "ci_deadline_at": (run.get("wait_context") or {}).get("deadline_at"),
+                    "pull_request": (before["/publication"]["pull_request"] or {}).get("url"),
+                    "result_id": before["/result"].get("result_id"),
+                    "notification_keys": [
+                        row["delivery_key"] for row in before["/notifications"]["notifications"]
+                    ],
+                }
+
             assert Supervisor(agent_client, fixture, heartbeat_interval=0.1).run_once()["accepted"]
             approvals = user.get(f"/v1/runs/{run_id}/approvals").json()
             request = approvals[0]
@@ -979,7 +1038,13 @@ def main():
                     output, identity, account, publisher, run_id, cp_url, cp_environment
                 )
                 return
-            if not args.live_webhook:
+            if args.restart_control_plane:
+                publication = verify_live_restart(
+                    output, identity, publisher, run_id, cp_url, publish, capture_restart
+                )
+                (output / "evaluation.json").rename(output / "sf19-restart-verification.json")
+                capture_restart()
+            elif not args.live_webhook:
                 result, publication = publish()
                 assert result["state"] == "SUCCEEDED" and state()["phase"] == "WAIT_CI"
             if live_ci:
@@ -1004,22 +1069,6 @@ def main():
                     {integration_id: provider_token}
                 )
 
-                def restart_control_plane():
-                    process = processes.pop()
-                    process.terminate()
-                    process.wait(timeout=10)
-                    log = files.enter_context((output / "control-plane-live-ci.log").open("ab"))
-                    processes.append(
-                        subprocess.Popen(
-                            [sys.executable, "-m", "software_factory.cli", "serve"],
-                            env=cp_environment,
-                            cwd=ROOT,
-                            stdout=log,
-                            stderr=log,
-                        )
-                    )
-                    wait_ready(cp_url + "/healthz", processes[-1])
-
                 restart_control_plane()
                 if args.live_webhook:
                     hook_path = f"/v1/webhooks/github/{integration_id}"
@@ -1035,7 +1084,7 @@ def main():
                     state,
                     output,
                     identity,
-                    restart_control_plane,
+                    capture_restart if args.restart_control_plane else restart_control_plane,
                     expect_failure=args.expect_ci_failure,
                 )
                 with Database().transaction() as session:
@@ -1071,6 +1120,38 @@ def main():
                 assert any(row.event != "ping" for row in deliveries) == args.live_webhook
                 assert triggers and triggers[-1].body.get("trigger") == expected_trigger
                 (output / "ci-trigger.json").write_text(json.dumps(proof, indent=2) + "\n")
+                if args.restart_control_plane:
+                    before = snapshot()
+                    (operation,) = publication["operations"]
+                    body = publication["observations"][-1]["body"]
+                    report_key = "publish-report:" + digest(body)
+                    replay = user.post(
+                        f"/v1/publisher/operations/{operation['operation_id']}/reports",
+                        json=body,
+                        headers={
+                            "Authorization": "Bearer " + publisher["publisher_token"],
+                            "Idempotency-Key": report_key,
+                        },
+                    )
+                    replay.raise_for_status()
+                    assert replay.json()["operation"]["operation_id"] == operation["operation_id"]
+                    after = snapshot()
+                    assert after == before
+                    assert set(restart_samples) == {"PUBLISH_UNKNOWN", "WAIT_CI", "SUCCEEDED"}
+                    (output / "sf19-verification.json").write_text(
+                        json.dumps(
+                            {
+                                "revision": identity["revision"],
+                                "run_id": run_id,
+                                "stages": restart_samples,
+                                "publisher_report_key": report_key,
+                                "after_replay_digest": digest(after),
+                                "evaluation": json.loads((output / "evaluation.json").read_text()),
+                            },
+                            indent=2,
+                        )
+                        + "\n"
+                    )
                 if args.drift_current_pr:
                     verify_live_pr_drift(user, run_id, output, identity, restart_control_plane)
                 return
