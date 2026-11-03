@@ -75,7 +75,11 @@ def row(directory):
         "stop_reason": run.get("stop_reason"),
         "verified_draft": bool(verified),
         "accepted": bool(
-            verified and notification.get("state") == "SENT" and notification.get("message_id")
+            verified
+            and report.get("notifications_sent") == 1
+            and report.get("slack_history_confirmed") is True
+            and notification.get("state") == "SENT"
+            and notification.get("message_id")
         ),
     }
 
