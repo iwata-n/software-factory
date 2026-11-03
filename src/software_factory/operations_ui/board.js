@@ -10,12 +10,16 @@ const lanes = new Map([
   ["CANCELLED", "取消済み"],
 ]);
 const detail = get("detail");
+const executionButtons = ["execution-action", "execution-submit", "execution-dismiss"];
 let token = "";
 let runs = [];
 let nextBefore = null;
 let boardRequest;
 let detailRequest;
 let selected;
+let executionContext;
+let executionRequest;
+let pendingExecution;
 
 function element(tag, text, className) {
   const node = document.createElement(tag);
@@ -51,6 +55,13 @@ async function read(path, signal) {
 function disconnect(text = "接続を終了しました。", error = false) {
   boardRequest?.abort();
   detailRequest?.abort();
+  executionRequest?.abort();
+  executionRequest = undefined;
+  executionButtons.forEach((id) => { get(id).disabled = false; });
+  executionContext = undefined;
+  closeExecutionForm();
+  get("execution").hidden = true;
+  executionMessage("");
   token = "";
   runs = [];
   nextBefore = null;
@@ -106,6 +117,101 @@ function renderBoard() {
   get("board").replaceChildren(...sections);
 }
 
+function executionMessage(text, error = false) {
+  message("execution-message", text, error);
+  get("execution-message").hidden = !text;
+}
+
+function closeExecutionForm() {
+  pendingExecution = undefined;
+  get("execution-form").hidden = true;
+  get("execution-reason").value = "";
+}
+
+function renderExecution(context) {
+  const { execution, access } = context;
+  if (executionContext?.execution.revision !== execution.revision || access !== "ADMIN") {
+    closeExecutionForm();
+  }
+  executionContext = context;
+  const panel = get("execution");
+  panel.dataset.stopped = String(execution.stopped);
+  panel.hidden = false;
+  get("execution-state").textContent = execution.stopped
+    ? `緊急停止中 · Rev. ${execution.revision}`
+    : `実行を許可 · Rev. ${execution.revision}`;
+  get("execution-action").hidden = access !== "ADMIN";
+  get("execution-action").textContent = execution.stopped ? "緊急停止を解除" : "緊急停止";
+}
+
+function openExecutionForm() {
+  if (executionContext?.access !== "ADMIN" || executionRequest) return;
+  const { execution } = executionContext;
+  pendingExecution = {
+    workspaceId: execution.workspace_id,
+    stopped: !execution.stopped,
+    expected_revision: execution.revision,
+  };
+  executionMessage("");
+  get("execution-submit").textContent = execution.stopped ? "解除を実行" : "停止を実行";
+  get("execution-form").hidden = false;
+  get("execution-reason").focus();
+}
+
+async function submitExecution(event) {
+  event.preventDefault();
+  const action = pendingExecution;
+  if (!action || executionRequest) return;
+  const reason = get("execution-reason").value.trim();
+  if (!reason) {
+    executionMessage("操作の理由を入力してください。", true);
+    return;
+  }
+  if (action.reason !== reason) {
+    action.reason = reason;
+    action.key = Array.from(crypto.getRandomValues(new Uint8Array(16)), (b) =>
+      b.toString(16).padStart(2, "0")).join("");
+  }
+  executionRequest = new AbortController();
+  const { signal } = executionRequest;
+  executionButtons.forEach((id) => { get(id).disabled = true; });
+  try {
+    const { workspaceId, stopped, expected_revision, key } = action;
+    const response = await fetch(`/v1/workspaces/${encodeURIComponent(workspaceId)}/execution-control`, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${token}`, "Content-Type": "application/json", "Idempotency-Key": key,
+      },
+      body: JSON.stringify({ stopped, expected_revision, reason }),
+      cache: "no-store", signal, redirect: "error",
+    });
+    if (signal.aborted) return;
+    if (response.status === 401) {
+      disconnect("User トークンを確認してください。", true);
+      return;
+    }
+    if ([403, 409].includes(response.status)) {
+      closeExecutionForm();
+      executionMessage("権限または実行状態が変わりました。最新状態を確認してください。", true);
+      await loadBoard();
+      return;
+    }
+    if (!response.ok) throw new ApiError(response.status);
+    const execution = await response.json();
+    if (signal.aborted) return;
+    renderExecution({ ...executionContext, execution });
+    executionMessage(stopped ? "緊急停止を適用しました。" : "緊急停止を解除しました。");
+    await loadBoard();
+  } catch {
+    if (!signal.aborted) executionMessage("操作結果を確認できませんでした。同じ理由で再試行できます。", true);
+  } finally {
+    if (executionRequest?.signal === signal) {
+      executionRequest = undefined;
+      executionButtons.forEach((id) => { get(id).disabled = false; });
+    }
+  }
+}
+
 async function loadBoard(older = false) {
   boardRequest?.abort();
   boardRequest = new AbortController();
@@ -115,8 +221,11 @@ async function loadBoard(older = false) {
   message("status", "Run 一覧を取得中…");
   try {
     const suffix = older ? `?before=${encodeURIComponent(nextBefore)}` : "";
-    const page = await read(`/v1/runs${suffix}`, signal);
+    const [page, context] = await Promise.all([
+      read(`/v1/runs${suffix}`, signal), read("/v1/operations/context", signal),
+    ]);
     if (signal.aborted) return;
+    renderExecution(context);
     runs = older ? [...runs, ...page.runs] : page.runs;
     nextBefore = page.next_before;
     renderBoard();
@@ -393,3 +502,7 @@ detail.addEventListener("close", () => {
   detailRequest?.abort();
   get("detail-content").replaceChildren();
 });
+
+get("execution-action").addEventListener("click", openExecutionForm);
+get("execution-dismiss").addEventListener("click", closeExecutionForm);
+get("execution-form").addEventListener("submit", submitExecution);

@@ -78,6 +78,18 @@ def operations_router(service, token_type):
             return Response(status_code=404)
         return FileResponse(UI_DIR / asset, headers={"X-Content-Type-Options": "nosniff"})
 
+    @router.get("/v1/operations/context", tags=["Operations"])
+    def operations_context(token: token_type, response: Response):
+        response.headers["Cache-Control"] = "no-store"
+
+        def query(session, actor):
+            return {
+                "access": actor.user_access,
+                "execution": service.execution_control(session, actor, actor.workspace_id),
+            }
+
+        return service.read(token, query)
+
     @router.get("/v1/runs", tags=["Runs"])
     def runs_list(
         token: token_type,

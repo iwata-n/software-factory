@@ -22,6 +22,20 @@
       <button id="refresh">更新</button>
       <button id="disconnect">切断</button>
     </div>
+    <section id="execution" class="execution" aria-labelledby="execution-title" hidden>
+      <h2 id="execution-title">Workspace の実行状態</h2>
+      <p id="execution-state" role="status"></p>
+      <button id="execution-action" type="button" hidden></button>
+      <form id="execution-form" hidden>
+        <label for="execution-reason">操作の理由</label>
+        <div class="controls">
+          <input id="execution-reason" maxlength="2000" required>
+          <button id="execution-submit" type="submit"></button>
+          <button id="execution-dismiss" type="button">閉じる</button>
+        </div>
+      </form>
+      <p id="execution-message" role="status" hidden></p>
+    </section>
     <p id="status" role="status">User トークンで接続すると Run を表示します。</p>
     <div id="board" class="board" aria-label="Run の状態別一覧" hidden></div>
     <button id="older" hidden>過去の Run を追加表示</button>

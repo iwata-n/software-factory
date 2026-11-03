@@ -416,7 +416,7 @@ Gateは必須Jobが処理中なら待機を続ける。全必須Jobが終端ま�
 | SF-23-AC05 | read-only Userが変更/承認、運用UserがWorker管理、WorkerがUser操作を要求 | 操作権限表に従い403。Workspace管理権限だけが登録/失効を実行でき、ID変更やpool再利用で越境不可 | CT/UI E2E：全API/操作×権限の表、A/B切替、秘密非表示を確認 |
 | SF-23-AC06 | 緊急停止・解除・承認・予算変更・Worker失効を行い、監査改変も試す | 緊急停止は新Claim/未開始公開を抑止し、実行中へ停止要求。解除は対象固定の明示操作のみ。監査は追記専用でactor/理由/時刻/前後revisionを保存 | IT/UI E2E：各競合と送信0、監査更新拒否、再起動後の停止継続 |
 
-0018でWorkspaceの緊急停止状態とrevisionを永続化した。ADMINが現在revisionと理由を指定して停止・解除する。停止中は新規Claimと公開開始を拒否し、実行中Runは既存LeaseのHeartbeatで停止要求を受ける。公開準備中はPublisherの入力取得を拒否し、既に外部送信された結果の照合・履歴記録は受け付ける。解除後は待機中のJobが再び割り当て可能になる。停止・解除の画面操作と実運用演習は追跡中。
+0018でWorkspaceの緊急停止状態とrevisionを永続化した。ADMINが現在revisionと理由を指定して停止・解除する。停止中は新規Claimと公開開始を拒否し、実行中Runは既存LeaseのHeartbeatで停止要求を受ける。公開準備中はPublisherの入力取得を拒否し、既に外部送信された結果の照合・履歴記録は受け付ける。解除後は待機中のJobが再び割り当て可能になる。運用カンバンからADMINが理由を入力して停止・解除できる。VIEWERは停止状態を閲覧できる。Chrome幅375pxから一時Control Plane/PostgreSQLにつなぎ、停止、VIEWERでの再接続、解除を確認した。幅1440px/375pxのfixture試験では旧revisionからの解除拒否と状態の再取得も確認した。別担当者による実運用演習はSF-24で追跡する。
 
 ### SF-24 保持と復元とMVP総合受け入れ
 

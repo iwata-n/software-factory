@@ -268,7 +268,13 @@ def test_workspace_user_access_separates_read_run_operations_and_worker_administ
     ):
         for path, body in denied:
             assert world.post(path, body, token=token).status_code == 403, (path, body)
-    for token in (viewer, operator):
+    for token, access in ((viewer, "VIEWER"), (operator, "OPERATOR"), (world.user_token, "ADMIN")):
+        context = world.get("/v1/operations/context", token=token)
+        assert context.headers["cache-control"] == "no-store"
+        assert context.json() == {
+            "access": access,
+            "execution": {"workspace_id": world.workspace_id, "stopped": False, "revision": 0},
+        }
         assert world.get(run_path, token=token).status_code == 200
         assert world.get(f"{root}/workers", token=token).status_code == 200
     assert world.run()["state_revision"] == revision
