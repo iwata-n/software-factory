@@ -1,6 +1,9 @@
+import io
+import tarfile
 import time
 from concurrent.futures import ThreadPoolExecutor
-from threading import Event
+from dataclasses import replace
+from threading import Barrier, Event
 from uuid import uuid4
 
 import httpx
@@ -11,12 +14,13 @@ from software_factory.models import Attempt, Project
 from software_factory.pipeline_worker import PipelineAdapter
 from software_factory.sandbox import DockerRunner, RunnerError
 from software_factory.worker import Supervisor
-from tests.conftest import example_policy
+from tests.conftest import example_policy, example_spec
 from tests.test_assembler import PATCH, request
 from tests.test_assembler import runner as runner
 from tests.test_assembler import source_bundle as source_bundle
 
-from .helpers import dump
+from .helpers import dump, worker_client
+from .test_sf10 import make_pipeline
 from .test_sf10 import pipeline as pipeline
 
 
@@ -262,3 +266,88 @@ def test_managed_worker_confirms_container_removed_on_stop(
         finally:
             if container and not pending.done():
                 runner.docker("rm", "--force", container, timeout=7)
+
+
+@pytest.mark.ac("SF-21-AC02")
+def test_two_workspaces_cannot_share_managed_worker_inputs(
+    pipeline, source_bundle, tmp_path, monkeypatch, evidence
+):
+    first = pipeline.world
+    other = replace(first, workspace_id=first.other_workspace_id, user_token=first.other_user_token)
+    project = other.post(
+        f"/v1/workspaces/{other.workspace_id}/projects",
+        {"name": "other", "policy": example_policy()},
+    ).json()
+    repository = other.post(
+        f"/v1/projects/{project['project_id']}/repositories",
+        {"name": "other", "base_sha": "a" * 40},
+    ).json()
+    task = other.post(
+        f"/v1/projects/{project['project_id']}/tasks", example_spec(repository["repository_id"])
+    ).json()
+    initial = other.post(f"/v1/tasks/{task['task_id']}/runs", {"spec_version": 1}).json()
+    worker = other.make_worker()
+    other = replace(
+        other,
+        project_id=project["project_id"],
+        repository_id=repository["repository_id"],
+        task_id=task["task_id"],
+        run_id=initial["run_id"],
+        worker_id=worker["worker_id"],
+        worker_token=worker["worker_token"],
+    )
+    second = make_pipeline(other, source_bundle, pipeline.runner, tmp_path)
+
+    monkeypatch.setenv("FACTORY_RUNNER_STATE_ROOT", str(tmp_path / "tenant-owners"))
+    results = []
+
+    class InspectRunner(DockerRunner):
+        def execute(self, request, **kwargs):
+            result = super().execute(request, **kwargs)
+            results.append(result.isolation)
+            return result
+
+    runner = InspectRunner(pipeline.runner.image_digest)
+    stages = (pipeline, second)
+    values = (b"tenant_a_canary", b"tenant_b_canary")
+    for stage, canary in zip(stages, values, strict=True):
+        stage.prepare(PATCH.replace(b"value = 2", b"value = '" + canary + b"'"))
+
+    barrier = Barrier(2)
+    leases = {}
+
+    def assemble(index):
+        stage = stages[index]
+
+        def attack(assignment):
+            leases[index] = assignment["lease"]
+            barrier.wait(timeout=10)
+            foreign = leases[1 - index]
+            response = stage.world.get(
+                f"/v1/worker/leases/{foreign['id']}/source?fence={foreign['fence']}",
+                token=stage.managed.worker_token,
+            )
+            assert response.status_code == 404
+
+        with worker_client(stage.managed, after_claim=attack)[0] as client:
+            assert Supervisor(client, PipelineAdapter(runner), heartbeat_interval=0.1).run_once()[
+                "accepted"
+            ]
+
+    with ThreadPoolExecutor(2) as pool:
+        list(pool.map(assemble, range(2)))
+    assert len(results) == 2 and all(row["mounts"] == [] for row in results)
+    assert all(row["network"] == "none" for row in results)
+    assert all(set(row["tmpfs"]) == {"/tmp", "/work"} for row in results)
+    for index, stage in enumerate(stages):
+        world = stage.world
+        candidate = world.get(f"/v1/candidates/{world.run()['current_candidate_id']}").json()
+        path = f"/v1/artifacts/{candidate['source_artifact_id']}/content"
+        assert stages[1 - index].world.get(path).status_code == 404
+        with tarfile.open(fileobj=io.BytesIO(world.get(path).content), mode="r:gz") as archive:
+            actual = archive.extractfile("src/example.py").read()
+            assert values[index] in actual and values[1 - index] not in actual
+    evidence(
+        "two Workspace credentials cannot cross leases or artifacts; no shared cache is mounted",
+        {"workspaces": 2, "cross_lease": 404, "cross_artifact": 404, "shared_mounts": 0},
+    )
