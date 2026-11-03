@@ -275,6 +275,18 @@ factory-publisher --publisher-token-file .local/publisher.token \
 
 `GET /v1/runs/{id}/publication` で操作台帳と外部PRを確認できます。公開開始前の取消は送信を止め、開始後の外部結果は取消Runとは別に履歴へ残します。Publisherは送信前後を永続化し、同じ認証の別起動とも共有します。開始後に結果を確認できなければ `UNKNOWN` とし、盲目的に再公開しません。UNKNOWNの定期照合はSF-19で実装します。現在は契約・ローカルbare Git試験までで、SF-17の実GitHub受け入れは未完了です。
 
+## Workspaceの操作権限
+
+`python -m software_factory.cli issue-user --workspace-id <id> --access VIEWER` で閲覧専用の資格情報を発行します。`OPERATOR` と `ADMIN` も指定できます。既存Userは移行時にADMINを引き継ぎます。
+
+| 操作 | VIEWER | OPERATOR | ADMIN |
+|---|---|---|---|
+| Workspace内のRun・証拠・Workerの閲覧 | 可 | 可 | 可 |
+| Task・Spec作成、Run開始・取消・承認・予算操作 | | 可 | 可 |
+| Project・Repository登録、Worker登録・失効 | | | 可 |
+
+Worker登録用の単回トークンは `POST /v1/workspaces/{id}/worker-enrollments` で発行します。Workerはこれを使い従来どおり `POST /v1/worker/enroll` で登録します。失効は `POST /v1/workspaces/{id}/workers/{worker_id}/revoke` に理由と `Idempotency-Key` を付けて実行します。発行したトークンは発行応答で受け取り、Worker一覧は資格情報を返さない設計です。
+
 ## GitHub CIのWebhook受信
 
 `alembic upgrade head` でInboxを追加します。Control Planeの起動時に、環境変数 `FACTORY_GITHUB_WEBHOOKS` にIntegration UUIDをキーとするJSONオブジェクトを渡すと受信を有効化できます。各エントリの項目は `workspace_id`、`repository_id`、`github_repository_id`（GitHubの数値ID）、`github_repository`（owner/repo）、`secret`（32文字以上）です。署名用secretはローカルの秘密設定から渡します。

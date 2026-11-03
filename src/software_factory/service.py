@@ -280,6 +280,13 @@ class Service:
             raise DomainError(403, "PRINCIPAL_ROLE_DENIED")
         return actor
 
+    @staticmethod
+    def require_user_access(actor: Principal, access: str) -> None:
+        if actor.role != "USER" or actor.user_access not in (
+            {"ADMIN"} if access == "ADMIN" else {"ADMIN", "OPERATOR"}
+        ):
+            raise DomainError(403, "USER_ACCESS_DENIED")
+
     def lock_workspace(self, session: Session, workspace_id: str) -> None:
         # Initial single-slot deployment deliberately serializes tenant mutations.
         # This mutex covers idempotency, worker slots, run slots and reservations.
@@ -305,13 +312,19 @@ class Service:
         key: str | None,
         body: dict,
         fn: Callable[[Session, Principal], dict],
+        *,
+        user_access: str = "OPERATOR",
     ) -> dict:
         with self.db.transaction() as session:
             actor = self.principal(session, token, role)
+            if role == "USER":
+                self.require_user_access(actor, user_access)
             if not key or len(key) > 200 or redact(key, (token,)) != key:
                 raise DomainError(422, "IDEMPOTENCY_KEY_REQUIRED")
             self.lock_workspace(session, actor.workspace_id)
             actor = self.principal(session, token, role)
+            if role == "USER":
+                self.require_user_access(actor, user_access)
             if role in {"USER", "PUBLISHER"}:
                 cleaned = (
                     scrub_project_body(body, (token,))
@@ -463,6 +476,7 @@ class Service:
         operation, body = f"runs:{task_id}", data.model_dump()
         with self.db.transaction() as session:
             actor = self.principal(session, token, "USER")
+            self.require_user_access(actor, "OPERATOR")
             if not key or len(key) > 200 or redact(key, (token,)) != key:
                 raise DomainError(422, "IDEMPOTENCY_KEY_REQUIRED")
             previous = session.scalar(
@@ -671,6 +685,58 @@ class Service:
                 job.state = "PENDING"
             elif job.state == "PENDING":
                 job.state = "READY"
+
+    def issue_worker_enrollment(self, token, workspace_id, data):
+        with self.db.transaction() as session:
+            actor = self.locked_principal(session, token, "USER")
+            self.require_user_access(actor, "ADMIN")
+            if workspace_id != actor.workspace_id:
+                raise DomainError(404, "NOT_FOUND")
+            now = db_now(session)
+            secret = issue_token()
+            enrollment = Enrollment(
+                workspace_id=workspace_id,
+                token_hash=token_hash(secret),
+                capabilities=[*data.kinds, f"adapter:{data.adapter}"]
+                + (["usage:trusted"] if data.usage_authority else []),
+                managed=data.managed,
+                expires_at=now + data.ttl_seconds,
+            )
+            session.add(enrollment)
+            session.flush()
+            session.add(
+                AuditEvent(
+                    workspace_id=workspace_id,
+                    actor_id=actor.id,
+                    operation="worker.enrollment.issued",
+                    body={"enrollment_id": enrollment.id, "expires_at": enrollment.expires_at},
+                    created_at=now,
+                )
+            )
+            return {"enrollment_token": secret, "expires_at": enrollment.expires_at}
+
+    def revoke_worker(self, session, actor, workspace_id, worker_id, reason):
+        if workspace_id != actor.workspace_id:
+            raise DomainError(404, "NOT_FOUND")
+        owned(session, Worker, worker_id, workspace_id)
+        principal = owned(session, Principal, worker_id, workspace_id)
+        before = principal.active
+        principal.active = False
+        session.add(
+            AuditEvent(
+                workspace_id=workspace_id,
+                actor_id=actor.id,
+                operation="worker.credential.revoke",
+                body={
+                    "worker_id": worker_id,
+                    "before_active": before,
+                    "after_active": False,
+                    "reason": reason,
+                },
+                created_at=db_now(session),
+            )
+        )
+        return {"worker_id": worker_id, "revoked": True}
 
     def enroll(self, enrollment_token: str, name: str) -> dict:
         with self.db.transaction() as session:

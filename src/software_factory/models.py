@@ -43,8 +43,12 @@ class Principal(Tenant, Base):
         UniqueConstraint("workspace_id", "id"),
         CheckConstraint("role IN ('USER', 'WORKER', 'PUBLISHER')", name="ck_principals_role"),
         UniqueConstraint("previous_token_hash", name="uq_principals_previous_token"),
+        CheckConstraint(
+            "user_access IN ('ADMIN', 'OPERATOR', 'VIEWER')", name="ck_principals_user_access"
+        ),
     )
     role: Mapped[str] = mapped_column(String(20))
+    user_access: Mapped[str] = mapped_column(String(20), default="ADMIN", server_default="ADMIN")
     token_hash: Mapped[str] = mapped_column(String(64), unique=True)
     active: Mapped[bool] = mapped_column(Boolean, default=True)
     token_expires_at: Mapped[float | None] = mapped_column(Float, nullable=True)

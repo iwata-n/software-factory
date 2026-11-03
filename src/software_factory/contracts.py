@@ -489,6 +489,30 @@ class Claim(Contract):
     wait_seconds: int = Field(default=0, ge=0, le=20)
 
 
+class WorkerEnrollmentRequest(Contract):
+    kinds: list[
+        Literal["PLAN", "IMPLEMENT", "REPAIR", "ASSEMBLE_CANDIDATE", "VERIFY", "REVIEW"]
+    ] = Field(min_length=1, max_length=6)
+    adapter: Literal["fake", "codex_cli"] = "fake"
+    ttl_seconds: int = Field(default=600, ge=1, le=3600)
+    managed: bool = False
+    usage_authority: bool = False
+
+    @model_validator(mode="after")
+    def trusted_capabilities(self):
+        if len(set(self.kinds)) != len(self.kinds):
+            raise ValueError("duplicate Worker capabilities")
+        if not self.managed and (
+            self.usage_authority or set(self.kinds) & {"ASSEMBLE_CANDIDATE", "VERIFY", "REVIEW"}
+        ):
+            raise ValueError("trusted capabilities require a managed Worker")
+        return self
+
+
+class WorkerRevocation(Contract):
+    reason: Name
+
+
 class Enroll(Contract):
     token: Annotated[str, Field(min_length=20, max_length=300)]
     name: Name

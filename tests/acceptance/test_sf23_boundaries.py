@@ -13,8 +13,8 @@ from sqlalchemy.exc import IntegrityError
 
 from software_factory import cli
 from software_factory.api import create_app
-from software_factory.models import AuditEvent, Principal, Run, RunEvent
-from software_factory.service import token_hash
+from software_factory.models import AuditEvent, Principal, Project, Run, RunEvent
+from software_factory.service import issue_token, token_hash
 from tests.conftest import example_spec
 
 
@@ -214,3 +214,82 @@ def test_concurrent_rotation_issues_only_one_new_token(world):
     with ThreadPoolExecutor(max_workers=2) as pool:
         responses = list(pool.map(rotate, range(2)))
     assert sorted(response.status_code for response in responses) == [200, 409]
+
+
+def test_workspace_user_access_separates_read_run_operations_and_worker_administration(world):
+    viewer, operator = issue_token(), issue_token()
+    with world.database.transaction() as session:
+        for token, access in ((viewer, "VIEWER"), (operator, "OPERATOR")):
+            session.add(
+                Principal(
+                    workspace_id=world.workspace_id,
+                    role="USER",
+                    token_hash=token_hash(token),
+                    user_access=access,
+                )
+            )
+        policy = session.get(Project, world.project_id).policy
+    root = f"/v1/workspaces/{world.workspace_id}"
+    run_path = f"/v1/runs/{world.run_id}"
+    revision = world.run()["state_revision"]
+    action = {"expected_run_revision": revision, "reason": "permission test"}
+    spec = example_spec(world.repository_id)
+    ordinary_mutations = [
+        (f"/v1/projects/{world.project_id}/tasks", spec),
+        (f"/v1/tasks/{world.task_id}/spec-versions", spec),
+        (f"/v1/tasks/{world.task_id}/runs", {"spec_version": 1}),
+        (f"{run_path}/cancel", action),
+        (f"{run_path}/replan", action),
+        (f"{run_path}/interventions", {**action, "action": "cancel", "subject_id": world.run_id}),
+        (
+            f"{run_path}/budget-requests",
+            {**action, "current_budget_microusd": 1, "new_budget_microusd": 2},
+        ),
+        (
+            f"/v1/approvals/{uuid4()}/decisions",
+            {**action, "target_hash": "a" * 64, "decision": "approve"},
+        ),
+    ]
+    enrollment_path = f"{root}/worker-enrollments"
+    revoke_path = f"{root}/workers/{world.worker_id}/revoke"
+    administrative_mutations = [
+        (enrollment_path, {"kinds": ["PLAN"]}),
+        (revoke_path, {"reason": "permission test"}),
+        (f"{root}/projects", {"name": "restricted", "policy": policy}),
+        (
+            f"/v1/projects/{world.project_id}/repositories",
+            {"name": "restricted", "base_sha": "a" * 40},
+        ),
+    ]
+    for token, denied in (
+        (viewer, ordinary_mutations + administrative_mutations),
+        (operator, administrative_mutations),
+        (world.worker_token, ordinary_mutations + administrative_mutations),
+    ):
+        for path, body in denied:
+            assert world.post(path, body, token=token).status_code == 403, (path, body)
+    for token in (viewer, operator):
+        assert world.get(run_path, token=token).status_code == 200
+        assert world.get(f"{root}/workers", token=token).status_code == 200
+    assert world.run()["state_revision"] == revision
+    assert (
+        world.post(enrollment_path, {"kinds": ["PLAN"]}, token=world.other_user_token).status_code
+        == 404
+    )
+    assert (
+        world.post(revoke_path, {"reason": "foreign"}, token=world.other_user_token).status_code
+        == 404
+    )
+    assert world.post(enrollment_path, {"kinds": ["VERIFY"]}).status_code == 422
+    enrolled = world.post(enrollment_path, {"kinds": ["PLAN"]})
+    assert enrolled.status_code == 201 and enrolled.headers["cache-control"] == "no-store"
+    new_worker = world.client.post(
+        "/v1/worker/enroll", json={"token": enrolled.json()["enrollment_token"], "name": "scoped"}
+    )
+    assert new_worker.status_code == 201
+    assert enrolled.json()["enrollment_token"] not in world.get(f"{root}/workers").text
+    assert new_worker.json()["worker_token"] not in world.get(f"{root}/workers").text
+    assert world.post(f"{run_path}/cancel", action, token=operator).status_code == 202
+    assert world.post(revoke_path, {"reason": "evaluation"}).status_code == 200
+    assert world.claim().status_code == 401
+    assert world.claim(token=new_worker.json()["worker_token"]).status_code == 204

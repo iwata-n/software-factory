@@ -43,6 +43,7 @@ class InterventionCommands:
         # Validate route/subject even on a cross-route replay. The transaction below
         # rechecks authorization and the actual decision under the workspace mutex.
         def authorize(session, actor):
+            self.service.require_user_access(actor, "OPERATOR")
             request = owned(session, ApprovalRequest, approval_id, actor.workspace_id)
             if run_id is not None:
                 owned(session, Run, run_id, actor.workspace_id)
@@ -108,7 +109,11 @@ class InterventionCommands:
         )
         if data.action == "cancel" and data.subject_id != run_id:
             # Never replay a valid cancellation through a mismatched URL/subject.
-            self.service.read(token, lambda s, a: owned(s, Run, run_id, a.workspace_id))
+            def authorize(session, actor):
+                self.service.require_user_access(actor, "OPERATOR")
+                owned(session, Run, run_id, actor.workspace_id)
+
+            self.service.read(token, authorize)
             raise DomainError(404, "NOT_FOUND")
         return self.service.write(
             token,

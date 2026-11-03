@@ -37,7 +37,9 @@ from .contracts import (
     RunStart,
     TaskSpec,
     UsageDelivery,
+    WorkerEnrollmentRequest,
     WorkerEventBatch,
+    WorkerRevocation,
 )
 from .db import Database
 from .jira_input import configured_jira, jira_router
@@ -176,7 +178,13 @@ def create_app(
             return service.create_project(session, actor, data)
 
         return service.write(
-            token, "USER", f"projects:{workspace_id}", key, data.model_dump(), command
+            token,
+            "USER",
+            f"projects:{workspace_id}",
+            key,
+            data.model_dump(),
+            command,
+            user_access="ADMIN",
         )
 
     @app.post("/v1/projects/{project_id}/repositories", status_code=201, tags=["Projects"])
@@ -188,6 +196,7 @@ def create_app(
             key,
             data.model_dump(),
             lambda s, a: service.create_repository(s, a, project_id, data),
+            user_access="ADMIN",
         )
 
     @app.post("/v1/projects/{project_id}/tasks", status_code=201, tags=["Tasks"])
@@ -791,6 +800,29 @@ def create_app(
             }
 
         return service.read(token, query)
+
+    @app.post(
+        "/v1/workspaces/{workspace_id}/worker-enrollments", status_code=201, tags=["Operations"]
+    )
+    def worker_enrollment(
+        workspace_id: str, data: WorkerEnrollmentRequest, token: Token, response: Response
+    ):
+        response.headers["Cache-Control"] = "no-store"
+        return service.issue_worker_enrollment(token, workspace_id, data)
+
+    @app.post("/v1/workspaces/{workspace_id}/workers/{worker_id}/revoke", tags=["Operations"])
+    def worker_revoke(
+        workspace_id: str, worker_id: str, data: WorkerRevocation, token: Token, key: Key = None
+    ):
+        return service.write(
+            token,
+            "USER",
+            f"workers:{workspace_id}:{worker_id}:revoke",
+            key,
+            data.model_dump(),
+            lambda s, a: service.revoke_worker(s, a, workspace_id, worker_id, data.reason),
+            user_access="ADMIN",
+        )
 
     @app.post("/v1/worker/enroll", status_code=201, tags=["Worker"])
     def enroll(data: Enroll, response: Response):
