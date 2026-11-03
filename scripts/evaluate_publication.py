@@ -16,19 +16,22 @@ import sys
 import time
 from contextlib import ExitStack
 from pathlib import Path
+from tempfile import TemporaryDirectory
 from uuid import uuid4
 
 import httpx
 from acceptance_support import source_manifest
 from alembic import command
 from alembic.config import Config
-from sqlalchemy import MetaData, select
+from factory_maintenance import backup, restore
+from sqlalchemy import MetaData, select, text
 from sqlalchemy.engine import make_url
 
 from software_factory.adapters import AgentResult, Capabilities, FakeAgent, ProducedArtifact
 from software_factory.db import Database
-from software_factory.models import Run
+from software_factory.models import PublicationOperation, Run
 from software_factory.pipeline_worker import PipelineAdapter
+from software_factory.publisher import PublicationJournal, PublisherSupervisor
 from software_factory.publisher_backend import GitHubDraftPublisher
 from software_factory.sandbox import DockerRunner
 from software_factory.service import Service
@@ -201,14 +204,199 @@ def verify_live_ci(user, run_id, publication, state, output, identity, restart_c
     print(json.dumps({"run_id": run_id, "pr": draft["url"], "ci": check["url"]}), flush=True)
 
 
+def verify_live_restore(output, identity, account, publisher, run_id, cp_url, cp_environment):
+    """Lose the provider response before CP persistence, then recover from an encrypted backup."""
+
+    class LostPublicationReport(Exception):
+        pass
+
+    def interrupt(point):
+        if point == "publisher.after_external":
+            raise LostPublicationReport
+
+    github_token = subprocess.check_output(
+        ["gh", "auth", "token", "--hostname", "github.com"], text=True
+    ).strip()
+    original_token = publisher["publisher_token"]
+    backend = GitHubDraftPublisher(SourcePolicy((REMOTE,)), github_token)
+    journal = PublicationJournal(output / "interrupted-publisher")
+    with httpx.Client(
+        base_url=cp_url, trust_env=False, headers={"Authorization": f"Bearer {original_token}"}
+    ) as client:
+        try:
+            PublisherSupervisor(client, backend, journal, checkpoint=interrupt).run_once()
+        except LostPublicationReport:
+            pending = journal.read()
+        else:
+            raise RuntimeError("Publisher did not reach the lost-report injection point")
+    if pending["report"]["status"] != "SUCCEEDED":
+        raise RuntimeError(f"GitHub publication failed: {pending['report'].get('reason')}")
+    pull = pending["report"]["pull_request"]
+    operation = pending["operation"]
+    source = Database()
+    with source.transaction() as session:
+        stored = session.get(PublicationOperation, operation["operation_id"])
+        assert stored.state == "IN_FLIGHT"
+
+    def remote_matches():
+        params = httpx.QueryParams(
+            state="all",
+            head=f"{REPOSITORY.split('/')[0]}:{pull['head_ref']}",
+            base=pull["base_ref"],
+        )
+        return [
+            (item["id"], item["number"], item["head"]["sha"]) for item in github(f"pulls?{params}")
+        ]
+
+    before = remote_matches()
+    assert len(before) == 1 and before[0][1:] == (pull["number"], pull["head_sha"])
+    name = "sf24_publication_" + uuid4().hex
+    with source.engine.connect().execution_options(isolation_level="AUTOCOMMIT") as connection:
+        connection.execute(text(f"CREATE DATABASE {name}"))
+    target_url = source.engine.url.set(database=name).render_as_string(hide_password=False)
+    target = Database(target_url)
+    try:
+        with TemporaryDirectory() as directory:
+            private = Path(directory)
+            certificate, key = private / "recovery.crt", private / "recovery.key"
+            subprocess.run(
+                [
+                    "openssl",
+                    "req",
+                    "-x509",
+                    "-newkey",
+                    "rsa:2048",
+                    "-nodes",
+                    "-subj",
+                    "/CN=SF24 live recovery",
+                    "-days",
+                    "1",
+                    "-keyout",
+                    str(key),
+                    "-out",
+                    str(certificate),
+                ],
+                capture_output=True,
+                check=True,
+            )
+            captured = backup(source, output / "artifacts", private / "backup", certificate)
+            restored_root = output / "restored-artifacts"
+            staging = restore(target, restored_root, captured["backup"], certificate, key)
+            assert staging["status"] == "STAGED_RECONCILIATION_REQUIRED"
+        restored_port = port()
+        restored_url = f"http://127.0.0.1:{restored_port}"
+        env = cp_environment | {
+            "FACTORY_DATABASE_URL": target_url,
+            "FACTORY_PORT": str(restored_port),
+            "FACTORY_ARTIFACT_ROOT": str(restored_root),
+        }
+        issued = process_json(
+            [
+                sys.executable,
+                "-m",
+                "software_factory.cli",
+                "reissue-publisher",
+                "--publisher-id",
+                publisher["publisher_id"],
+                "--reason",
+                "Live recovery fixture",
+            ],
+            environment=env,
+        )
+        assert issued["publisher_id"] == publisher["publisher_id"]
+        with (output / "restored-control-plane.log").open("wb") as log:
+            process = subprocess.Popen(
+                [sys.executable, "-m", "software_factory.cli", "serve"],
+                env=env,
+                cwd=ROOT,
+                stdout=log,
+                stderr=log,
+            )
+            try:
+                wait_ready(restored_url + "/healthz", process)
+                with httpx.Client(base_url=restored_url, trust_env=False) as client:
+                    old = client.get(
+                        "/v1/publisher/reconciliations",
+                        headers={"Authorization": f"Bearer {original_token}"},
+                    )
+                    assert old.status_code == 401
+                    client.headers["Authorization"] = f"Bearer {account['user_token']}"
+                    path = f"/v1/workspaces/{account['workspace_id']}/execution-control"
+                    revision = client.get(path).json()["revision"]
+                    action = {
+                        "stopped": False,
+                        "expected_revision": revision,
+                        "reason": "Live recovery fixture",
+                    }
+                    denied = client.post(path, json=action, headers={"Idempotency-Key": "release"})
+                    assert denied.status_code == 409
+                    assert denied.json()["code"] == "RESTORE_RECONCILIATION_REQUIRED"
+                    with httpx.Client(
+                        base_url=restored_url,
+                        trust_env=False,
+                        headers={"Authorization": f"Bearer {issued['publisher_token']}"},
+                    ) as restored_publisher:
+                        recovery = PublisherSupervisor(
+                            restored_publisher,
+                            backend,
+                            PublicationJournal(output / "restored-publisher"),
+                        ).run_once()
+                    assert recovery["state"] == "SUCCEEDED"
+                    reads = list(backend.trace)
+                    assert reads and all(item["method"] == "GET" for item in reads)
+                    result = client.get(f"/v1/runs/{run_id}/publication").json()
+                    assert result["pull_request"]["number"] == pull["number"]
+                    assert result["pull_request"]["head_sha"] == pull["head_sha"]
+                    post(client, path, action)
+                after = remote_matches()
+                assert after == before
+            finally:
+                process.terminate()
+                process.wait(timeout=10)
+        evidence = {
+            "evaluation": "SF24_LIVE_PUBLICATION_RESTORE",
+            "revision": identity["revision"],
+            "run_id": run_id,
+            "pull_request": pull["url"],
+            "head_sha": pull["head_sha"],
+            "pre_restore_operation": "IN_FLIGHT",
+            "recovered_operation": recovery["state"],
+            "provider_requests": reads,
+            "matching_prs_before": len(before),
+            "matching_prs_after": len(after),
+            "old_token_status": old.status_code,
+            "release_before_reconciliation_status": denied.status_code,
+        }
+        encoded = json.dumps(evidence, indent=2) + "\n"
+        assert not any(
+            token in encoded
+            for token in (
+                github_token,
+                original_token,
+                issued["publisher_token"],
+                account["user_token"],
+            )
+        )
+        (output / "evaluation.json").write_text(encoded)
+        print(encoded, flush=True)
+    finally:
+        target.engine.dispose()
+        with source.engine.connect().execution_options(isolation_level="AUTOCOMMIT") as connection:
+            connection.execute(text(f"DROP DATABASE {name}"))
+        source.engine.dispose()
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--base-ref", required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--actions-workflow-id", type=int)
     parser.add_argument("--fixture-base-sha")
+    parser.add_argument("--restore-publication", action="store_true")
     args = parser.parse_args()
     live_ci = args.actions_workflow_id is not None
+    if args.restore_publication and not live_ci:
+        parser.error("--restore-publication requires the fixed Actions evaluation profile")
     if live_ci != bool(args.fixture_base_sha):
         parser.error("--actions-workflow-id and --fixture-base-sha must be specified together")
     if live_ci and (
@@ -509,6 +697,11 @@ def main():
 
             assert Supervisor(agent_client, fixture, heartbeat_interval=0.1).run_once()["accepted"]
             managed_stages()
+            if args.restore_publication:
+                verify_live_restore(
+                    output, identity, account, publisher, run_id, cp_url, cp_environment
+                )
+                return
             result, publication = publish()
             assert result["state"] == "SUCCEEDED" and state()["phase"] == "WAIT_CI"
             if live_ci:
