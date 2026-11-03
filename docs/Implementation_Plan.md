@@ -606,7 +606,7 @@ SF-03の公開認可とSF-07の承認/CI待機の復旧は境界Fakeの契約試
 
 ## SF-08以降の作業記録
 
-評価先は `config/evaluation.json` に保存する。ユーザー指定の既存Codex CLI認証、Jira `https://pokeca-chips.atlassian.net` のSWF、Slack `C0B4FJX81TM` を使用する。JiraサイトとSlackチャンネルの読取接続、Codex CLI 0.166.0-alpha.5.1のChatGPTログイン状態を確認済み。モデル/料金/実Agent image等の未確定manifestを架空の値で埋めて受け入れない。
+評価用の設定項目は `config/evaluation.json` を参照する。実JiraとSlackの接続先は非公開の環境設定で管理する。ユーザー指定の既存Codex CLI認証を使用し、CLI 0.166.0-alpha.5.1のChatGPTログインと評価先の読取接続を確認した。モデル・料金・実Agent imageの未確定項目は受け入れまで追跡する。
 
 - SF-08：Source RunnerをCPとは別のHTTPサービスとして追加。Gitを実Docker内で実行し、HTTPS allowlist、固定SHA、tree/code digest、submodule/LFS/hook/外部設定/pathの拒否、取得前後の権限確認を実装。実HTTPS branch/tag/full SHA、移動/消失するbare ref、2つの実TLSサーバーでredirect先接続0・認証拒否・転送中断・timeoutを検証した。実別PIDとCPのprocess起動禁止、同Jobの3試行・2/4秒待機・入力固定、POLICY拒否時BLOCKEDも確認した。固定評価先は公開HTTPSであり、未接続の非公開Repositoryまで検証済みとはしない。現行revisionの全回帰と実CI照合を継続する。
 - SF-09：0004でLease/Workspace/Run/Job/Attemptに結び付いたArtifactを追加。16 MiB、1時間予約、予約→upload→finalize、認証付き取得、immutable bytes、symlink/hardlink対策、未確定GC、LOGの秘密マスクを実装。20回競合、サイズ・期限境界、取消、受理済み再送を含む追加試験を実行中。現行revisionの全回帰と実CIまで未判定を維持する。

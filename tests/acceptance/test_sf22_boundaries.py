@@ -27,8 +27,8 @@ from software_factory.slack_delivery import (
 )
 from tests.conftest import example_spec
 
-CHANNEL = "C0B4FJX81TM"
-SITE = "https://pokeca-chips.atlassian.net"
+CHANNEL = "C0123456789"
+SITE = "https://fixture.atlassian.net"
 FIELD = "customfield_12345"
 JIRA_PATH = "/v1/integrations/jira/jira-eval/issues"
 JIRA_TOKEN = "fixture-relay-token-01234567890123456789"

@@ -2,7 +2,7 @@
 
 ## Jira
 
-評価対象は `https://pokeca-chips.atlassian.net` の `SWF`。Control Plane は信頼済み
+評価対象は環境ごとに指定する専用Jira Project。Control Plane は信頼済み
 リレーが専用欄から取得した構造化 TaskSpec を受け取る。Jira 側のイベント受信、Jira API での
 認証と専用欄の取得、版の採番はリレー側の責務。
 
@@ -24,7 +24,7 @@ JSON オブジェクトで指定する。リレー用の `FACTORY_JIRA_RELAY_TOK
 
 ## Slack
 
-評価対象は iwata-home の `C0B4FJX81TM`。配送プロセスには
+評価対象のチャンネルは非公開の環境設定で指定する。配送プロセスには
 `FACTORY_DATABASE_URL`、`FACTORY_SLACK_WORKSPACE_ID`（Factory の workspace ID）、
 `FACTORY_SLACK_CHANNEL_ID` と秘密ストアの `FACTORY_SLACK_BOT_TOKEN` を設定する。
 チャンネルへの書き込み権限と、障害時の照合に必要な履歴・メタデータの読み取り権限を
