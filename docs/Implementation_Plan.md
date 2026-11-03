@@ -756,6 +756,10 @@ GitHubの既定ブランチが `codex/sf01-07-acceptance` であることを確�
 
 これは「実Codexで変更を生成し、独立検証へ渡せる」という接続部分の動作確認である。CLIクライアント自体のLinux隔離、通信切断を含むSF-20全条件の実接続証拠、SF-21の独立watchdog/全停止保証、製品内の実CI同期、3タスクの総合評価は未受入のままとし、SF-20全体およびMVPの受入完了とはしない。
 
+### 実Codexから実GitHub CIまでの空状態評価
+
+対象 `962b9d3`、固定base `2e914e63c4042b81459209e2310688f0fb45d443` のEVAL-01で、実CodexのPlan・変更・独立レビュー、実Docker Verifier、実Publisher、[Draft PR #12](https://github.com/iwata-n/software-factory/pull/12)、[必須CI PASS](https://github.com/iwata-n/software-factory/actions/runs/41611793809/job/125835242794)を通した。Run `4f4e95a1-ce77-4f99-8126-2774d694c27e` は `VERIFIED_DRAFT_PR`、PR headとCI検証SHAが一致、人のコード修正0、usage受領3件、予算用推計74,456 microUSD。結果とSlack通知予約は再起動後も維持された。証拠は `.local/evaluation/codex-live-publication-01/evaluation.json`。Codex CLIは既存のホスト接続を使用した。この実行は隔離された実Agent、Slackへの配送、同一revisionでのEVAL-01〜03一括受け入れを含まない。
+
 ### SF-18〜24の並行実装の統合
 
 7タスクの着手分を統合ブランチに集約した。DB移行はWebhook Inbox 0012、公開復旧 0013、Jira／Slack 0014の順。着手分の試験は `test_sf*_boundaries.py` と各機能の回帰試験としてCIで実行する。全条件を備えた受け入れ試験モジュールと実サービス証拠は各タスクの確定時に追加する。
