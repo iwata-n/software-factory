@@ -53,6 +53,7 @@ from .models import (
     JobDependency,
     OutboxEvent,
     PlanVersion,
+    Repository,
     Run,
     RunEvent,
     SlackDelivery,
@@ -252,21 +253,40 @@ def create_app(
     def run_get(run_id: str, token: Token):
         return service.read(token, lambda s, a: run_view(owned(s, Run, run_id, a.workspace_id)))
 
+    def verified_result(session, actor, run_id):
+        run = owned(session, Run, run_id, actor.workspace_id)
+        result = session.scalar(
+            select(VerifiedRunResult).where(
+                VerifiedRunResult.workspace_id == run.workspace_id,
+                VerifiedRunResult.run_id == run.id,
+            )
+        )
+        if result is None:
+            raise DomainError(404, "NOT_FOUND")
+        return run, result
+
     @app.get("/v1/runs/{run_id}/result", tags=["Runs"])
     def run_result(run_id: str, token: Token):
         def query(session, actor):
-            run = owned(session, Run, run_id, actor.workspace_id)
-            result = session.scalar(
-                select(VerifiedRunResult).where(
-                    VerifiedRunResult.workspace_id == run.workspace_id,
-                    VerifiedRunResult.run_id == run.id,
-                )
-            )
-            if result is None:
-                raise DomainError(404, "NOT_FOUND")
+            _, result = verified_result(session, actor, run_id)
             return {"result_id": result.id, "verified_at": result.created_at, **result.body}
 
         return service.read(token, query)
+
+    @app.get("/v1/runs/{run_id}/result/current-pr", tags=["Runs"])
+    def run_result_current_pr(run_id: str, token: Token, response: Response):
+        def query(session, actor):
+            run, result = verified_result(session, actor, run_id)
+            repo = owned(session, Repository, run.repository_id, actor.workspace_id)
+            binding = ci_poller.bindings.get((run.workspace_id, run.repository_id))
+            if not repo.active or (binding and not ci_poller.matches_repository(repo, binding[1])):
+                return None, result.body["draft_pr"]
+            return binding, result.body["draft_pr"]
+
+        binding, draft = service.read(token, query)
+        response.headers["Cache-Control"] = "no-store"
+        with httpx.Client(timeout=5, trust_env=False) as client:
+            return ci_poller.observe_result_pr(client, binding, draft)
 
     @app.get("/v1/runs/{run_id}/notifications", tags=["Integrations"])
     def run_notifications(run_id: str, token: Token):

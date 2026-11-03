@@ -3,13 +3,15 @@ from uuid import uuid4
 
 import httpx
 import pytest
+from fastapi.testclient import TestClient
 from pydantic import SecretStr
 from sqlalchemy import select, text
 from sqlalchemy.exc import IntegrityError
 
+from software_factory import api
 from software_factory.ci_poll import CIPoller
 from software_factory.ci_webhook import GitHubWebhook, save_delivery
-from software_factory.github_ci import check_status
+from software_factory.github_ci import CIReadError, GitHubCIReader, check_status
 from software_factory.models import Gate, OutboxEvent, Run, RunEvent, VerifiedRunResult
 from software_factory.service import Service
 from tests.test_assembler import runner as runner
@@ -53,6 +55,7 @@ def waiting(publication, clock, request):
         "number": draft["number"],
         "id": int(draft["external_id"]),
         "draft": True,
+        "merged": False,
         "state": "open",
         "merge_commit_sha": merge,
         **{
@@ -76,7 +79,13 @@ def waiting(publication, clock, request):
         "conclusion": "success",
         "completed_at": "2026-11-03T00:00:00Z",
     }
-    stub = {"status": 200, "reads": 0, "checks": [check]}
+    stub = {
+        "status": 200,
+        "reads": 0,
+        "checks": [check],
+        "integrations": integrations,
+        "tokens": tokens,
+    }
 
     def respond(req):
         assert req.method == "GET" and req.url.host == "api.github.com"
@@ -373,4 +382,52 @@ def test_result_outbox_and_terminal_status_roll_back_together(waiting):
         )
     clock.value += 60
     poll()
+    assert world.run()["status"] == "SUCCEEDED"
+
+
+def test_current_pr_changes_do_not_modify_verified_result(waiting, monkeypatch):
+    world, _, poll, _, pull, _, _, stub = waiting
+    poll()
+    poll()
+    path = f"/v1/runs/{world.run_id}/result"
+    snapshot = world.get(path).json()
+
+    monkeypatch.setattr(api, "configured_webhooks", lambda: stub["integrations"])
+    monkeypatch.setattr(api, "configured_read_tokens", lambda: stub["tokens"])
+    client = TestClient(api.create_app(world.database))
+    calls = []
+
+    def get_pr(reader, path):
+        calls.append(path)
+        assert path == f"/pulls/{pull['number']}"
+        assert reader.repository_id == REPOSITORY_ID
+        if stub["status"] != 200:
+            raise CIReadError("GITHUB_CI_UNAVAILABLE")
+        return pull, False
+
+    monkeypatch.setattr(GitHubCIReader, "get", get_pr)
+    current = path + "/current-pr"
+    other = {"Authorization": f"Bearer {world.other_user_token}"}
+    assert client.get(current, headers=other).status_code == 404
+    assert not calls
+    headers = {"Authorization": f"Bearer {world.user_token}"}
+    response = client.get(current, headers=headers)
+    assert response.headers["Cache-Control"] == "no-store"
+    assert response.json()["target_matches"] is True
+    pull["head"]["sha"] = "a" * 40
+    pull["state"] = "closed"
+    changed = client.get(current, headers=headers).json()
+    assert (changed["state"], changed["head_sha"], changed["target_matches"]) == (
+        "CLOSED",
+        "a" * 40,
+        False,
+    )
+    pull["merged"] = True
+    assert client.get(current, headers=headers).json()["state"] == "MERGED"
+    stub["status"] = 503
+    assert client.get(current, headers=headers).json() == {
+        "status": "UNKNOWN",
+        "reason": "GITHUB_CI_UNAVAILABLE",
+    }
+    assert client.get(path, headers=headers).json() == snapshot
     assert world.run()["status"] == "SUCCEEDED"

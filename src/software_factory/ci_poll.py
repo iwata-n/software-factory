@@ -72,6 +72,28 @@ class CIPoller:
                 raise ValueError("Multiple GitHub CI read integrations for one repository")
             self.bindings[key] = integration_id, config, token
 
+    def reader(self, client, binding):
+        _, config, token = binding
+        return GitHubCIReader(
+            client,
+            config.github_repository,
+            config.github_repository_id,
+            token.get_secret_value(),
+        )
+
+    @staticmethod
+    def matches_repository(repo, config):
+        remote = (repo.remote_url or "").rstrip("/").removesuffix(".git").casefold()
+        return remote == f"https://github.com/{config.github_repository}".casefold()
+
+    def observe_result_pr(self, client, binding, draft):
+        if binding is None:
+            return {"status": "UNKNOWN", "reason": "GITHUB_CI_READ_NOT_CONFIGURED"}
+        try:
+            return self.reader(client, binding).observe_pr(draft)
+        except CIReadError as exc:
+            return {"status": "UNKNOWN", "reason": str(exc)}
+
     def poll(self, client):
         if not self.bindings:
             return
@@ -83,16 +105,11 @@ class CIPoller:
             binding = self.bindings.get((workspace_id, repository_id))
             if binding is None:
                 continue
-            integration_id, config, token = binding
+            integration_id, config, _ = binding
             context = self.claim(workspace_id, run_id, integration_id, config)
             if context is None:
                 continue
-            reader = GitHubCIReader(
-                client,
-                config.github_repository,
-                config.github_repository_id,
-                token.get_secret_value(),
-            )
+            reader = self.reader(client, binding)
             try:
                 checks, error = reader.read(context), None
             except CIReadError as exc:
@@ -113,8 +130,7 @@ class CIPoller:
         if not self.service.repository_allowed(session, run):
             return None, None
         repo = owned(session, Repository, run.repository_id, workspace_id)
-        remote = (repo.remote_url or "").rstrip("/").removesuffix(".git").casefold()
-        if remote != f"https://github.com/{config.github_repository}".casefold():
+        if not self.matches_repository(repo, config):
             return None, None
         return run, context
 

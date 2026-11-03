@@ -71,6 +71,39 @@ class GitHubCIReader:
         ):
             raise CIReadError("GITHUB_CI_TARGET_CHANGED")
 
+    def observe_pr(self, draft):
+        """Read the same PR by provider identity, allowing its state and refs to change."""
+        value, _ = self.get(f"/pulls/{draft['number']}")
+        try:
+            base = value["base"]
+            head = value["head"]
+            if (
+                str(value["id"]) != draft["external_id"]
+                or value["number"] != draft["number"]
+                or base["repo"]["id"] != self.repository_id
+            ):
+                raise CIReadError("GITHUB_CI_TARGET_CHANGED")
+            if (
+                value["state"] not in {"open", "closed"}
+                or type(value["draft"]) is not bool
+                or type(value["merged"]) is not bool
+                or not all(SHA.fullmatch(side["sha"]) for side in (head, base))
+            ):
+                raise CIReadError("GITHUB_CI_INVALID_RESPONSE")
+            matches = self.matches_side(base, draft, "base") and (
+                head["repo"] is not None and self.matches_side(head, draft, "head")
+            )
+            return {
+                "status": "OBSERVED",
+                "state": "MERGED" if value["merged"] else value["state"].upper(),
+                "draft": value["draft"],
+                "head_sha": head["sha"],
+                "base_sha": base["sha"],
+                "target_matches": matches,
+            }
+        except (KeyError, TypeError, AttributeError):
+            raise CIReadError("GITHUB_CI_INVALID_RESPONSE") from None
+
     def read(self, context):
         try:
             return self.read_snapshot(context)

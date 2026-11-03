@@ -195,6 +195,23 @@ function publicationView(publication) {
   );
 }
 
+function verifiedResultView(result, current) {
+  return section("検証済み Draft PR",
+    fields([
+      ["成功確定時刻", date(result.verified_at)], ["検証時 Head", result.draft_pr.head_sha],
+      ["Final Gate", result.final_gate_id],
+    ]),
+    records("成功確定時の CI", result.checks, (check) => [
+      ["名前", check.check_name], ["状態", check.status], ["URL", check.url],
+    ]),
+    current?.status === "OBSERVED" ? fields([
+      ["現在の PR", current.state], ["Draft", current.draft],
+      ["現在の Head", current.head_sha],
+      ["対象の比較", current.target_matches ? "検証時と同じ対象" : "現在コードは未検証"],
+    ]) : element("p", "現在の PR を確認できませんでした。"),
+  );
+}
+
 function ciView(context) {
   if (context?.kind !== "CI") return section("CI", element("p", "CI 待ちの記録なし"));
   return section("CI", fields([
@@ -252,11 +269,16 @@ async function loadDetail() {
     const run = runResult.value;
     const candidateId = run.current_candidate_id;
     const candidatePath = `/v1/candidates/${encodeURIComponent(candidateId)}`;
-    const candidateResults = candidateId ? await Promise.allSettled([
-      read(candidatePath, signal), read(`${candidatePath}/verification`, signal),
-    ]) : [];
+    const [candidateResults, verifiedResults] = await Promise.all([
+      candidateId ? Promise.allSettled([
+        read(candidatePath, signal), read(`${candidatePath}/verification`, signal),
+      ]) : [],
+      run.status === "SUCCEEDED" ? Promise.allSettled([
+        read(`${root}/result`, signal), read(`${root}/result/current-pr`, signal),
+      ]) : [],
+    ]);
     if (signal.aborted) return;
-    const allResults = [...results, ...candidateResults];
+    const allResults = [...results, ...candidateResults, ...verifiedResults];
     const denied = allResults.find(({ reason }) => [401, 403].includes(reason?.status));
     if (denied) throw denied.reason;
     const context = run.wait_context;
@@ -274,8 +296,11 @@ async function loadDetail() {
         ["Candidate ID", candidateId], ["世代", candidateResults[0].value?.generation],
         ["Head", candidateResults[0].value?.head_sha],
       ]) : element("p", "現候補なし")),
-      ciView(context),
+      ...(run.status === "SUCCEEDED" ? [] : [ciView(context)]),
     ];
+    if (verifiedResults[0]?.status === "fulfilled") {
+      content.push(verifiedResultView(verifiedResults[0].value, verifiedResults[1].value));
+    }
     if (candidateId) content.push(candidateResults[1].status === "fulfilled"
       ? verificationView(candidateResults[1].value)
       : section("Check・Gate", element("p", "取得できませんでした。", "error")));
