@@ -343,6 +343,9 @@ class GateCommands:
             "target": gate.target,
             "draft": draft,
             "required_ci": run.snapshot["verification_profile"].get("required_ci_checks", []),
+            "protected_manifest": run.snapshot["verification_profile"].get(
+                "protected_manifest", {}
+            ),
             "checks": [],
         }
         run.status, run.phase = "WAITING_EXTERNAL", "WAIT_CI"

@@ -279,3 +279,19 @@ factory-publisher --publisher-token-file .local/publisher.token \
 受信先は `POST /v1/webhooks/github/<integration UUID>` です。GitHubのJSON配送を署名とリポジトリで照合し、同じ配送を1件として保存します。対象は `ping`、`workflow_run`、`check_run`、`check_suite` です。配送を受けると、次の照合ループで GitHub API から状態を取得します。配送がない場合も60秒間隔で照合します。
 
 照合を有効にするには、同じ Integration UUID をキーに、読み取り専用トークンを値とする JSON オブジェクトを環境変数 `FACTORY_GITHUB_CI_READ_TOKENS` に設定します。GitHub の対象リポジトリに Pull requests、Contents、Checks の読み取り権限が必要です。固定された Draft PR と base/head SHA を再確認し、公開時に merge SHA がある場合はその親も確認します。merge SHA がない場合は固定 head 上で対象 PR の関連が確認できるチェックを使います。判定は Profile の GitHub App ID とチェック名に一致するチェックだけを対象とします。
+
+
+GitHub Actions（App ID `15368`）の必須チェックには、Policy の `required_ci_checks` で `app_id` と `check_name` に加えて `github_workflow_id` と `github_workflow_path` を指定します。トークンには Actions の読み取り権限も必要です。ワークフローのSHA-256を同じPolicyの `protected_manifest` に登録します。Control Planeはbase/head両方のワークフローファイル、現在のPR、`pull_request` イベント、ジョブと最新の実行試行を照合します。
+
+固定するワークフローは `pull_request` を起点とし、検証対象のジョブでPRのheadを明示的にcheckoutしてから `Verify candidate head` ステップを実行します。テストはその作業ツリーで実行してください。検証ステップの成功を確認できない終端チェックは判定不能とし、GitHubが報告したSHAと実際に検証できたSHAを別に記録します。
+
+```yaml
+- uses: actions/checkout@v4
+  with:
+    ref: ${{ github.event.pull_request.head.sha }}
+    persist-credentials: false
+- name: Verify candidate head
+  env:
+    EXPECTED_HEAD: ${{ github.event.pull_request.head.sha }}
+  run: test "$(git rev-parse HEAD)" = "$EXPECTED_HEAD"
+```

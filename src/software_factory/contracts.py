@@ -184,10 +184,26 @@ class EvidenceReport(Contract):
         return self
 
 
+GITHUB_ACTIONS_APP_ID = 15368
+
+
 class RequiredCICheck(Contract):
     provider: Literal["github"] = "github"
     app_id: int = Field(gt=0)
     check_name: Name
+    github_workflow_id: int | None = Field(default=None, strict=True, gt=0)
+    github_workflow_path: Name | None = None
+
+    @model_validator(mode="after")
+    def workflow_identity(self):
+        if self.app_id == GITHUB_ACTIONS_APP_ID:
+            if self.github_workflow_id is None or self.github_workflow_path is None:
+                raise ValueError("GitHub Actions requires a fixed workflow ID and path")
+            if not re.fullmatch(r"\.github/workflows/[\w.-]+\.ya?ml", self.github_workflow_path):
+                raise ValueError("invalid GitHub Actions workflow path")
+        elif self.github_workflow_id is not None or self.github_workflow_path is not None:
+            raise ValueError("workflow identity is only supported for GitHub Actions")
+        return self
 
 
 MicroUSD = Annotated[int, Field(strict=True, ge=0, le=10**12)]
@@ -282,6 +298,11 @@ class ProjectPolicy(Contract):
         ids = [command.check_id for command in self.verification_commands]
         if len(ids) != len(set(ids)) or not set(ids).issubset(self.verification.required_checks):
             raise ValueError("verification command IDs must be unique required checks")
+        if any(
+            check.github_workflow_path and check.github_workflow_path not in self.protected_manifest
+            for check in self.required_ci_checks
+        ):
+            raise ValueError("GitHub Actions workflow must be in the protected manifest")
         identities = [(c.provider, c.app_id, c.check_name) for c in self.required_ci_checks]
         if len(identities) != len(set(identities)):
             raise ValueError("required CI identities must be unique")

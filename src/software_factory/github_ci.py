@@ -1,11 +1,16 @@
 """Read-only GitHub verification of the publication and its required check runs."""
 
+import base64
+import hashlib
 import re
 
 import httpx
 
+from .contracts import GITHUB_ACTIONS_APP_ID
+
 SHA = re.compile(r"[0-9a-f]{40}")
 CONCLUSIONS = {"success": "PASS", "failure": "FAIL", "timed_out": "ERROR"}
+HEAD_PROOF_STEP = "Verify candidate head"
 PENDING = {"queued", "in_progress", "requested", "waiting", "pending"}
 
 
@@ -127,16 +132,48 @@ class GitHubCIReader:
         if not all(SHA.fullmatch(sha) for sha in [tested, *parents]):
             raise CIReadError("GITHUB_CI_TARGET_CHANGED")
         self.verify_pr(draft)
-        if draft["merge_sha"]:
-            commit, _ = self.get(f"/git/commits/{tested}")
-            if commit["sha"] != tested or [p["sha"] for p in commit["parents"]] != parents:
-                raise CIReadError("GITHUB_CI_TARGET_CHANGED")
         required = {
-            (check["app_id"], check["check_name"])
+            (check["app_id"], check["check_name"]): check
             for check in context["required_ci"]
             if check["provider"] == "github"
         }
+        native = {key: spec for key, spec in required.items() if key[0] != GITHUB_ACTIONS_APP_ID}
+        actions = {
+            key: spec
+            for key, spec in required.items()
+            if key[0] == GITHUB_ACTIONS_APP_ID and spec.get("github_workflow_id")
+        }
+        if native and draft["merge_sha"]:
+            commit, _ = self.get(f"/git/commits/{tested}")
+            if commit["sha"] != tested or [p["sha"] for p in commit["parents"]] != parents:
+                raise CIReadError("GITHUB_CI_TARGET_CHANGED")
+        manifest = context.get("protected_manifest", {})
+        for path in {spec["github_workflow_path"] for spec in actions.values()}:
+            for sha in (target["base_sha"], target["head_sha"]):
+                self.verify_workflow(path, sha, manifest.get(path))
+        checks = self.read_checks(draft, target, tested, parents, native)
+        checks.update(self.read_checks(draft, target, target["head_sha"], [], actions))
+        self.verify_pr(draft)
+        return [checks[key] for key in sorted(checks)]
+
+    def verify_workflow(self, path, head, expected_digest):
+        if not expected_digest:
+            raise CIReadError("GITHUB_CI_WORKFLOW_UNPINNED")
+        workflow, _ = self.get(f"/contents/{path}", ref=head)
+        if workflow["encoding"] != "base64":
+            raise CIReadError("GITHUB_CI_INVALID_RESPONSE")
+        try:
+            data = base64.b64decode("".join(workflow["content"].splitlines()), validate=True)
+        except ValueError:
+            raise CIReadError("GITHUB_CI_INVALID_RESPONSE") from None
+        if hashlib.sha256(data).hexdigest() != expected_digest:
+            raise CIReadError("GITHUB_CI_WORKFLOW_CHANGED")
+
+    def read_checks(self, draft, target, tested, parents, required):
         checks = {}
+        if not required:
+            return checks
+        workflow_runs = {}
         for page in range(1, 51):
             data, more = self.get(
                 f"/commits/{tested}/check-runs", filter="all", per_page=100, page=page
@@ -147,11 +184,18 @@ class GitHubCIReader:
                     continue
                 if check["head_sha"] != tested:
                     continue
-                if not draft["merge_sha"] and not any(
+                if tested == target["head_sha"] and not any(
                     self.matches_pr(pr, draft) for pr in check["pull_requests"]
                 ):
                     continue
-                result = self.evidence(check, target, draft, tested, parents)
+                result = self.evidence(check, target, tested, parents)
+                if app_id == GITHUB_ACTIONS_APP_ID:
+                    workflow = self.workflow_evidence(
+                        check, required[(app_id, check["name"])], draft, workflow_runs
+                    )
+                    if workflow is None:
+                        continue
+                    result.update(workflow)
                 key = (result["app_id"], result["check_name"], result["run_sequence"])
                 if key in checks and checks[key] != result:
                     raise CIReadError("GITHUB_CI_INVALID_RESPONSE")
@@ -160,10 +204,58 @@ class GitHubCIReader:
                 break
         else:
             raise CIReadError("GITHUB_CI_PAGE_LIMIT")
-        self.verify_pr(draft)
-        return [checks[key] for key in sorted(checks)]
+        return checks
 
-    def evidence(self, check, target, draft, tested, parents):
+    def workflow_evidence(self, check, spec, draft, workflow_runs):
+        check_id = check["id"]
+        job, _ = self.get(f"/actions/jobs/{check_id}")
+        run_id = job["run_id"]
+        if type(run_id) is not int or run_id <= 0:
+            raise CIReadError("GITHUB_CI_INVALID_RESPONSE")
+        if run_id not in workflow_runs:
+            workflow_runs[run_id], _ = self.get(f"/actions/runs/{run_id}")
+        run = workflow_runs[run_id]
+        if (
+            run["id"] != run_id
+            or run["workflow_id"] != spec["github_workflow_id"]
+            or run["path"] != spec["github_workflow_path"]
+            or run["event"] != "pull_request"
+            or run["repository"]["id"] != self.repository_id
+            or run["head_repository"]["id"] != self.repository_id
+            or run["check_suite_id"] != check["check_suite"]["id"]
+            or run["head_sha"] != draft["head_sha"]
+            or not any(self.matches_pr(pr, draft) for pr in run["pull_requests"])
+            or job["id"] != check_id
+            or job["run_attempt"] != run["run_attempt"]
+            or job["name"] != check["name"]
+            or job["head_sha"] != draft["head_sha"]
+            or job["check_run_url"]
+            != (f"https://api.github.com/repos/{self.repository}/check-runs/{check_id}")
+            or check_status(job) != check_status(check)
+        ):
+            return None
+        proof = [step for step in job["steps"] if step["name"] == HEAD_PROOF_STEP]
+        status = check_status(job)
+        head_verified = (
+            len(proof) == 1
+            and proof[0]["status"] == "completed"
+            and proof[0]["conclusion"] == "success"
+        )
+        if status != "PENDING" and not head_verified:
+            status = "INCONCLUSIVE"
+        return {
+            "status": status,
+            "provider_reported_sha": check["head_sha"],
+            "tested_sha": draft["head_sha"] if head_verified else None,
+            "github_workflow_id": run["workflow_id"],
+            "github_workflow_path": run["path"],
+            "github_event": run["event"],
+            "github_workflow_run_id": run_id,
+            "github_run_attempt": run["run_attempt"],
+            "url": f"https://github.com/{self.repository}/actions/runs/{run_id}/job/{check_id}",
+        }
+
+    def evidence(self, check, target, tested, parents):
         check_id = check["id"]
         if type(check_id) is not int or check_id <= 0:
             raise CIReadError("GITHUB_CI_INVALID_RESPONSE")
@@ -182,7 +274,7 @@ class GitHubCIReader:
             "head_sha": target["head_sha"],
             "base_sha": target["base_sha"],
             "tested_sha": tested,
-            "merge_parents": parents if draft["merge_sha"] else [],
+            "merge_parents": parents if tested != target["head_sha"] else [],
             "status": check_status(check),
             "url": f"https://api.github.com/repos/{self.repository}/check-runs/{check_id}",
         }

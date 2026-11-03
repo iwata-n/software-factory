@@ -178,6 +178,8 @@ class CIPoller:
                 for key in ("github_ci_poll", "draft", "target", "required_ci", "deadline_at")
             ):
                 return
+            if context.get("protected_manifest") != claimed.get("protected_manifest"):
+                return
             claim = claimed["github_ci_poll"]
             if (run.phase, run.state_revision) != (claim["phase"], claim["revision"]):
                 return

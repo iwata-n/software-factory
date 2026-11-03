@@ -82,7 +82,7 @@ def local_gate(target, required_checks, required_criteria, checks, findings, *, 
 
 
 def final_gate(target, local, draft, required_ci, checks, *, now, deadline):
-    expected = {(c["provider"], c["app_id"], c["check_name"]) for c in required_ci}
+    expected = {(c["provider"], c["app_id"], c["check_name"]): c for c in required_ci}
     selected, extras, ambiguous = {}, [], False
     groups = {}
     for item in checks:
@@ -108,7 +108,7 @@ def final_gate(target, local, draft, required_ci, checks, *, now, deadline):
         return decision("INCONCLUSIVE", "CI_PROFILE_MISSING", target, evidence)
     if now >= deadline:
         return decision("INCONCLUSIVE", "CI_TIMEOUT", target, evidence)
-    pending = set(selected) != expected or any(
+    pending = selected.keys() != expected.keys() or any(
         c["status"] == "PENDING" for c in [*selected.values(), *extras]
     )
     if pending:
@@ -128,7 +128,15 @@ def final_gate(target, local, draft, required_ci, checks, *, now, deadline):
         )
     ):
         return decision("INCONCLUSIVE", "PUBLISH_TARGET_MISMATCH", target, evidence)
-    for item in selected.values():
+    for key, item in selected.items():
+        requirement = expected[key]
+        if requirement.get("github_workflow_id") and (
+            item.get("github_workflow_id") != requirement["github_workflow_id"]
+            or item.get("github_workflow_path") != requirement["github_workflow_path"]
+            or item.get("github_event") != "pull_request"
+            or item["tested_sha"] != target["head_sha"]
+        ):
+            return decision("INCONCLUSIVE", "CI_IDENTITY_MISMATCH", target, evidence)
         if (
             item["origin_verified"] is not True
             or item["head_sha"] != target["head_sha"]
