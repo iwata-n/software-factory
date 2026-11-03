@@ -279,7 +279,7 @@ def main():
                     }
                 ],
                 "required_ci_checks": [
-                    {"provider": "github", "app_id": 15368, "check_name": name}
+                    {"provider": "github", "app_id": 123, "check_name": name}
                     for name in ("publication-transport-a", "publication-transport-b")
                 ],
             }
