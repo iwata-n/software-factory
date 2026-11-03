@@ -255,6 +255,7 @@ def audit(engine, response, role):
         "currency_basis": "budget_estimate",
         "token_basis": "cli_turn_total",
         "supports_resume": False,
+        "startup_diagnostics": response.startup_diagnostics,
     }
 
 

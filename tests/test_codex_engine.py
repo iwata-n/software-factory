@@ -363,3 +363,19 @@ def test_isolated_manifest_cannot_fall_back_to_host_execution(cli, monkeypatch):
     monkeypatch.setattr("software_factory.codex_engine.subprocess.run", reject_launch)
     with pytest.raises(CodexError, match="^ISOLATED_CODEX_RUNNER_REQUIRED$"):
         CodexCLI(engine.binary, payload)
+
+
+def test_linux_startup_diagnostic_does_not_replace_valid_turn():
+    items = events()
+    warning = {
+        "type": "item.completed",
+        "item": {"type": "error", "id": "diagnostic", "message": "private diagnostic text"},
+    }
+    result = parse_events(encoded([items[0], warning, *items[1:]]))
+    assert result.value == {"value": "ok"}
+    assert result.startup_diagnostics == 1
+    assert "private diagnostic text" not in repr(result)
+    with pytest.raises(CodexError, match="CODEX_EVENT_SCHEMA_INVALID"):
+        parse_events(encoded([items[0], warning]))
+    with pytest.raises(CodexError, match="CODEX_TOOL_ACTIVITY_DENIED"):
+        parse_events(encoded([*items[:2], warning, *items[2:]]))

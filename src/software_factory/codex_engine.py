@@ -106,6 +106,7 @@ class CodexResponse:
     value: dict
     usage: ModelCallUsage
     thread_id: str
+    startup_diagnostics: int = 0
 
 
 def file_hash(path):
@@ -132,7 +133,7 @@ def strict_schema(value):
 def parse_events(raw):
     """Reject missing usage, unknown events and executable tool activity; never infer success."""
     thread_id, usage, message = None, None, None
-    started = completed = 0
+    started = completed = startup_diagnostics = 0
     try:
         for line in raw.decode("utf-8").splitlines():
             item = json.loads(line)
@@ -159,9 +160,22 @@ def parse_events(raw):
                 )
                 completed += 1
             elif kind in {"item.started", "item.updated", "item.completed"}:
+                detail = item["item"]
+                if (
+                    kind == "item.completed"
+                    and thread_id is not None
+                    and not started
+                    and detail["type"] == "error"
+                    and isinstance(detail["id"], str)
+                    and isinstance(detail["message"], str)
+                    and startup_diagnostics < 4
+                ):
+                    # Linux emits startup diagnostics before the turn. The text
+                    # never becomes output, and a completed measured turn is still required.
+                    startup_diagnostics += 1
+                    continue
                 if started != 1 or completed:
                     raise ValueError
-                detail = item["item"]
                 if detail["type"] not in {"agent_message", "reasoning"}:
                     raise CodexError("CODEX_TOOL_ACTIVITY_DENIED", "POLICY")
                 if kind == "item.completed" and detail["type"] == "agent_message":
@@ -175,7 +189,7 @@ def parse_events(raw):
         parsed = json.loads(message)
         if not isinstance(parsed, dict):
             raise ValueError
-        return CodexResponse(parsed, usage, thread_id)
+        return CodexResponse(parsed, usage, thread_id, startup_diagnostics)
     except CodexError as error:
         error.usage, error.thread_id = usage, thread_id
         raise
