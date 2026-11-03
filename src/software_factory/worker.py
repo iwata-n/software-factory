@@ -8,6 +8,7 @@ import shutil
 import time
 from concurrent.futures import Future
 from contextlib import nullcontext
+from dataclasses import replace
 from threading import Thread
 from urllib.parse import urlparse
 
@@ -95,8 +96,9 @@ class Supervisor:
             self.adapter.bind_transport(self.client, lease_path, lease["fence"])
         # Confirm the lease before starting. Round-trip time consumes the returned allowance.
         deadline = 0.0
+        stop_margin = getattr(self.adapter, "stop_margin_seconds", 0)
 
-        def heartbeat() -> tuple[float, bool]:
+        def heartbeat() -> tuple[float, bool, float]:
             sent_at = time.monotonic()
             remaining = max(0.1, deadline - sent_at) if deadline else 10
             reply = self.client.post(
@@ -108,8 +110,11 @@ class Supervisor:
             payload = reply.json()
             allowance = payload["lease_expires_in_seconds"]
             # A proportionate margin also works with short test/job deadlines.
-            confirmed_until = sent_at + max(0, allowance - min(10, allowance / 4))
-            return confirmed_until, payload["cancel_requested"]
+            confirmed_until = sent_at + max(
+                0, allowance - min(1 if stop_margin else 10, allowance / 4)
+            )
+            stop_at = min(confirmed_until, sent_at + allowance - stop_margin)
+            return confirmed_until, payload["cancel_requested"], stop_at
 
         def background_heartbeat() -> Future:
             future = Future()
@@ -127,10 +132,14 @@ class Supervisor:
         started = False
         usage_queued = False
         try:
-            deadline, cancelled = heartbeat()
+            deadline, cancelled, stop_at = heartbeat()
             preparation = None
             preparation_error = None
-            if not cancelled and time.monotonic() < deadline:
+            if not cancelled and stop_margin and time.monotonic() >= stop_at:
+                preparation_error = AgentResult(
+                    "FAILED", {}, category="INFRASTRUCTURE", reason="INSUFFICIENT_EXECUTION_TIME"
+                )
+            elif not cancelled and time.monotonic() < deadline:
                 if (
                     job["snapshot"].get("source")
                     and job["kind"] in {"PLAN", "IMPLEMENT", "ASSEMBLE_CANDIDATE"}
@@ -167,8 +176,20 @@ class Supervisor:
                     if not started:
                         self.adapter.cancel()
                     raise TimeoutError("confirmed lease deadline reached; Agent cancelled")
+                if stop_margin and now >= stop_at:
+                    self.adapter.cancel()
+                    stopped = self.adapter.result()
+                    if not cancelled and stopped.reason != "STOP_UNCONFIRMED":
+                        stopped = replace(
+                            stopped,
+                            outcome="FAILED",
+                            category="INFRASTRUCTURE",
+                            reason="RUNNER_TIMEOUT",
+                        )
+                    preparation_error = stopped
+                    break
                 if pending_heartbeat is not None and pending_heartbeat.done():
-                    deadline, cancelled = pending_heartbeat.result()
+                    deadline, cancelled, stop_at = pending_heartbeat.result()
                     pending_heartbeat = None
                     if cancelled:
                         self.adapter.cancel()
@@ -177,7 +198,7 @@ class Supervisor:
                     preparation is not None
                     and preparation.done()
                     and not cancelled
-                    and time.monotonic() < deadline
+                    and time.monotonic() < stop_at
                 ):
                     try:
                         source = preparation.result()
@@ -208,7 +229,7 @@ class Supervisor:
                 buffered_events.extend(self.adapter.events())
                 if now >= next_heartbeat and pending_heartbeat is None:
                     pending_heartbeat = background_heartbeat()
-                time.sleep(min(0.1, max(0, deadline - time.monotonic())))
+                time.sleep(min(0.1, max(0, stop_at - time.monotonic())))
             result = preparation_error or self.adapter.result()
             if result.reason == "STOP_UNCONFIRMED":
                 self._quarantined = True

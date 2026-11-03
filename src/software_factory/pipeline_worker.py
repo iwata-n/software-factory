@@ -12,6 +12,7 @@ from .sandbox import STOP_UNCONFIRMED, DockerRunner, RunnerError
 
 
 class PipelineAdapter:
+    stop_margin_seconds = 10
     capabilities = Capabilities(
         kinds=("ASSEMBLE_CANDIDATE", "VERIFY", "REVIEW"), adapters=("fake", "codex_cli")
     )
@@ -201,7 +202,12 @@ class PipelineAdapter:
                 }
             ]
         except RunnerError as error:
-            if job["kind"] != "VERIFY" or error.category == "POLICY" or cancelled.is_set():
+            if (
+                error.code == STOP_UNCONFIRMED
+                or job["kind"] != "VERIFY"
+                or error.category == "POLICY"
+                or cancelled.is_set()
+            ):
                 raise
             observations = [
                 {

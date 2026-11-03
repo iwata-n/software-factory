@@ -297,3 +297,40 @@ def test_unconfirmed_stop_quarantines_supervisor_even_if_report_is_lost():
         with pytest.raises(RuntimeError, match="quarantined"):
             supervisor.run_once()
     assert calls == ["claims", "heartbeat", "fail", "fail", "fail"]
+
+
+@pytest.mark.parametrize(
+    ("allowance", "expected_calls", "reason"),
+    [
+        (10, [], "INSUFFICIENT_EXECUTION_TIME"),
+        (10.2, ["start", "cancel"], "RUNNER_TIMEOUT"),
+    ],
+)
+def test_managed_execution_reserves_ten_seconds_for_stop(allowance, expected_calls, reason):
+    actions = []
+
+    class ManagedAgent(FakeAgent):
+        stop_margin_seconds = 10
+
+        def start(self, job):
+            actions.append("start")
+
+        def cancel(self):
+            actions.append("cancel")
+            super().cancel()
+
+    def handle(request):
+        endpoint = request.url.path.rsplit("/", 1)[-1]
+        if endpoint == "claims":
+            return httpx.Response(200, json=assignment())
+        if endpoint == "heartbeat":
+            return httpx.Response(
+                200, json={"cancel_requested": False, "lease_expires_in_seconds": allowance}
+            )
+        assert endpoint == "fail"
+        assert json.loads(request.content)["reason"] == reason
+        return httpx.Response(200, json={"accepted": True})
+
+    with httpx.Client(base_url="http://localhost", transport=httpx.MockTransport(handle)) as client:
+        assert Supervisor(client, ManagedAgent()).run_once()["accepted"]
+    assert actions == expected_calls
