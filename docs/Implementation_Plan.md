@@ -447,7 +447,7 @@ Worker一覧は最後の試行のHeartbeatとLease期限を表示する。標準
 
 対象 `ec60857` で100 Tasks、100 Runs、30 Candidates、1,000 Artifacts（1 GiB）を一時DB・Storageに生成し、8回暗号化して7世代を保持した。別の空DBとStorageに復元し、全ArtifactのサイズとSHA-256、DBの件数、費用台帳と残高を照合した。演習時の復元ポイント差は3.108秒、復元開始からhealth/照合まで6.211秒。旧Worker Tokenは401、同一Workerの再認証後に旧Leaseは409、停止中の新規Claimは204だった。証拠は `.local/verification/sf24-scale/observation.json` に保存した。8世代は連続実行であり、24時間ごとの運用は別途検証する。
 
-0021で復元時のIN_FLIGHTをUNKNOWNへ戻し、照合完了までWorkspace解除を拒否する。ローカル管理者が同じPublisher IDで資格情報を再発行できる。一時DBの復元、実GitオブジェクトとGitHub API fixtureを使い、照合前の解除409、旧Publisher 401、再発行後の既存PR復旧、追加push/PR作成0、照合後の解除を確認した。復元後の実GitHub照合は引き続き追跡する。
+0021で復元時のIN_FLIGHTをUNKNOWNへ戻し、照合完了までWorkspace解除を拒否する。ローカル管理者が同じPublisher IDで資格情報を再発行できる。一時DBの復元、実GitオブジェクトとGitHub API fixtureを使い、照合前の解除409、旧Publisher 401、再発行後の既存PR復旧、追加push/PR作成0、照合後の解除を確認した。さらに対象 `9ba4518` で実[Draft PR #8](https://github.com/iwata-n/software-factory/pull/8)を作成し、結果送信前のIN_FLIGHTを暗号化バックアップから復元した。旧Publisherは401、照合前の解除は409、再発行後は実GitHubへのGET 4件だけで同じPRとheadを回復した。対象PR数は前後とも1件で、照合後に停止解除できた。証拠は `.local/evaluation/live-publication-restore-01/evaluation.json` に保存した。
 
 ## 要件の対応
 
