@@ -521,8 +521,7 @@ def test_worker_recovers_rotation_after_lost_response_and_grace_expiry(world, cl
 
 
 @pytest.mark.ac("SF-21-AC05", "SF-23-AC02")
-@pytest.mark.ac("SF-23-AC02")
-def test_unconfirmed_stop_revokes_worker_across_control_plane_restart(world):
+def test_unconfirmed_stop_revokes_worker_across_control_plane_restart(world, evidence):
     lease = world.claim().json()["lease"]
     result = world.post(
         f"/v1/worker/leases/{lease['id']}/fail",
@@ -554,3 +553,15 @@ def test_unconfirmed_stop_revokes_worker_across_control_plane_restart(world):
         )
         assert record.actor_id == worker["worker_id"]
         assert record.body["reason"] == "STOP_UNCONFIRMED"
+    evidence(
+        "An unconfirmed stop remains visible after restart and the old credential cannot claim",
+        {
+            "run_status": result.json()["run"]["status"],
+            "credential_status": worker["credential_status"],
+            "lease_status": worker["lease_status"],
+            "stop_confirmation": worker["stop_confirmation"],
+            "restarted_claim_status": 401,
+        },
+        worker_id=worker["worker_id"],
+        lease_id=lease["id"],
+    )

@@ -95,6 +95,7 @@ def required_criteria() -> list[str]:
         "SF-19-AC02",
         "SF-19-AC04",
         "SF-21-AC02",
+        "SF-21-AC05",
     }
     implemented = {
         int(path.stem.removeprefix("test_sf"))

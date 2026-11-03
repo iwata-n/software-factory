@@ -1,4 +1,4 @@
-"""DB-free, opt-in Docker integration probes for the first SF-21 implementation."""
+"""Opt-in Docker acceptance probes for SF-21."""
 
 import json
 import os
@@ -69,8 +69,9 @@ def removed(container):
     return result.returncode and b"no such" in result.stderr.lower()
 
 
+@pytest.mark.ac("SF-21-AC05")
 @pytest.mark.parametrize("trigger", ["cancel", "owner_death", "lease", "job"])
-def test_stops_term_resistant_tree(tmp_path, trigger):
+def test_stops_term_resistant_tree(tmp_path, trigger, evidence):
     script = """
 import os, signal, time
 signal.signal(signal.SIGTERM, signal.SIG_IGN)
@@ -155,7 +156,8 @@ sys.stdin.read()
         events = records(audit_file)
         term, kill = (row for row in events if row["Action"] == "kill")
         assert [row["Actor"]["Attributes"]["signal"] for row in (term, kill)] == ["15", "9"]
-        assert 5 <= (kill["timeNano"] - term["timeNano"]) / 1e9 < 6
+        grace_seconds = (kill["timeNano"] - term["timeNano"]) / 1e9
+        assert 5 <= grace_seconds < 6
         # Test-only observer in the Linux VM's host PID namespace.
         probe = DockerRunner.docker(
             "run",
@@ -174,6 +176,19 @@ sys.stdin.read()
         )
         assert probe.returncode == 0, probe.stderr.decode()
         (tmp_path / "pids.json").write_text(json.dumps({"container": pids, "host": host_pids}))
+        evidence(
+            "TERM-resistant process tree stopped and reclaimed after the five-second grace",
+            {
+                "trigger": trigger,
+                "reason": stopping["reason"],
+                "term_to_kill_seconds": grace_seconds,
+                "stop_seconds": stopped["monotonic"] - stopping["monotonic"],
+                "remaining_at_stop_start_seconds": min(lease, job) - stopping["monotonic"],
+                "linux_host_pids_absent": host_pids,
+                "container_removed": True,
+            },
+            container_id=container,
+        )
     finally:
         proc.stdin.close()
         if proc.poll() is None:
@@ -183,11 +198,11 @@ sys.stdin.read()
 @pytest.mark.parametrize(
     ("remaining", "bad_image", "code"),
     [
-        (10, False, "INSUFFICIENT_EXECUTION_TIME"),
+        pytest.param(10, False, "INSUFFICIENT_EXECUTION_TIME", marks=pytest.mark.ac("SF-21-AC05")),
         (50, True, "IMAGE_DIGEST_MISMATCH"),
     ],
 )
-def test_admission_rejects_before_create(remaining, bad_image, code):
+def test_admission_rejects_before_create(remaining, bad_image, code, evidence):
     now = time.monotonic()
     image = "sha256:" + "0" * 64 if bad_image else IMAGE
     with subprocess.Popen(
@@ -197,7 +212,9 @@ def test_admission_rejects_before_create(remaining, bad_image, code):
     ) as proc:
         # Keep the owner pipe open until the watchdog exits.
         assert proc.wait(timeout=7) == 1
-        assert [row["code"] for row in map(json.loads, proc.stdout)] == [code]
+        trace = list(map(json.loads, proc.stdout))
+        assert [(row["event"], row["code"]) for row in trace] == [("rejected", code)]
+        evidence("Rejected before container creation", trace, remaining_seconds=remaining)
 
 
 def test_live_isolation_and_limits(tmp_path, monkeypatch):
@@ -391,7 +408,8 @@ while True:
         assert removed(b)
 
 
-def test_codex_owner_death_reclaims_network_and_auth_copy(tmp_path):
+@pytest.mark.ac("SF-21-AC05")
+def test_codex_owner_death_reclaims_network_and_auth_copy(tmp_path, evidence):
     from uuid import uuid4
 
     from software_factory.codex_watchdog import AUTH_PREFIX, names
@@ -432,7 +450,8 @@ with owner_guard(invocation, scratch):
         owner.kill()
         assert owner.wait(timeout=2) == -9
         until(lambda: removed(container), timeout=8)
-        assert 5 <= time.monotonic() - started < 8
+        stop_seconds = time.monotonic() - started
+        assert 5 <= stop_seconds < 8
 
         def reclaimed():
             networks = DockerRunner.docker("network", "ls", "--format", "{{.Name}}", timeout=2)
@@ -444,6 +463,16 @@ with owner_guard(invocation, scratch):
             )
 
         until(reclaimed, timeout=10)
+        evidence(
+            "Codex owner death reclaims the container, gateway, networks and auth copy",
+            {
+                "owner_exit_code": owner.returncode,
+                "stop_seconds": stop_seconds,
+                "reclamation_seconds": time.monotonic() - started,
+                "resources_reclaimed": True,
+            },
+            container_id=container,
+        )
     finally:
         if owner.poll() is None:
             owner.kill()

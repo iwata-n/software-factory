@@ -23,7 +23,7 @@ Docker 用の監督プロセス。初期スコープは固定イメージ上の�
 
 ## 実測範囲
 
-`tests/test_sandbox_watchdog.py` はデータベース不要の Docker 統合プローブ。runner の
+`tests/acceptance/test_sandbox_watchdog.py` は受け入れ試験の Docker 統合プローブ。runner の
 content ID を `SF21_TEST_IMAGE` に設定し、専用の `--basetemp` と JUnit 出力先を指定する。
 テストは一意な名前のコンテナを使い、ホスト側ポートを公開しない。
 プロセス消滅の検査に限り、試験用観測コンテナが Linux ホスト PID namespace を参照する。
