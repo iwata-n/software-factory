@@ -204,10 +204,17 @@ class DockerRunner:
                 candidate_volume=volume,
             )
         finally:
-            self.docker("rm", "--force", helper, timeout=7)
-            removed = self.docker("volume", "rm", volume, timeout=7)
-            if removed.returncode:
-                raise RunnerError("CANDIDATE_VOLUME_CLEANUP_FAILED")
+            try:
+                try:
+                    self.docker("rm", "--force", helper, timeout=7)
+                finally:
+                    removed = self.docker("volume", "rm", volume, timeout=7)
+                    if removed.returncode:
+                        raise RunnerError("CANDIDATE_VOLUME_CLEANUP_FAILED")
+            except (OSError, subprocess.SubprocessError, RunnerError):
+                if self._quarantined.is_set():
+                    raise RunnerError(STOP_UNCONFIRMED) from None
+                raise
 
     @staticmethod
     def docker(*args, **kwargs):

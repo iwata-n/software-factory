@@ -180,3 +180,32 @@ def test_restart_refuses_uninspectable_managed_container(runner, tmp_path, monke
         assert listing.returncode == 0 and not listing.stdout.strip()
     finally:
         docker("rm", "--force", container, timeout=7)
+
+
+def test_candidate_cleanup_does_not_mask_unconfirmed_stop(source_bundle, runner, monkeypatch):
+    isolated = DockerRunner(runner.image_digest)
+    docker = isolated.docker
+    containers = []
+    volumes = []
+
+    def fail_cleanup(*args, **kwargs):
+        if args[:2] == ("rm", "--force") and not args[2].startswith("factory-volume-"):
+            containers.append(args[2])
+            return subprocess.CompletedProcess(args, 1, b"", b"injected Docker remove failure")
+        if args[:2] == ("volume", "rm"):
+            volumes.append(args[2])
+        return docker(*args, **kwargs)
+
+    monkeypatch.setattr(isolated, "docker", fail_cleanup)
+    try:
+        with pytest.raises(RunnerError, match="^STOP_UNCONFIRMED$"):
+            isolated.execute_candidate(
+                request(source_bundle, PATCH), base64.b64decode(source_bundle["archive"])
+            )
+        assert len(containers) == len(volumes) == 1
+        assert docker("volume", "inspect", volumes[0], timeout=5).returncode == 0
+    finally:
+        for name in containers:
+            assert docker("rm", "--force", name, timeout=7).returncode == 0
+        for volume in volumes:
+            assert docker("volume", "rm", volume, timeout=7).returncode == 0
