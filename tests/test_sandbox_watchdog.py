@@ -387,3 +387,62 @@ while True:
             first.stdin.close()
         assert second.wait(timeout=8) == 1
         assert removed(b)
+
+
+def test_codex_owner_death_reclaims_network_and_auth_copy(tmp_path):
+    from uuid import uuid4
+
+    from software_factory.codex_watchdog import AUTH_PREFIX, names
+
+    invocation = uuid4().hex
+    container, gateway, external, internal = names(invocation)
+    scratch = tmp_path / (AUTH_PREFIX + invocation + "-test")
+    scratch.mkdir(mode=0o700)
+    ready = tmp_path / "ready"
+    launcher = """
+import sys, time
+from pathlib import Path
+from software_factory.codex_container import model_network, owner_guard
+from software_factory.codex_watchdog import names
+from software_factory.sandbox import DockerRunner
+
+image, invocation, scratch, ready = sys.argv[1:]
+container = names(invocation)[0]
+with owner_guard(invocation, scratch):
+    Path(scratch, "auth.json").write_text("synthetic-credential")
+    with model_network(image, ["chatgpt.com"], invocation) as (network, _):
+        result = DockerRunner.docker(
+            "run", "-d", "--name", container, "--network", network, "--entrypoint", "python",
+            image, "-c", "import signal,time; signal.signal(signal.SIGTERM, signal.SIG_IGN); "
+            "print('ready', flush=True); time.sleep(60)", timeout=10,
+        )
+        assert result.returncode == 0
+        Path(ready).touch()
+        time.sleep(60)
+"""
+    owner = subprocess.Popen(
+        [sys.executable, "-c", launcher, IMAGE, invocation, str(scratch), str(ready)]
+    )
+    try:
+        until(ready.exists, timeout=20)
+        until(lambda: logs(container) == "ready")
+        started = time.monotonic()
+        owner.kill()
+        assert owner.wait(timeout=2) == -9
+        until(lambda: removed(container), timeout=8)
+        assert 5 <= time.monotonic() - started < 8
+
+        def reclaimed():
+            networks = DockerRunner.docker("network", "ls", "--format", "{{.Name}}", timeout=2)
+            assert networks.returncode == 0
+            return (
+                removed(gateway)
+                and not ({external, internal} & set(networks.stdout.decode().splitlines()))
+                and not scratch.exists()
+            )
+
+        until(reclaimed, timeout=10)
+    finally:
+        if owner.poll() is None:
+            owner.kill()
+            owner.wait(timeout=2)
