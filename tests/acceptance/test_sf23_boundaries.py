@@ -15,7 +15,7 @@ from sqlalchemy.exc import IntegrityError
 from software_factory import cli
 from software_factory.api import create_app
 from software_factory.db import db_now
-from software_factory.models import AuditEvent, Principal, Project, Run, RunEvent
+from software_factory.models import Attempt, AuditEvent, Principal, Project, Run, RunEvent
 from software_factory.service import Service, issue_token, token_hash
 from software_factory.worker_credentials import WorkerCredentials
 from tests.conftest import example_spec
@@ -144,7 +144,9 @@ def sse_revisions(response):
 
 
 @pytest.mark.ac("SF-23-AC04")
-def test_rotation_preserves_worker_slot_and_fences_old_token_at_grace(world, clock, monkeypatch):
+def test_rotation_preserves_worker_slot_and_fences_old_token_at_grace(
+    world, clock, monkeypatch, evidence
+):
     claimed = world.claim().json()
     lease = claimed["lease"]
     path = f"/v1/worker/leases/{lease['id']}/heartbeat"
@@ -198,6 +200,17 @@ def test_rotation_preserves_worker_slot_and_fences_old_token_at_grace(world, clo
     with pytest.raises(IntegrityError, match="EVIDENCE_IMMUTABLE"):
         with world.database.transaction() as session:
             session.execute(update(AuditEvent).values(operation="overwrite"))
+    evidence(
+        "Rotation preserves the active lease, grace expires at 60 seconds and revoke is immediate",
+        {
+            "lease_id": lease["id"],
+            "worker_id": payload["worker_id"],
+            "grace_seconds": 60,
+            "old_token_after_grace": 401,
+            "both_tokens_after_revoke": 401,
+            "audit_operations": [item.operation for item in events],
+        },
+    )
 
 
 @pytest.mark.ac("SF-23-AC04")
@@ -223,6 +236,60 @@ def test_concurrent_rotation_issues_only_one_new_token(world):
     with ThreadPoolExecutor(max_workers=2) as pool:
         responses = list(pool.map(rotate, range(2)))
     assert sorted(response.status_code for response in responses) == [200, 409]
+
+
+@pytest.mark.ac("SF-23-AC04")
+def test_rotation_races_active_heartbeat_and_claim_without_changing_slot(world, clock, evidence):
+    lease = world.claim().json()["lease"]
+    path = f"/v1/worker/leases/{lease['id']}/heartbeat"
+    barrier = Barrier(3)
+
+    def call(action):
+        barrier.wait(timeout=5)
+        return action()
+
+    clock.advance(1)
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        rotate = pool.submit(
+            call,
+            lambda: world.post("/v1/worker/credentials/rotate", {}, token=world.worker_token),
+        )
+        claim = pool.submit(call, world.claim)
+        heartbeat = pool.submit(
+            call,
+            lambda: world.post(path, {"fence": lease["fence"]}, token=world.worker_token),
+        )
+        rotated, claimed, renewed = (
+            future.result(timeout=10) for future in (rotate, claim, heartbeat)
+        )
+    assert (rotated.status_code, claimed.status_code, renewed.status_code) == (200, 204, 200)
+    current = rotated.json()
+    assert current["worker_id"] == world.worker_id
+    with world.database.transaction() as session:
+        (attempt,) = session.scalars(select(Attempt))
+        assert attempt.lease_id == lease["id"] and attempt.fence == lease["fence"]
+        (audit,) = session.scalars(
+            select(AuditEvent).where(AuditEvent.operation == "worker.credential.rotate")
+        )
+        assert audit.actor_id == world.worker_id
+    clock.advance(60)
+    assert world.post(path, {"fence": lease["fence"]}, token=world.worker_token).status_code == 401
+    assert (
+        world.post(path, {"fence": lease["fence"]}, token=current["worker_token"]).status_code
+        == 200
+    )
+    evidence(
+        "Concurrent rotation, heartbeat and claim retain exactly one Worker slot and fence",
+        {
+            "rotation": rotated.status_code,
+            "extra_claim": claimed.status_code,
+            "heartbeat": renewed.status_code,
+            "lease_count": 1,
+            "audit_count": 1,
+        },
+        worker_id=world.worker_id,
+        lease_id=lease["id"],
+    )
 
 
 @pytest.mark.ac("SF-23-AC05")
