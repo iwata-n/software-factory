@@ -11,7 +11,7 @@ from sqlalchemy.exc import IntegrityError
 
 from software_factory.adapters import AgentResult, FakeAgent, ProducedArtifact
 from software_factory.db import db_now
-from software_factory.models import Enrollment, Job, Project, Repository
+from software_factory.models import Candidate, Enrollment, Gate, Job, Project, Repository
 from software_factory.pipeline_worker import PipelineAdapter
 from software_factory.service import issue_token, token_hash
 from software_factory.storage import LocalArtifactStorage
@@ -158,9 +158,15 @@ def make_pipeline(world, source_bundle, runner, tmp_path):
     return Pipeline()
 
 
-@pytest.mark.ac("SF-10-AC01", "SF-10-AC07")
+@pytest.mark.ac("SF-10-AC01", "SF-10-AC07", "SF-20-AC02")
 def test_real_pipeline_pins_candidate_and_independent_jobs(pipeline, evidence):
     pipeline.prepare()
+    run = pipeline.world.run()
+    assert run["current_candidate_id"] is None
+    with pipeline.world.database.transaction() as session:
+        assert session.scalar(select(Candidate).where(Candidate.run_id == run["run_id"])) is None
+        assert session.scalar(select(Gate).where(Gate.run_id == run["run_id"])) is None
+    evidence("PLAN and IMPLEMENT outputs create neither Candidate nor Gate", run["phase"])
     result = pipeline.assemble()
     assert result["accepted"]
     run = pipeline.world.run()

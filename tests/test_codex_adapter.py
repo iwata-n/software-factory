@@ -140,7 +140,11 @@ def test_plan_uses_only_scoped_source_and_measured_estimated_usage(job):
 @pytest.mark.ac("SF-20-AC02")
 def test_implementation_produces_real_patch_without_executing_generated_code(job):
     job["kind"] = "IMPLEMENT"
-    result = execute(Engine(), job)
+    engine = Engine()
+    result = execute(engine, job)
+    assert engine.calls[0]["accepted_plan"] == PLAN
+    assert "repair_failures" not in engine.calls[0]
+    assert engine.calls[0]["source_files"] == {"src/example.py": "value = 1\n"}
     patch = next(a.body for a in result.artifacts if a.kind == "PATCH")
     assert b"-value = 1\n+value = 2\n" in patch and result.result["simulation"] is False
 
@@ -289,7 +293,14 @@ def test_codex_review_binds_evidence_to_current_candidate_and_real_locations(job
             CodexReviewer(Engine(reviewed)).for_job(job).review(context, Event())
         assert caught.value.usage_deliveries
     else:
-        result = CodexReviewer(Engine(reviewed)).for_job(job).review(context, Event())
+        engine = Engine(reviewed)
+        result = CodexReviewer(engine).for_job(job).review(context, Event())
+        (prompt,) = engine.calls
+        assert prompt["role"] == "REVIEW"
+        assert prompt["source_files"] == {"src/example.py": "value = 1\n"}
+        assert {"accepted_plan", "repair_failures", "target", "source_artifact_id"}.isdisjoint(
+            prompt
+        )
         assert result["criteria"][0]["evidence_artifact_ids"] == [
             "current-source",
             "$artifact/review-log",
