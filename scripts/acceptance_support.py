@@ -82,9 +82,14 @@ def acceptance_scenarios() -> dict[str, list[str]]:
 
 
 def required_criteria() -> list[str]:
-    # Only tasks with complete acceptance modules enter the strict CI audit.
+    # A boundary criterion can be audited once its complete acceptance matrix is collected.
+    complete_boundary_criteria = {"SF-18-AC03"}
     implemented = {
         int(path.stem.removeprefix("test_sf"))
         for path in (ROOT / "tests/acceptance").glob("test_sf[0-9][0-9].py")
     }
-    return [ac for ac in task_criteria() if int(ac[3:5]) in implemented]
+    return [
+        ac
+        for ac in task_criteria()
+        if int(ac[3:5]) in implemented or ac in complete_boundary_criteria
+    ]
