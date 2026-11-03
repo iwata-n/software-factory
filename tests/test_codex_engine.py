@@ -60,6 +60,19 @@ mode={mode!r}
 if mode=='hang':
  signal.signal(signal.SIGTERM,signal.SIG_IGN)
  time.sleep(60)
+if mode=='child':
+ read_fd,write_fd=os.pipe()
+ if os.fork()==0:
+  os.close(read_fd)
+  signal.signal(signal.SIGTERM,signal.SIG_IGN)
+  os.write(write_fd,b'ready')
+  os.close(write_fd)
+  time.sleep(0.5)
+  open({str(tmp_path / "child-survived")!r},'w').close()
+  os._exit(0)
+ os.close(write_fd)
+ os.read(read_fd,5)
+ os.close(read_fd)
 if mode=='badexit':
  print('Bearer secret-canary',file=sys.stderr);raise SystemExit(7)
 if mode=='badjson':
@@ -129,6 +142,12 @@ def test_process_failures_never_become_success_or_echo_stderr(cli, mode, code):
         engine.run({"task": "safe"}, Reply, Event())
     assert caught.value.code == code
     assert "secret-canary" not in str(caught.value) and engine._process is None
+
+
+def test_exited_cli_does_not_leave_running_child(cli, tmp_path):
+    assert cli("child").run({"task": "safe"}, Reply, Event()).value == {"value": "ok"}
+    time.sleep(0.75)
+    assert not (tmp_path / "child-survived").exists()
 
 
 def test_timeout_stops_term_ignoring_cli(cli):

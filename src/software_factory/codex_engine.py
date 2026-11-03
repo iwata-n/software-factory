@@ -237,15 +237,19 @@ class CodexCLI:
     def cancel(self):
         with self._lock:
             process = self._process
-        if process is None:
-            return
-        try:
-            os.killpg(process.pid, signal.SIGTERM)
-        except ProcessLookupError:
-            return
-        try:
-            process.wait(timeout=5)
-        except subprocess.TimeoutExpired:
+            if process is None:
+                return
+            try:
+                os.killpg(process.pid, signal.SIGTERM)
+            except ProcessLookupError:
+                process.wait(timeout=2)
+                return
+            try:
+                process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                pass
+            # The CLI can exit while a descendant in its group is still running.
+            # Always signal the remaining group, even after the leader was reaped.
             try:
                 os.killpg(process.pid, signal.SIGKILL)
             except ProcessLookupError:
