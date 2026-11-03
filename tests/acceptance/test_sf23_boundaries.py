@@ -1,6 +1,13 @@
 """Run console foundation. Full SF-23 AC01 also needs SF-19 live evidence."""
 
-from software_factory.models import Run
+import json
+from uuid import uuid4
+
+from fastapi.testclient import TestClient
+from sqlalchemy import delete
+
+from software_factory.api import create_app
+from software_factory.models import Run, RunEvent
 from tests.conftest import example_spec
 
 
@@ -58,3 +65,66 @@ def test_run_index_paginates_timestamp_ties_and_matches_run_details(world):
     assert world.claim().status_code == 200
     cards = world.get("/v1/runs").json()["runs"]
     assert {card["status"] for card in cards} == {"QUEUED", "RUNNING"}
+
+
+def test_event_stream_resumes_from_last_run_revision_after_restart(world):
+    history = f"/v1/runs/{world.run_id}/event-history"
+    path = f"/v1/runs/{world.run_id}/events?wait_seconds=0"
+    before = world.get(history).json()["events"]
+    first = world.get(path)
+    assert first.status_code == 200 and first.headers["content-type"].startswith(
+        "text/event-stream"
+    )
+    assert first.headers["cache-control"] == "no-store"
+    assert sse_revisions(first) == [(world.run_id, item["revision"]) for item in before]
+    assert world.claim().status_code == 200
+
+    last = f"{world.run_id}:{before[-1]['revision']}"
+    headers = {"Authorization": f"Bearer {world.user_token}", "Last-Event-ID": last}
+    resumed = TestClient(create_app(world.database)).get(path, headers=headers)
+    after = world.get(history).json()["events"][len(before) :]
+    assert after
+    assert sse_revisions(resumed) == [(world.run_id, item["revision"]) for item in after]
+    headers["Last-Event-ID"] = f"{world.run_id}:{after[-1]['revision']}"
+    assert not sse_revisions(world.client.get(path, headers=headers))
+
+
+def test_event_stream_scopes_cursor_and_reports_retained_history_gap(world):
+    path = f"/v1/runs/{world.run_id}/events?wait_seconds=0"
+    headers = {"Authorization": f"Bearer {world.user_token}"}
+    assert world.get(path, token=world.other_user_token).status_code == 404
+    assert world.get(path, token=world.worker_token).status_code == 403
+    assert (
+        world.client.get(path, headers=headers | {"Last-Event-ID": f"{uuid4()}:2"}).status_code
+        == 404
+    )
+    for cursor in ("garbage", f"{world.run_id}:-1", f"{world.run_id}:999999"):
+        assert (
+            world.client.get(path, headers=headers | {"Last-Event-ID": cursor}).status_code == 422
+        )
+    assert world.claim().status_code == 200
+    latest = world.run()["state_revision"]
+    with world.database.transaction() as session:
+        session.execute(
+            delete(RunEvent).where(RunEvent.run_id == world.run_id, RunEvent.revision < latest)
+        )
+    expired = world.client.get(path, headers=headers | {"Last-Event-ID": f"{world.run_id}:1"})
+    assert expired.status_code == 410
+    assert expired.json()["history"] == f"/v1/runs/{world.run_id}/event-history"
+    assert sse_revisions(world.get(path)) == [(world.run_id, latest)]
+    boundary = world.client.get(
+        path, headers=headers | {"Last-Event-ID": f"{world.run_id}:{latest - 1}"}
+    )
+    assert sse_revisions(boundary) == [(world.run_id, latest)]
+
+
+def sse_revisions(response):
+    assert response.status_code == 200
+    records = []
+    for frame in response.text.split("\n\n"):
+        if frame.startswith("id: "):
+            identifier, data = frame.split("\n", 1)
+            run_id, revision = identifier.removeprefix("id: ").split(":")
+            assert json.loads(data.removeprefix("data: "))["revision"] == int(revision)
+            records.append((run_id, int(revision)))
+    return records

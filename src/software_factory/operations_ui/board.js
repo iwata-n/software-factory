@@ -241,13 +241,65 @@ const detailSections = [
     ["Approval ID", item.approval_id],
   ])],
   ["event-history", "履歴", ({ events }) => {
-    const history = records("履歴", [...events].reverse(), (event) => [
-      ["Revision", event.revision], ["イベント", event.kind], ["時刻", date(event.created_at)],
-    ]);
-    if (events.length === 1000) history.append(element("p", "履歴は先頭の 1,000 件を表示しています。"));
-    return history;
+    const list = element("div");
+    list.id = "run-event-list";
+    list.append(...[...events].reverse().map(eventRecord));
+    return section("履歴", list);
   }],
 ];
+
+function eventRecord(event) {
+  const record = element("div", undefined, "record");
+  record.append(fields([
+    ["Revision", event.revision], ["イベント", event.kind], ["時刻", date(event.created_at)],
+  ]));
+  return record;
+}
+
+async function followRunEvents(root, runId, revision, signal) {
+  const list = get("run-event-list");
+  while (!signal.aborted) {
+    try {
+      const headers = { Authorization: `Bearer ${token}`, Accept: "text/event-stream" };
+      if (revision !== undefined) headers["Last-Event-ID"] = `${runId}:${revision}`;
+      const response = await fetch(`${root}/events`, {
+        headers, cache: "no-store", signal, redirect: "error",
+      });
+      if (response.status === 410) {
+        if (!signal.aborted) loadDetail();
+        return;
+      }
+      if ([401, 403].includes(response.status)) {
+        if (!signal.aborted) disconnect("User トークンを確認してください。", true);
+        return;
+      }
+      if (!response.ok) throw new ApiError(response.status);
+      let buffer = "";
+      for await (const chunk of response.body.pipeThrough(new TextDecoderStream())) {
+        if (signal.aborted) return;
+        buffer += chunk;
+        let boundary;
+        while ((boundary = buffer.indexOf("\n\n")) !== -1) {
+          const frame = buffer.slice(0, boundary);
+          buffer = buffer.slice(boundary + 2);
+          if (frame.startsWith("event: reset\n")) {
+            loadDetail();
+            return;
+          }
+          const data = frame.split("\n").find((line) => line.startsWith("data: "));
+          if (!data) continue;
+          const event = JSON.parse(data.slice(6));
+          if (revision !== undefined && event.revision <= revision) continue;
+          list.prepend(eventRecord(event));
+          revision = event.revision;
+        }
+      }
+    } catch {
+      if (!signal.aborted) message("detail-status", "履歴ストリームに再接続中…");
+    }
+    if (!signal.aborted) await new Promise((resolve) => setTimeout(resolve, 1000));
+  }
+}
 
 async function loadDetail() {
   detailRequest?.abort();
@@ -312,6 +364,8 @@ async function loadDetail() {
     get("detail-content").replaceChildren(...content);
     const incomplete = allResults.some(({ status }) => status === "rejected");
     message("detail-status", incomplete ? "一部の詳細を取得できませんでした。" : "", incomplete);
+    const history = results[detailSections.length - 1].value;
+    if (history) followRunEvents(root, run.run_id, history.events.at(-1)?.revision, signal);
   } catch (error) {
     if (signal.aborted) return;
     if ([401, 403].includes(error.status)) {

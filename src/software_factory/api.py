@@ -62,7 +62,7 @@ from .models import (
     VerifiedRunResult,
     Worker,
 )
-from .operations import operations_router
+from .operations import event_view, operations_router
 from .resolver import SourceResolver
 from .service import DomainError, Service, owned, run_view
 from .slack_delivery import NOTIFICATION
@@ -762,17 +762,7 @@ def create_app(
                 .order_by(RunEvent.revision)
                 .limit(1000)
             )
-            return {
-                "events": [
-                    {
-                        "revision": e.revision,
-                        "kind": e.kind,
-                        "body": e.body,
-                        "created_at": e.created_at,
-                    }
-                    for e in events
-                ]
-            }
+            return {"events": [event_view(item) for item in events]}
 
         return service.read(token, query)
 

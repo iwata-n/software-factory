@@ -403,6 +403,8 @@ Gateは必須Jobが処理中なら待機を続ける。全必須Jobが終端ま�
 
 依存SF-16/19/21。試験追加先は `tests/acceptance/test_sf23.py`。既存証拠候補は履歴/Graph/資格情報失効試験。Userはローカル資格情報のまま操作権限を分離し、SSO・外部ユーザー課金は含めない。
 
+`GET /v1/runs/{id}/events` は永続Run revisionを `<run-id>:<revision>` のSSE IDとして配信する。Run詳細は切断後に最後に表示したIDを送信し、再送を排除する。別RunのIDは404、保持済み履歴との間に欠落がある場合は410と再取得先を返す。PostgreSQLの試験では別アプリ起動後の再開と削除境界を、Chromeの1440px/375pxではfixture応答による再接続・重複排除・履歴再取得を確認した。実運用での履歴回収はSF-24で追跡する。
+
 | AC ID | 前提と操作 | 合格となる期待結果 | 検証方法と証拠 |
 |---|---|---|---|
 | SF-23-AC01 | 成功/失敗/待機/取消/UNKNOWNのRunを運用画面で開く | status/phase/revision、理由、現候補、Check/Gate、PR/CI、消費/予約、試行/修正、必要な判断をDB/APIと同値表示 | UI E2E：状態別fixture、表示値assertion、desktop/モバイル幅の画面証拠 |
