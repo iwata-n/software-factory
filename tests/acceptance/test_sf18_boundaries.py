@@ -346,13 +346,17 @@ def test_restart_confirms_result_and_notification_once(waiting, evidence):
 
 
 @pytest.mark.ac("SF-19-AC04")
-@pytest.mark.parametrize("fault", ["head", "missing", "failure", "cancel"])
+@pytest.mark.parametrize("fault", ["candidate", "head", "missing", "failure", "cancel"])
 def test_final_gate_cannot_finalize_after_target_or_ci_changes(waiting, fault, evidence):
     world, _, poll, _, pull, _, check, stub = waiting
     poll()
     ready = world.run()
     assert ready["phase"] == "FINAL_GATE_READY"
-    if fault == "head":
+    if fault == "candidate":
+        # Inject loss of the current Candidate between the first pass and final confirmation.
+        with world.database.transaction() as session:
+            session.get(Run, world.run_id).current_candidate_id = None
+    elif fault == "head":
         pull["head"]["sha"] = "a" * 40
     elif fault == "missing":
         stub["checks"] = []
@@ -376,6 +380,9 @@ def test_final_gate_cannot_finalize_after_target_or_ci_changes(waiting, fault, e
     assert world.get(f"/v1/runs/{world.run_id}/result").status_code == 404
     if fault == "head":
         assert world.run()["stop_reason"] == "GITHUB_CI_TARGET_CHANGED"
+    if fault == "candidate":
+        assert world.run()["status"] == "BLOCKED"
+        assert world.run()["stop_reason"] == "PUBLICATION_GATE_STALE"
     if fault == "cancel":
         assert world.run()["status"] == "CANCELLED"
     evidence(
