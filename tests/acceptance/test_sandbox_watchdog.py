@@ -14,6 +14,24 @@ IMAGE = os.environ.get("SF21_TEST_IMAGE")
 pytestmark = pytest.mark.skipif(not IMAGE, reason="set SF21_TEST_IMAGE to a pinned runner image")
 
 
+def host_pid_namespace(image):
+    probe = DockerRunner.docker(
+        "run",
+        "--rm",
+        "--network",
+        "none",
+        "--pid",
+        "host",
+        "--entrypoint",
+        "readlink",
+        image,
+        "/proc/self/ns/pid",
+        timeout=8,
+    )
+    assert probe.returncode == 0, probe.stderr.decode()
+    return probe.stdout.decode().strip()
+
+
 def argv(script, lease, job, image=IMAGE):
     return [
         sys.executable,
