@@ -154,11 +154,26 @@ class FixtureReviewer:
         }
 
 
-def verify_live_ci(user, run_id, publication, state, output, identity, restart_control_plane):
+def verify_live_ci(
+    user,
+    run_id,
+    publication,
+    state,
+    output,
+    identity,
+    restart_control_plane,
+    *,
+    expect_failure=False,
+):
     deadline = time.monotonic() + 900
     while time.monotonic() < deadline:
         run = state()
+        if expect_failure and run["phase"] == "REPAIR" and run["status"] == "QUEUED":
+            return verify_live_ci_failure(
+                user, run, publication, state, output, identity, restart_control_plane
+            )
         if run["status"] == "SUCCEEDED":
+            assert not expect_failure, "Failed required CI must not finalize a Run"
             break
         if run["status"] != "WAITING_EXTERNAL" or run["phase"] not in {
             "WAIT_CI",
@@ -201,6 +216,49 @@ def verify_live_ci(user, run_id, publication, state, output, identity, restart_c
             ensure_ascii=False,
         )
     )
+    print(json.dumps({"run_id": run_id, "pr": draft["url"], "ci": check["url"]}), flush=True)
+
+
+def verify_live_ci_failure(user, run, publication, state, output, identity, restart_control_plane):
+    run_id = run["run_id"]
+    candidate_id = run["current_candidate_id"]
+    verification_path = f"/v1/candidates/{candidate_id}/verification"
+
+    def evidence():
+        verification = user.get(verification_path)
+        verification.raise_for_status()
+        result = user.get(f"/v1/runs/{run_id}/result")
+        assert result.status_code == 404
+        notifications = user.get(f"/v1/runs/{run_id}/notifications")
+        notifications.raise_for_status()
+        assert not any(
+            item["run_status"] == "SUCCEEDED" for item in notifications.json()["notifications"]
+        )
+        return verification.json()["gates"]
+
+    gates = evidence()
+    (local,) = [gate for gate in gates if gate["stage"] == "LOCAL"]
+    (final,) = [gate for gate in gates if gate["stage"] == "FINAL"]
+    assert local["status"] == "PASS"
+    assert final["status"] == "FAIL" and final["reason"] == "CI_FAILED"
+    (check,) = final["metadata_body"]["checks"]
+    draft = publication["pull_request"]
+    assert check["status"] == "FAIL" and check["tested_sha"] == draft["head_sha"]
+    restart_control_plane()
+    assert state()["phase"] == "REPAIR" and evidence() == gates
+    summary = {
+        "evaluation": "SF18_LIVE_GITHUB_POLL_FAILURE",
+        "revision": identity["revision"],
+        "run_id": run_id,
+        "run_phase": run["phase"],
+        "draft_pr": draft,
+        "local_gate": local["status"],
+        "final_gate": final,
+        "check": check,
+        "success_receipt": False,
+        "success_notification": False,
+    }
+    (output / "evaluation.json").write_text(json.dumps(summary, indent=2) + "\n")
     print(json.dumps({"run_id": run_id, "pr": draft["url"], "ci": check["url"]}), flush=True)
 
 
@@ -393,10 +451,13 @@ def main():
     parser.add_argument("--actions-workflow-id", type=int)
     parser.add_argument("--fixture-base-sha")
     parser.add_argument("--restore-publication", action="store_true")
+    parser.add_argument("--expect-ci-failure", action="store_true")
     args = parser.parse_args()
     live_ci = args.actions_workflow_id is not None
-    if args.restore_publication and not live_ci:
-        parser.error("--restore-publication requires the fixed Actions evaluation profile")
+    if (args.restore_publication or args.expect_ci_failure) and not live_ci:
+        parser.error("restore and failure rehearsals require the fixed Actions evaluation profile")
+    if args.restore_publication and args.expect_ci_failure:
+        parser.error("select one rehearsal at a time")
     if live_ci != bool(args.fixture_base_sha):
         parser.error("--actions-workflow-id and --fixture-base-sha must be specified together")
     if live_ci and (
@@ -540,7 +601,10 @@ def main():
                     {
                         "provider": "github",
                         "app_id": 15368,
-                        "check_name": "factory-eval-empty",
+                        # The Agent fixture fixes empty-state behavior only.
+                        "check_name": (
+                            "factory-eval-count" if args.expect_ci_failure else "factory-eval-empty"
+                        ),
                         "github_workflow_id": args.actions_workflow_id,
                         "github_workflow_path": EVALUATION_WORKFLOW,
                     }
@@ -744,7 +808,14 @@ def main():
 
                 restart_control_plane()
                 verify_live_ci(
-                    user, run_id, publication, state, output, identity, restart_control_plane
+                    user,
+                    run_id,
+                    publication,
+                    state,
+                    output,
+                    identity,
+                    restart_control_plane,
+                    expect_failure=args.expect_ci_failure,
                 )
                 return
             first_publication = publication
