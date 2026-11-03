@@ -202,6 +202,19 @@ def verify_live_ci(
     assert notification["run_status"] == "SUCCEEDED" and notification["state"] == "PENDING"
     restart_control_plane()
     assert state()["status"] == "SUCCEEDED" and receipt() == (result, notifications)
+    observed_pr = user.get(f"/v1/runs/{run_id}/result/current-pr")
+    observed_pr.raise_for_status()
+    assert observed_pr.headers["Cache-Control"] == "no-store"
+    current_pr = observed_pr.json()
+    assert current_pr == {
+        "status": "OBSERVED",
+        "state": "OPEN",
+        "draft": True,
+        "head_sha": draft["head_sha"],
+        "base_sha": draft["base_sha"],
+        "target_matches": True,
+    }
+    assert receipt() == (result, notifications)
     (output / "evaluation.json").write_text(
         json.dumps(
             {
@@ -212,6 +225,7 @@ def verify_live_ci(
                 "ci_input_origin": "actual_github",
                 "notification": notification,
                 "result": result,
+                "current_pr_after_restart": current_pr,
             },
             indent=2,
             ensure_ascii=False,
