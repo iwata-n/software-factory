@@ -38,6 +38,80 @@ REMOTE = "https://github.com/iwata-n/software-factory.git"
 TARGET = "examples/evaluation/app.py"
 
 
+PROFILES = {
+    "empty": {
+        "id": "EVAL-01",
+        "function": "describe_items",
+        "title": "空の一覧に説明文を追加",
+        "objective": "Return データがありません for an empty list and preserve nonempty behavior.",
+        "criteria": [
+            "describe_items([]) returns exactly データがありません",
+            "One and multiple items and stable_label retain existing behavior",
+        ],
+        "tests": ("test_empty", "test_one_item", "test_many_items"),
+        "failing": ("test_empty",),
+    },
+    "count": {
+        "id": "EVAL-02",
+        "function": "parse_count",
+        "title": "件数入力の形式を厳密に検証",
+        "objective": "Parse exactly one to nine ASCII digits as an integer.",
+        "criteria": [
+            "parse_count accepts only one to nine ASCII digits and returns an integer including 0",
+            (
+                "Invalid lengths, non-ASCII digits, spaces and other invalid strings raise ValueError; "
+                "stable_label is unchanged"
+            ),
+        ],
+        "tests": (
+            "test_valid[3-3]",
+            "test_valid[0-0]",
+            "test_valid[999999999-999999999]",
+            "test_invalid[]",
+            "test_invalid[-1]",
+            "test_invalid[a]",
+            "test_invalid[1.5]",
+            "test_invalid[1000000000]",
+            "test_invalid[ 3]",
+            "test_invalid[3 ]",
+            "test_invalid[\\uff11\\uff12]",
+        ),
+        "failing": (
+            "test_invalid[-1]",
+            "test_invalid[1000000000]",
+            "test_invalid[ 3]",
+            "test_invalid[3 ]",
+            "test_invalid[\\uff11\\uff12]",
+        ),
+    },
+    "spaces": {
+        "id": "EVAL-03",
+        "function": "normalize_spaces",
+        "title": "半角スペースだけを整形",
+        "objective": "Trim and collapse only U+0020 spaces, preserving all other characters.",
+        "criteria": [
+            "Leading and trailing ASCII spaces are removed and internal runs collapse to one",
+            "Preserve tabs, newlines, ideographic spaces, Japanese characters and stable_label",
+        ],
+        "tests": (
+            "test_ascii_space_only[ a  b -a b]",
+            "test_ascii_space_only[-]",
+            "test_ascii_space_only[   -]",
+            "test_ascii_space_only[ \\u3042  \\u3044 -\\u3042 \\u3044]",
+            "test_ascii_space_only[\\ta\\tb\\n-\\ta\\tb\\n]",
+            "test_ascii_space_only[\\u3000a\\u3000-\\u3000a\\u3000]",
+            "test_ascii_space_only[a    b-a b]",
+        ),
+        "failing": (
+            "test_ascii_space_only[ a  b -a b]",
+            "test_ascii_space_only[   -]",
+            "test_ascii_space_only[ \\u3042  \\u3044 -\\u3042 \\u3044]",
+            "test_ascii_space_only[a    b-a b]",
+        ),
+    },
+}
+
+
 def available_port():
     with socket.socket() as connection:
         connection.bind(("127.0.0.1", 0))
@@ -124,6 +198,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--base-ref", default="codex/sf17-publisher")
     parser.add_argument("--output", required=True, type=Path)
+    parser.add_argument("--task", choices=PROFILES, default="empty")
     parser.add_argument("--probe-disconnect", action="store_true")
     parser.add_argument("--actions-workflow-id", type=int)
     parser.add_argument("--fixture-base-sha")
@@ -136,6 +211,8 @@ def main():
         ),
     )
     args = parser.parse_args()
+    profile = PROFILES[args.task]
+    check_file = f"check_{args.task}"
     publish_live = args.actions_workflow_id is not None
     if publish_live and (
         args.actions_workflow_id <= 0
@@ -159,6 +236,7 @@ def main():
     image = os.environ["FACTORY_RUNNER_IMAGE_DIGEST"]
     report = {
         "result": "IN_PROGRESS",
+        "evaluation_task": profile["id"],
         "started_at": datetime.now(UTC).isoformat(),
         "implementation": identity,
         "engine_manifest": engine.manifest.model_dump(),
@@ -265,20 +343,19 @@ def main():
                 "examples/evaluation/checks/" + name: hashlib.sha256(
                     files["examples/evaluation/checks/" + name][1]
                 ).hexdigest()
-                for name in ["check_empty.py", "check_compat.py", "load_target.py"]
+                for name in [f"{check_file}.py", "check_compat.py", "load_target.py"]
             }
-            test_ids = [
-                "examples.evaluation.checks.check_empty::" + name
-                for name in ["test_empty", "test_one_item", "test_many_items"]
-            ]
+            check_prefix = f"examples.evaluation.checks.{check_file}::"
+            test_ids = [check_prefix + name for name in profile["tests"]]
             test_ids += ["examples.evaluation.checks.check_compat::test_existing_label_api"]
+            expected_failures = {check_prefix + name for name in profile["failing"]}
             verification = {
                 "check_id": "unit_tests",
                 "argv": [
                     "python",
                     "-m",
                     "pytest",
-                    "/candidate/examples/evaluation/checks/check_empty.py",
+                    f"/candidate/examples/evaluation/checks/{check_file}.py",
                     "/candidate/examples/evaluation/checks/check_compat.py",
                     "--rootdir=/candidate",
                     "-q",
@@ -308,7 +385,7 @@ def main():
                 ],
                 "protected_manifest": protected,
                 "verification": {
-                    "profile_id": "codex-empty-state",
+                    "profile_id": f"codex-{args.task}",
                     "required_checks": ["unit_tests", "review"],
                 },
                 "verification_commands": [verification],
@@ -325,7 +402,7 @@ def main():
                     {
                         "provider": "github",
                         "app_id": 15368,
-                        "check_name": "factory-eval-empty",
+                        "check_name": f"factory-eval-{args.task}",
                         "github_workflow_id": args.actions_workflow_id,
                         "github_workflow_path": EVALUATION_WORKFLOW,
                     }
@@ -360,9 +437,11 @@ def main():
             )
             if (
                 baseline_verdict["status"] != "FAIL"
-                or len(baseline_verdict["failed_test_ids"]) != 1
+                or set(baseline_verdict["failed_test_ids"]) != expected_failures
+                or baseline_verdict["counts"]["errors"]
+                or baseline_verdict["counts"]["skipped"]
             ):
-                raise RuntimeError("base must have exactly the expected empty-state failure")
+                raise RuntimeError("base does not match the fixed expected test failures")
             report["baseline"] = baseline_verdict
             print(
                 json.dumps(
@@ -373,7 +452,7 @@ def main():
             project = post(
                 user,
                 f"/v1/workspaces/{account['workspace_id']}/projects",
-                {"name": "Real Codex empty-state evaluation", "policy": policy},
+                {"name": f"Real Codex {profile['id']} evaluation", "policy": policy},
             )
             repository = post(
                 user,
@@ -388,25 +467,13 @@ def main():
             spec = {
                 "schema_version": 1,
                 "task": {
-                    "title": "Codex: 空の一覧に説明文を追加",
+                    "title": f"Codex: {profile['title']}",
                     "repository_id": repository["repository_id"],
                     "base_ref": args.base_ref,
-                    "objective": (
-                        "describe_items([]) must return データがありません. "
-                        "Preserve all other behavior."
-                    ),
+                    "objective": profile["objective"],
                     "acceptance_criteria": [
-                        {
-                            "id": "AC-1",
-                            "description": "describe_items([]) returns exactly データがありません",
-                        },
-                        {
-                            "id": "AC-2",
-                            "description": (
-                                "One and multiple items, stable_label and other functions "
-                                "retain existing behavior"
-                            ),
-                        },
+                        {"id": f"AC-{i}", "description": criterion}
+                        for i, criterion in enumerate(profile["criteria"], start=1)
                     ],
                     "constraints": [
                         "Only examples/evaluation/app.py may change; golden checks are immutable"
@@ -414,6 +481,8 @@ def main():
                 },
                 "verification": policy["verification"],
             }
+            (output / "task-spec.json").write_text(json.dumps(spec, indent=2, ensure_ascii=False))
+            (output / "policy.json").write_text(json.dumps(policy, indent=2, ensure_ascii=False))
             task = post(user, f"/v1/projects/{project['project_id']}/tasks", spec)
             run_id = post(user, f"/v1/tasks/{task['task_id']}/runs", {"spec_version": 1})["run_id"]
             report["run_id"] = run_id
@@ -543,7 +612,7 @@ def main():
                             node.name: ast.dump(node)
                             for node in tree.body
                             if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
-                            and node.name != "describe_items"
+                            and node.name != profile["function"]
                         }
 
                     if unrelated(before_ast) != unrelated(after_ast):
@@ -648,12 +717,13 @@ def main():
                 )
                 report["publication"] = json.loads((output / "evaluation.json").read_text())
                 report["publication"]["local_agent_and_reviewer"] = "codex_cli"
-                report["github_writes"] = [
+                report["github_write_requests"] = [
                     request
                     for observation in publication["observations"]
                     for request in observation["body"].get("provider_requests", [])
                     if request["method"] != "GET"
                 ]
+                report["github_writes"] = len(report["github_write_requests"])
                 current = state()
             report.update(
                 result="PASS",
