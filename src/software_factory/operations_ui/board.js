@@ -221,6 +221,7 @@ const leaseLabels = {
   HEARTBEAT_OVERDUE: "Heartbeat 遅延・停止未確認",
   EXECUTION_RIGHT_EXPIRED: "実行権失効・停止未確認",
   WORKER_REPORTED_STOP: "Worker が停止を報告済み",
+  STOP_UNCONFIRMED: "停止未確認・Worker 隔離済み",
   LEASE_ENDED: "Lease 終了・停止未確認",
 };
 const credentialLabels = { ACTIVE: "有効", EXPIRED: "期限切れ", REVOKED: "失効済み" };

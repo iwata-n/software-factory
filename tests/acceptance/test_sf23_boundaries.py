@@ -542,7 +542,7 @@ def test_claim_racing_workspace_stop_is_either_denied_or_cancelled(world):
 
 
 @pytest.mark.ac("SF-23-AC02")
-def test_worker_health_separates_overdue_expired_and_reported_stop(world, clock):
+def test_worker_health_separates_overdue_expired_and_reported_stop(world, clock, evidence):
     path = f"/v1/workspaces/{world.workspace_id}/workers"
     assert world.get(path, token=world.other_user_token).status_code == 404
     assert world.get(path, token=world.worker_token).status_code == 403
@@ -584,6 +584,16 @@ def test_worker_health_separates_overdue_expired_and_reported_stop(world, clock)
     current = worker()
     assert current["lease_status"] == current["stop_confirmation"] == "WORKER_REPORTED_STOP"
     assert current["last_heartbeat_at"] > initial["last_heartbeat_at"]
+    evidence(
+        "The same Worker shows heartbeat delay, lease expiry and an explicit stop separately",
+        {
+            "worker_states": [
+                row | {"auth_state": row["credential_status"]}
+                for row in (initial, overdue, expired, current)
+            ]
+        },
+        worker_id=world.worker_id,
+    )
 
 
 @pytest.mark.ac("SF-23-AC04")
@@ -662,6 +672,7 @@ def test_unconfirmed_stop_revokes_worker_across_control_plane_restart(world, evi
             "lease_status": worker["lease_status"],
             "stop_confirmation": worker["stop_confirmation"],
             "restarted_claim_status": 401,
+            "worker_states": [worker | {"auth_state": worker["credential_status"]}],
         },
         worker_id=worker["worker_id"],
         lease_id=lease["id"],
