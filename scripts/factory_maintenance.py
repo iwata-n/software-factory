@@ -14,6 +14,8 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 from uuid import uuid4
 
+from alembic import command as migrations
+from alembic.config import Config
 from psycopg.conninfo import make_conninfo
 from sqlalchemy import delete, func, inspect, select, text, update
 
@@ -40,6 +42,7 @@ from software_factory.models import (
     WorkerEvent,
     Workspace,
 )
+from software_factory.service import event
 from software_factory.storage import LocalArtifactStorage, content_hash, identifier
 
 DAY = 86400
@@ -251,29 +254,50 @@ def restore(database, root, bundle, certificate, key):
             "--no-acl",
             str(dump),
         )
+        configuration = Config(str(Path(__file__).resolve().parents[1] / "alembic.ini"))
+        with database.engine.begin() as connection:
+            configuration.attributes["connection"] = connection
+            migrations.upgrade(configuration, "head")
         if inventory(database) != rows:
             raise ValueError("Restored database and Artifact inventory disagree")
         with database.transaction() as session:
             now = db_now(session)
             for workspace in session.scalars(select(Workspace)):
-                if not workspace.execution_stopped:
-                    before = workspace.execution_stop_revision
-                    workspace.execution_stopped = True
-                    workspace.execution_stop_revision += 1
-                    session.add(
-                        AuditEvent(
-                            workspace_id=workspace.id,
-                            actor_id="local-admin",
-                            operation="workspace.execution.stop",
-                            body={
-                                "workspace_id": workspace.id,
-                                "reason": "RESTORE_RECONCILIATION_REQUIRED",
-                                "before_revision": before,
-                                "after_revision": workspace.execution_stop_revision,
-                            },
-                            created_at=now,
-                        )
+                before = workspace.execution_stop_revision
+                workspace.execution_stopped = True
+                workspace.restore_reconciliation_required = True
+                workspace.execution_stop_revision += 1
+                session.add(
+                    AuditEvent(
+                        workspace_id=workspace.id,
+                        actor_id="local-admin",
+                        operation="workspace.execution.stop",
+                        body={
+                            "workspace_id": workspace.id,
+                            "reason": "RESTORE_RECONCILIATION_REQUIRED",
+                            "before_revision": before,
+                            "after_revision": workspace.execution_stop_revision,
+                        },
+                        created_at=now,
                     )
+                )
+            for operation in session.scalars(
+                select(PublicationOperation).where(PublicationOperation.state == "IN_FLIGHT")
+            ):
+                operation.state = "UNKNOWN"
+                operation.reason = "PUBLISH_UNKNOWN"
+                operation.next_reconcile_at = now
+                job = session.get(Job, operation.job_id)
+                job.state = "PUBLISH_UNKNOWN"
+                run = session.get(Run, operation.run_id)
+                if run.status in {"QUEUED", "RUNNING"} and run.phase == "PUBLISH_DRAFT":
+                    run.status, run.phase = "WAITING_EXTERNAL", "PUBLISH_UNKNOWN"
+                event(
+                    session,
+                    run,
+                    "PUBLICATION_RESTORE_RECONCILIATION_REQUIRED",
+                    {"operation_id": operation.id},
+                )
             session.execute(
                 update(Principal)
                 .where(Principal.role.in_(["WORKER", "PUBLISHER"]))

@@ -37,6 +37,9 @@ class Workspace(Base):
     name: Mapped[str] = mapped_column(String(200))
     execution_stopped: Mapped[bool] = mapped_column(Boolean, default=False, server_default="false")
     execution_stop_revision: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
+    restore_reconciliation_required: Mapped[bool] = mapped_column(
+        Boolean, default=False, server_default="false"
+    )
 
 
 class Principal(Tenant, Base):

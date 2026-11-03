@@ -1,11 +1,21 @@
+import json
+import subprocess
+import sys
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import replace
 from threading import Barrier
+from types import SimpleNamespace
+from uuid import uuid4
 
 import httpx
 import pytest
 from fastapi.testclient import TestClient
+from sqlalchemy import text
 
+from scripts.factory_maintenance import backup, restore
+from software_factory import cli
 from software_factory.api import create_app
+from software_factory.db import Database
 from software_factory.publisher import PublisherUnavailable
 from tests.test_assembler import runner as runner
 from tests.test_publications import publication as publication
@@ -244,3 +254,88 @@ def test_two_reports_for_one_attempt_cannot_spend_two_retries(publication, clock
     assert len(status["observations"]) == 2
     assert status["operations"][0]["reconcile_attempts"] == 1
     assert status["operations"][0]["next_reconcile_at"] == clock.value + 2
+
+
+def test_restored_publisher_reconciles_existing_pr_without_writing(
+    backend, tmp_path, monkeypatch, capsys
+):
+    publication, provider, inputs, remote, _ = backend
+    world = publication.world
+    pull = provider.publish(inputs)
+    assert remote["pushes"] == 1 and len(remote["pulls"]) == 1
+    certificate, key = tmp_path / "recovery.crt", tmp_path / "recovery.key"
+    subprocess.run(
+        [
+            "openssl",
+            "req",
+            "-x509",
+            "-newkey",
+            "rsa:2048",
+            "-nodes",
+            "-subj",
+            "/CN=restore publication",
+            "-days",
+            "1",
+            "-keyout",
+            str(key),
+            "-out",
+            str(certificate),
+        ],
+        check=True,
+        capture_output=True,
+    )
+    artifact_root = world.client.app.state.service.artifacts.storage.root
+    bundle = backup(world.database, artifact_root, tmp_path / "backup", certificate)
+    name = f"factory_restore_{uuid4().hex}"
+    with world.database.engine.connect().execution_options(isolation_level="AUTOCOMMIT") as conn:
+        conn.execute(text(f"CREATE DATABASE {name}"))
+    target = Database(
+        world.database.engine.url.set(database=name).render_as_string(hide_password=False)
+    )
+    try:
+        report = restore(target, tmp_path / "restored", bundle["backup"], certificate, key)
+        assert report["status"] == "STAGED_RECONCILIATION_REQUIRED"
+        with TestClient(create_app(target, reconcile_interval=3600)) as client:
+            restored = replace(world, database=target, client=client)
+            assert (
+                restored.get("/v1/publisher/reconciliations", token=publication.secret).status_code
+                == 401
+            )
+            path = f"/v1/workspaces/{world.workspace_id}/execution-control"
+            release = {"stopped": False, "expected_revision": 1, "reason": "restore reconciliation"}
+            denied = restored.post(path, release)
+            assert (
+                denied.status_code == 409
+                and denied.json()["code"] == "RESTORE_RECONCILIATION_REQUIRED"
+            )
+            monkeypatch.setattr(cli, "Database", lambda: target)
+            monkeypatch.setattr(
+                sys,
+                "argv",
+                [
+                    "factory",
+                    "reissue-publisher",
+                    "--publisher-id",
+                    publication.identity,
+                    "--reason",
+                    "recovery exercise",
+                ],
+            )
+            cli.main()
+            issued = json.loads(capsys.readouterr().out)
+            assert issued["publisher_id"] == publication.identity
+            recovered = SimpleNamespace(world=restored, secret=issued["publisher_token"])
+            agent, _ = supervisor(recovered, tmp_path / "fresh-publisher-journal", backend=provider)
+            assert agent.run_once()["state"] == "SUCCEEDED"
+            assert all(request["method"] == "GET" for request in provider.trace)
+            assert remote["pushes"] == 1 and len(remote["pulls"]) == 1
+            current = restored.get(f"/v1/runs/{world.run_id}/publication").json()
+            assert current["pull_request"]["number"] == pull["number"]
+            assert restored.run()["phase"] == "WAIT_CI"
+            assert restored.post(path, release).status_code == 200
+    finally:
+        target.engine.dispose()
+        with world.database.engine.connect().execution_options(
+            isolation_level="AUTOCOMMIT"
+        ) as conn:
+            conn.execute(text(f"DROP DATABASE {name}"))

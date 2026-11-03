@@ -333,4 +333,6 @@ uv run python scripts/factory_maintenance.py --offline --artifact-root "$RESTORE
   restore "$BACKUP_BUNDLE" --certificate "$BACKUP_CERTIFICATE" --key "$BACKUP_PRIVATE_KEY"
 ```
 
-`STAGED_RECONCILIATION_REQUIRED` を確認してから、復元先のControl Planeを隔離状態で起動します。復元は全Workspaceを停止状態にし、旧Worker・Publisher資格情報と旧Leaseの実行権を失効させます。Workerを同じIDで復旧する場合は、ローカル管理者が復元先を指定して `python -m software_factory.cli reissue-worker --worker-id <id> --reason '<理由>'` を実行します。新しい資格情報で旧Leaseが拒否されることを確認し、未確定の公開を照合してから停止解除を判断します。
+`STAGED_RECONCILIATION_REQUIRED` を確認してから、復元先のControl Planeを隔離状態で起動します。復元は全Workspaceを停止状態にし、旧Worker・Publisher資格情報と旧Leaseの実行権を失効させます。Workerを同じIDで復旧する場合は、ローカル管理者が復元先を指定して `python -m software_factory.cli reissue-worker --worker-id <id> --reason '<理由>'` を実行します。新しい資格情報で旧Leaseが拒否されることを確認します。復元時に公開中だった操作は `UNKNOWN` に戻り、Publisherによる読み取り照合の対象になります。
+
+Publisherも同じIDとRepository権限を保持して再発行します。復元先を指定し、`python -m software_factory.cli reissue-publisher --publisher-id <id> --reason '<理由>'` の結果を所有者専用ファイルに保存します。復元先では新しい `--state-dir` と再発行したトークンでPublisherを起動し、`GET /v1/publisher/reconciliations` とRunの公開履歴を確認します。未照合の公開処理が残っている間、停止解除は `RESTORE_RECONCILIATION_REQUIRED` で拒否されます。照合で確定できず `BLOCKED` になったRunは、解除後も個別に対応します。

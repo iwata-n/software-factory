@@ -445,7 +445,9 @@ Worker一覧は最後の試行のHeartbeatとLease期限を表示する。標準
 
 0019でRun終了時刻、証拠回収時刻、回収済みのイベント番号を永続化した。終了後30日でArtifactと期限到達済みの履歴・Workerログを回収し、稼働中のRun・Leaseと未解決の公開処理は保護する。SSEは回収済みの番号を410とし、後から追加されたイベントは保持期限まで再開できる。0020で終了Runと関連する費用・証拠を90日後に回収し、Runを持たないTaskと期限到達済み監査も回収する。既存Taskの期限は移行日時から起算する。削除された親の冪等性応答を削除日からさらに90日保持し、認証と同一操作を照合する。Jira由来Taskの回収後は再取込を防ぐ識別情報を残す。同規模でのバックアップ・復元は後述の演習で確認した。別担当者による運用演習は追跡中。
 
-対象 `ec60857` で100 Tasks、100 Runs、30 Candidates、1,000 Artifacts（1 GiB）を一時DB・Storageに生成し、8回暗号化して7世代を保持した。別の空DBとStorageに復元し、全ArtifactのサイズとSHA-256、DBの件数、費用台帳と残高を照合した。演習時の復元ポイント差は3.108秒、復元開始からhealth/照合まで6.211秒。旧Worker Tokenは401、同一Workerの再認証後に旧Leaseは409、停止中の新規Claimは204だった。証拠は `.local/verification/sf24-scale/observation.json` に保存した。8世代は連続実行であり、24時間ごとの運用と復元後の実PR照合・重複作成0は別途検証する。
+対象 `ec60857` で100 Tasks、100 Runs、30 Candidates、1,000 Artifacts（1 GiB）を一時DB・Storageに生成し、8回暗号化して7世代を保持した。別の空DBとStorageに復元し、全ArtifactのサイズとSHA-256、DBの件数、費用台帳と残高を照合した。演習時の復元ポイント差は3.108秒、復元開始からhealth/照合まで6.211秒。旧Worker Tokenは401、同一Workerの再認証後に旧Leaseは409、停止中の新規Claimは204だった。証拠は `.local/verification/sf24-scale/observation.json` に保存した。8世代は連続実行であり、24時間ごとの運用は別途検証する。
+
+0021で復元時のIN_FLIGHTをUNKNOWNへ戻し、照合完了までWorkspace解除を拒否する。ローカル管理者が同じPublisher IDで資格情報を再発行できる。一時DBの復元、実GitオブジェクトとGitHub API fixtureを使い、照合前の解除409、旧Publisher 401、再発行後の既存PR復旧、追加push/PR作成0、照合後の解除を確認した。復元後の実GitHub照合は引き続き追跡する。
 
 ## 要件の対応
 

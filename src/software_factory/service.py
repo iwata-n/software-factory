@@ -36,6 +36,7 @@ from .models import (
     PlanVersion,
     Principal,
     Project,
+    PublicationOperation,
     Repository,
     Run,
     RunEvent,
@@ -322,6 +323,18 @@ class Service:
         if data.stopped == current["stopped"]:
             raise DomainError(409, "EXECUTION_CONTROL_ALREADY_SET")
         workspace = session.get(Workspace, workspace_id)
+        if not data.stopped and workspace.restore_reconciliation_required:
+            unresolved = session.scalar(
+                select(PublicationOperation.id)
+                .where(
+                    PublicationOperation.workspace_id == workspace_id,
+                    PublicationOperation.state.in_(["IN_FLIGHT", "UNKNOWN", "RECONCILING"]),
+                )
+                .limit(1)
+            )
+            if unresolved:
+                raise DomainError(409, "RESTORE_RECONCILIATION_REQUIRED")
+            workspace.restore_reconciliation_required = False
         workspace.execution_stopped = data.stopped
         workspace.execution_stop_revision += 1
         if data.stopped:
