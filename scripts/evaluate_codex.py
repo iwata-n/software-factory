@@ -1,7 +1,7 @@
 """Evaluate real Codex PLAN/IMPLEMENT/REVIEW through HTTP Workers and Linux verification.
 
 Uses only the existing CLI ChatGPT login and a disposable PostgreSQL instance. Public GitHub
-source is read; this evaluation does not create a PR, send notifications, merge or deploy.
+source is read. An optional fixed evaluation profile publishes a Draft PR and verifies GitHub CI.
 """
 
 import argparse
@@ -24,6 +24,7 @@ import httpx
 from acceptance_support import source_manifest
 from alembic import command
 from alembic.config import Config
+from evaluate_publication import EVALUATION_WORKFLOW, REPOSITORY, github, verify_live_ci
 from sqlalchemy.engine import make_url
 
 from software_factory.codex_adapter import CodexAdapter, archive_files
@@ -124,6 +125,8 @@ def main():
     parser.add_argument("--base-ref", default="codex/sf17-publisher")
     parser.add_argument("--output", required=True, type=Path)
     parser.add_argument("--probe-disconnect", action="store_true")
+    parser.add_argument("--actions-workflow-id", type=int)
+    parser.add_argument("--fixture-base-sha")
     parser.add_argument("--codex-manifest", default="config/codex_cli.json")
     parser.add_argument(
         "--codex-binary",
@@ -133,6 +136,18 @@ def main():
         ),
     )
     args = parser.parse_args()
+    publish_live = args.actions_workflow_id is not None
+    if publish_live and (
+        args.actions_workflow_id <= 0
+        or not args.fixture_base_sha
+        or not args.base_ref.startswith("codex/factory-evaluation/")
+        or args.probe_disconnect
+    ):
+        parser.error(
+            "live publication requires a fixed evaluation base, workflow ID and no fault probe"
+        )
+    if args.fixture_base_sha and not publish_live:
+        parser.error("--fixture-base-sha requires --actions-workflow-id")
     url = make_url(os.environ["FACTORY_DATABASE_URL"])
     if not str(url.query.get("host", "")).startswith("/private/tmp/factory-pg-"):
         raise SystemExit("use scripts/with_postgres.py; existing databases are not supported")
@@ -241,6 +256,8 @@ def main():
             fixed = post(
                 source, "/v1/sources/resolve", {"remote_url": REMOTE, "base_ref": args.base_ref}
             )
+            if publish_live and fixed["sha"] != args.fixture_base_sha:
+                raise RuntimeError("Evaluation base does not match the fixed SHA")
             fetched = post(source, "/v1/sources/fetch", {"remote_url": REMOTE, "sha": fixed["sha"]})
             report["base_sha"] = fixed["sha"]
             files = archive_files(base64.b64decode(fetched["archive"]), fetched["source_digest"])
@@ -299,6 +316,20 @@ def main():
                 "run_budget_microusd": 1_000_000,
                 "job_reservation_microusd": 100_000,
             }
+            if publish_live:
+                workflow = files[EVALUATION_WORKFLOW][1]
+                if workflow != (ROOT / EVALUATION_WORKFLOW).read_bytes():
+                    raise RuntimeError("Remote evaluation workflow differs from reviewed fixture")
+                protected[EVALUATION_WORKFLOW] = hashlib.sha256(workflow).hexdigest()
+                policy["required_ci_checks"] = [
+                    {
+                        "provider": "github",
+                        "app_id": 15368,
+                        "check_name": "factory-eval-empty",
+                        "github_workflow_id": args.actions_workflow_id,
+                        "github_workflow_path": EVALUATION_WORKFLOW,
+                    }
+                ]
             os.environ["FACTORY_RUNNER_STATE_ROOT"] = str(output / "baseline-runner")
             runner = DockerRunner(image)
             baseline = runner.execute_candidate(
@@ -537,6 +568,93 @@ def main():
                 )
                 report["disconnect"] = probe_disconnect(cp_url, model_secret, engine)
                 report["disconnect"]["run_id"] = fault_run["run_id"]
+            if publish_live:
+                published = admin(
+                    "issue-publisher",
+                    "--workspace-id",
+                    account["workspace_id"],
+                    "--repository-id",
+                    repository["repository_id"],
+                    "--name",
+                    "Codex evaluation Publisher",
+                )
+                publisher_token = published["publisher_token"]
+                known_secrets.append(publisher_token)
+                credential = output / "publisher.token"
+                credential.write_text(publisher_token)
+                try:
+                    dispatched = json.loads(
+                        subprocess.check_output(
+                            [
+                                sys.executable,
+                                "-m",
+                                "software_factory.publisher",
+                                "--control-plane-url",
+                                cp_url,
+                                "--publisher-token-file",
+                                str(credential),
+                                "--github-use-gh",
+                                "--allowed-remote",
+                                REMOTE,
+                                "--state-dir",
+                                str(output / "publisher"),
+                                "--once",
+                            ],
+                            cwd=ROOT,
+                            env=base_env,
+                            timeout=180,
+                        )
+                    )
+                finally:
+                    credential.unlink(missing_ok=True)
+                assert dispatched["state"] == "SUCCEEDED"
+                publication = user.get(f"/v1/runs/{run_id}/publication").json()
+                assert publication["pull_request"]["head_sha"] == candidate["head_sha"]
+                integration = uuid4().hex
+                github_token = subprocess.check_output(
+                    ["gh", "auth", "token", "--hostname", "github.com"], text=True
+                ).strip()
+                webhook_secret = uuid4().hex + uuid4().hex
+                known_secrets.extend([github_token, webhook_secret])
+                cp_env["FACTORY_GITHUB_WEBHOOKS"] = json.dumps(
+                    {
+                        integration: {
+                            "workspace_id": account["workspace_id"],
+                            "repository_id": repository["repository_id"],
+                            "github_repository_id": github("")["id"],
+                            "github_repository": REPOSITORY,
+                            "secret": webhook_secret,
+                        }
+                    }
+                )
+                cp_env["FACTORY_GITHUB_CI_READ_TOKENS"] = json.dumps({integration: github_token})
+
+                def restart_control_plane():
+                    processes[1].terminate()
+                    processes[1].wait(timeout=10)
+                    log = stack.enter_context((output / "control-plane-live-ci.log").open("ab"))
+                    processes[1] = subprocess.Popen(
+                        [sys.executable, "-m", "software_factory.cli", "serve"],
+                        env=cp_env,
+                        cwd=ROOT,
+                        stdout=log,
+                        stderr=log,
+                    )
+                    wait_ready(cp_url + "/healthz", processes[1])
+
+                restart_control_plane()
+                verify_live_ci(
+                    user, run_id, publication, state, output, identity, restart_control_plane
+                )
+                report["publication"] = json.loads((output / "evaluation.json").read_text())
+                report["publication"]["local_agent_and_reviewer"] = "codex_cli"
+                report["github_writes"] = [
+                    request
+                    for observation in publication["observations"]
+                    for request in observation["body"].get("provider_requests", [])
+                    if request["method"] != "GET"
+                ]
+                current = state()
             report.update(
                 result="PASS",
                 candidate_id=candidate_id,
