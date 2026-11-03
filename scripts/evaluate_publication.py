@@ -300,14 +300,7 @@ def crash_publisher_before_report():
     raise RuntimeError("Publisher did not reach the lost-response injection point")
 
 
-def verify_live_restore(output, identity, account, publisher, run_id, cp_url, cp_environment):
-    """Kill the Publisher before result persistence, then recover from an encrypted backup."""
-    github_token = subprocess.check_output(
-        ["gh", "auth", "token", "--hostname", "github.com"], text=True
-    ).strip()
-    original_token = publisher["publisher_token"]
-    backend = GitHubDraftPublisher(SourcePolicy((REMOTE,)), github_token)
-    journal_path = output / "interrupted-publisher"
+def interrupt_live_publication(journal_path, cp_url, publisher_token, github_token):
     child = subprocess.run(
         [
             sys.executable,
@@ -324,7 +317,7 @@ def verify_live_restore(output, identity, account, publisher, run_id, cp_url, cp
         input=json.dumps(
             {
                 "cp_url": cp_url,
-                "publisher_token": original_token,
+                "publisher_token": publisher_token,
                 "github_token": github_token,
                 "journal": str(journal_path),
             }
@@ -338,21 +331,101 @@ def verify_live_restore(output, identity, account, publisher, run_id, cp_url, cp
     pending = PublicationJournal(journal_path).read()
     assert pending["phase"] == "STARTED" and "report" not in pending
     operation = pending["operation"]
-    source = Database()
-    with source.transaction() as session:
+    with Database().transaction() as session:
         stored = session.get(PublicationOperation, operation["operation_id"])
         assert stored.state == "IN_FLIGHT"
+    return operation
 
-    def remote_matches():
-        target = operation["target"]
-        params = httpx.QueryParams(
-            state="all",
-            head=f"{REPOSITORY.split('/')[0]}:{target['head_ref']}",
-            base=target["base_ref"],
+
+def matching_live_drafts(operation):
+    target = operation["target"]
+    params = httpx.QueryParams(
+        state="all",
+        head=f"{REPOSITORY.split('/')[0]}:{target['head_ref']}",
+        base=target["base_ref"],
+    )
+    return github(f"pulls?{params}")
+
+
+def verify_live_restart(output, identity, publisher, run_id, cp_url, publish):
+    github_token = subprocess.check_output(
+        ["gh", "auth", "token", "--hostname", "github.com"], text=True
+    ).strip()
+    journal = output / "interrupted-publisher"
+    operation = interrupt_live_publication(
+        journal, cp_url, publisher["publisher_token"], github_token
+    )
+    (before,) = matching_live_drafts(operation)
+    assert before["draft"] and before["head"]["sha"] == operation["target"]["candidate"]["head_sha"]
+    restarted, publication = publish(journal)
+    assert restarted["state"] == "UNKNOWN"
+    (unknown,) = publication["operations"]
+    assert unknown["state"] == "UNKNOWN" and unknown["next_reconcile_at"] is not None
+    with httpx.Client(
+        base_url=cp_url,
+        trust_env=False,
+        headers={"Authorization": f"Bearer {publisher['publisher_token']}"},
+    ) as client:
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline:
+            reply = client.get("/v1/publisher/reconciliations")
+            reply.raise_for_status()
+            if reply.json()["operations"]:
+                break
+            time.sleep(0.1)
+        else:
+            raise RuntimeError("read-only recovery did not become due")
+    recovered, publication = publish(journal)
+    assert recovered["state"] == "SUCCEEDED"
+    (completed,) = publication["operations"]
+    assert completed["operation_id"] == unknown["operation_id"] == operation["operation_id"]
+    assert completed["state"] == "SUCCEEDED" and completed["reconcile_attempts"] == 1
+    observed = publication["pull_request"]
+    assert observed["number"] == before["number"] and observed["head_sha"] == before["head"]["sha"]
+    (after,) = matching_live_drafts(operation)
+    assert (after["id"], after["head"]["sha"]) == (before["id"], before["head"]["sha"])
+    reads = publication["observations"][-1]["body"]["provider_requests"]
+    assert reads and all(item["method"] == "GET" for item in reads)
+    with Database().transaction() as session:
+        events = session.scalars(
+            select(RunEvent).where(RunEvent.run_id == run_id).order_by(RunEvent.revision)
         )
-        return github(f"pulls?{params}")
+        recovered_states = [
+            "RECONCILING" if event.kind == "PUBLICATION_RECONCILING" else event.body["status"]
+            for event in events
+            if event.kind in {"PUBLICATION_RECONCILING", "PUBLICATION_RESULT_RECORDED"}
+            and event.body.get("operation_id") == operation["operation_id"]
+        ]
+    assert recovered_states == ["UNKNOWN", "RECONCILING", "SUCCEEDED"]
+    evidence = {
+        "revision": identity["revision"],
+        "run_id": run_id,
+        "publisher_exit_signal": "SIGKILL",
+        "journal_phase_at_crash": "STARTED",
+        "states": ["IN_FLIGHT", *recovered_states],
+        "operation_id": operation["operation_id"],
+        "pull_request": observed["url"],
+        "head_sha": observed["head_sha"],
+        "provider_requests": reads,
+        "matching_prs_before": 1,
+        "matching_prs_after": 1,
+    }
+    (output / "evaluation.json").write_text(json.dumps(evidence, indent=2) + "\n")
+    print(json.dumps(evidence), flush=True)
 
-    (pull,) = remote_matches()
+
+def verify_live_restore(output, identity, account, publisher, run_id, cp_url, cp_environment):
+    """Kill the Publisher before result persistence, then recover from an encrypted backup."""
+    github_token = subprocess.check_output(
+        ["gh", "auth", "token", "--hostname", "github.com"], text=True
+    ).strip()
+    original_token = publisher["publisher_token"]
+    backend = GitHubDraftPublisher(SourcePolicy((REMOTE,)), github_token)
+    operation = interrupt_live_publication(
+        output / "interrupted-publisher", cp_url, original_token, github_token
+    )
+    source = Database()
+    (pull,) = matching_live_drafts(operation)
     assert pull["draft"] and not pull.get("merged")
     assert pull["head"]["sha"] == operation["target"]["candidate"]["head_sha"]
     before = [(pull["id"], pull["number"], pull["head"]["sha"])]
@@ -454,7 +527,10 @@ def verify_live_restore(output, identity, account, publisher, run_id, cp_url, cp
                     assert result["pull_request"]["number"] == pull["number"]
                     assert result["pull_request"]["head_sha"] == pull["head"]["sha"]
                     post(client, path, action)
-                after = [(p["id"], p["number"], p["head"]["sha"]) for p in remote_matches()]
+                after = [
+                    (p["id"], p["number"], p["head"]["sha"])
+                    for p in matching_live_drafts(operation)
+                ]
                 assert after == before
             finally:
                 process.terminate()
@@ -466,7 +542,7 @@ def verify_live_restore(output, identity, account, publisher, run_id, cp_url, cp
             "pull_request": pull["html_url"],
             "head_sha": pull["head"]["sha"],
             "publisher_exit_signal": "SIGKILL",
-            "journal_phase_at_crash": pending["phase"],
+            "journal_phase_at_crash": "STARTED",
             "pre_restore_operation": "IN_FLIGHT",
             "recovered_operation": recovery["state"],
             "provider_requests": reads,
@@ -501,13 +577,19 @@ def main():
     parser.add_argument("--actions-workflow-id", type=int)
     parser.add_argument("--fixture-base-sha")
     parser.add_argument("--restore-publication", action="store_true")
+    parser.add_argument("--restart-publisher", action="store_true")
     parser.add_argument("--expect-ci-failure", action="store_true")
     parser.add_argument("--live-webhook", action="store_true")
     args = parser.parse_args()
     live_ci = args.actions_workflow_id is not None
-    if (args.restore_publication or args.expect_ci_failure or args.live_webhook) and not live_ci:
+    recovery = args.restore_publication or args.restart_publisher
+    if (recovery or args.expect_ci_failure or args.live_webhook) and not live_ci:
         parser.error("restore and failure rehearsals require the fixed Actions evaluation profile")
-    if args.restore_publication and (args.expect_ci_failure or args.live_webhook):
+    if recovery and (
+        args.expect_ci_failure
+        or args.live_webhook
+        or (args.restore_publication and args.restart_publisher)
+    ):
         parser.error("select one rehearsal at a time")
     if live_ci != bool(args.fixture_base_sha):
         parser.error("--actions-workflow-id and --fixture-base-sha must be specified together")
@@ -785,7 +867,7 @@ def main():
                         "transport candidate did not pass the actual local golden checks"
                     )
 
-            def publish():
+            def publish(state_dir=output / "publisher"):
                 result = process_json(
                     [
                         sys.executable,
@@ -799,7 +881,7 @@ def main():
                         "--allowed-remote",
                         REMOTE,
                         "--state-dir",
-                        str(output / "publisher"),
+                        str(state_dir),
                         "--once",
                     ],
                     environment=base_environment,
@@ -812,6 +894,9 @@ def main():
 
             assert Supervisor(agent_client, fixture, heartbeat_interval=0.1).run_once()["accepted"]
             managed_stages()
+            if args.restart_publisher:
+                verify_live_restart(output, identity, publisher, run_id, cp_url, publish)
+                return
             if args.restore_publication:
                 verify_live_restore(
                     output, identity, account, publisher, run_id, cp_url, cp_environment
