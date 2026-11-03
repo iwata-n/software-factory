@@ -788,10 +788,23 @@ GitHubの既定ブランチが `codex/sf01-07-acceptance` であることを確�
 
 | タスク | 確認済みの範囲 | 受け入れに必要な残作業 |
 |---|---|---|
-| SF-18 | 実GitHubの成功・失敗をWebhookとポーリングの両経路で確認 | 現行revisionの条件別証拠と実CI照合 |
-| SF-19 | 実Draft PRの読み取り復旧と二重公開防止を確認 | 現行revisionでの復元、取消競合、成功後のPR変更を条件別に照合 |
+| SF-18 | `7c273d6` で実CIの成功・失敗をWebhookとポーリングの両経路で確認 | AC01〜05の条件別証拠と同一revisionの全回帰を照合 |
+| SF-19 | `7c273d6` で実Draft PRの読み取り復旧と二重公開防止を確認 | 取消競合、成功後のPR変更、照合不能・再起動の各条件を照合 |
 | SF-20 | ホスト上の実Codexで3件が検証済みDraft PRまで到達 | 隔離Runnerでの実Codex、通信断、利用量証拠の照合 |
 | SF-21 | 実Dockerで停止・回収・越境拒否、PostgreSQLで停止未確認時の永続隔離を確認 | 実Agentの許可経路だけを通す通信制限と、実Codexを含む停止経路 |
 | SF-22 | Jira REST取り込み・Slack配送の境界試験が成功 | Jira専用欄と読み取り認証、Slack Bot認証を設定し実サービスを通しで確認 |
 | SF-23 | 運用カンバン、SSE、資格情報更新、緊急停止・監査の境界を確認 | 現行候補で、状態別・権限別の表示と監査を通しで照合 |
 | SF-24 | 暗号化バックアップ復元と実Codexの3件評価を確認 | 日次バックアップの実測、実Slack配送、別担当者による[復旧演習](Operations_Recovery_Runbook.md)、AT-01〜12の照合 |
+
+#### GitHub実環境の再検証
+
+評価対象は `7c273d6f6d2b83f45a62f5d89bda6aaefbd4c3ba+inputs-70efd1901a95a2bc`。SF-18-AC06では次の4件でPRのhead/baseとCIの検証対象が一致した。成功は `VERIFIED_DRAFT_PR`、失敗は `REPAIR` へ進み、両経路で判定が一致した。
+
+| 経路 | 必須CI成功 | 必須CI失敗 |
+|---|---|---|
+| ポーリング | [PR #16](https://github.com/iwata-n/software-factory/pull/16)、[CI](https://github.com/iwata-n/software-factory/actions/runs/41616656877/job/125851658637) | [PR #17](https://github.com/iwata-n/software-factory/pull/17)、[CI](https://github.com/iwata-n/software-factory/actions/runs/41616657609/job/125851660511) |
+| 署名付きWebhook | [PR #20](https://github.com/iwata-n/software-factory/pull/20)、[CI](https://github.com/iwata-n/software-factory/actions/runs/41617132633/job/125853274988) | [PR #19](https://github.com/iwata-n/software-factory/pull/19)、[CI](https://github.com/iwata-n/software-factory/actions/runs/41617011671/job/125852866140) |
+
+Webhook成功の初回試験（[PR #18](https://github.com/iwata-n/software-factory/pull/18)）は配送0件でポーリングによる確定だったため、Webhook成功件数から除いた。一時Webhookは削除を確認した。条件別の自動試験38件は同じ入力digestで成功し、AC01〜05の試験結果を台帳に保存した。
+
+SF-19の公開直後の復元では、[PR #21](https://github.com/iwata-n/software-factory/pull/21) を読み取り4件で再照合した。対象PRは復元前後とも1件、再公開の送信は0件。旧Publisher資格情報は401、照合前の停止解除は409だった。各Runのローカル証拠は実行チェックアウトの `.local/evaluation/github-ci-and-restore-7c273d6.json` とリンク先の個別記録に保存した。
