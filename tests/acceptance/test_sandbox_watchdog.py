@@ -235,7 +235,8 @@ def test_admission_rejects_before_create(remaining, bad_image, code, evidence):
         evidence("Rejected before container creation", trace, remaining_seconds=remaining)
 
 
-def test_live_isolation_and_limits(tmp_path, monkeypatch):
+@pytest.mark.ac("SF-21-AC04")
+def test_live_isolation_and_limits(tmp_path, monkeypatch, evidence):
     host_canary = tmp_path / "secret"
     host_canary.write_text("host-only")
     monkeypatch.setenv("CP_TOKEN", "cp-canary")
@@ -326,9 +327,20 @@ raise SystemExit(72)
         assert proc.wait(timeout=12) == 1
         assert event(trace_file, "exited")["exit_code"] == 72
         assert removed(container)
+        evidence(
+            "The kernel rejects writes and forks past the fixed quota",
+            {
+                "limits": metrics["limits"],
+                "work_bytes_before_enospc": metrics["work_bytes"],
+                "peak_pids_before_eagain": metrics["peak_pids"],
+                "exit_code": event(trace_file, "exited")["exit_code"],
+            },
+            container_id=container,
+        )
 
 
-def test_memory_pressure_is_oom_failure(tmp_path):
+@pytest.mark.ac("SF-21-AC04")
+def test_memory_pressure_is_oom_failure(tmp_path, evidence):
     script = """
 import time
 from pathlib import Path
@@ -347,9 +359,15 @@ while True:
         exit_event = event(trace_file, "exited")
         assert exit_event["oom_killed"] and exit_event["exit_code"] == 137
         assert removed(container)
+        evidence(
+            "Memory pressure triggers cgroup OOM and nonzero runtime exit",
+            {"limit_bytes": 2**31, "runtime_exit": exit_event},
+            container_id=container,
+        )
 
 
-def test_cpu_pressure_is_throttled(tmp_path):
+@pytest.mark.ac("SF-21-AC04")
+def test_cpu_pressure_is_throttled(tmp_path, evidence):
     script = """
 import json, os, time
 from pathlib import Path
@@ -387,6 +405,11 @@ time.sleep(2)
         (tmp_path / "cpu-metrics.json").write_text(json.dumps(metrics, indent=2))
         assert proc.wait(timeout=8) == 0
         assert removed(container)
+        evidence(
+            "Eight runnable children are throttled within a two-CPU quota",
+            metrics,
+            container_id=container,
+        )
 
 
 def test_concurrent_sandboxes_have_separate_work_and_tmp(tmp_path):

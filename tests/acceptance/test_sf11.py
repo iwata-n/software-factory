@@ -103,6 +103,12 @@ def test_runtime_isolation():
     elif scenario == "timeout":
         command["argv"] = ["python", "-c", "import time;time.sleep(5)"]
         command["timeout_seconds"] = 1
+    elif scenario == "oom":
+        command["argv"] = [
+            "python",
+            "-c",
+            "pages = []\nwhile True: pages.append(bytearray(16 * 2**20))",
+        ]
     elif scenario == "start_failed":
         command["argv"] = ["/factory-no-such-command"]
     elif scenario == "missing_test":
@@ -258,6 +264,27 @@ def test_exit_one_is_failed_evidence_not_an_infrastructure_completion(pipeline, 
     assert item["status"] == "FAIL" and item["exit_code"] == 1
     assert item["counts"]["failed"] == 1 and item["eligible"]
     evidence("EXECUTED/accepted does not mean PASS; real failing test is persisted", item)
+
+
+@pytest.mark.ac("SF-21-AC04")
+@pytest.mark.parametrize("source_bundle", ["oom"], indirect=True)
+def test_managed_verifier_classifies_memory_limit_signal_as_error(pipeline, evidence):
+    pipeline.prepare()
+    assert pipeline.assemble()["accepted"]
+    assert stage(pipeline, "VERIFY")[0]["accepted"]
+    (item,) = checks(pipeline)
+    assert (item["status"], item["metadata_body"]["reason"], item["exit_code"]) == (
+        "ERROR",
+        "PROCESS_SIGNALED",
+        -9,
+    )
+    isolation = item["metadata_body"]["isolation"]
+    assert isolation["memory"] == 2**31
+    evidence(
+        "A managed verification check killed at the memory limit yields ERROR",
+        item,
+        candidate_id=item["target"]["candidate_id"],
+    )
 
 
 @pytest.mark.ac("SF-11-AC03")
