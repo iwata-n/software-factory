@@ -71,6 +71,78 @@ def verify_publisher_restart(report, manifest):
         raise ValueError("actual GitHub Draft PR does not match the recovered publication")
 
 
+def verify_live_ci_matrix(matrix, manifest):
+    expected = {(route, result) for route in ("POLL", "WEBHOOK") for result in ("PASS", "FAIL")}
+    runs = matrix["runs"]
+    if len(runs) != len(expected) or {(case["route"], case["status"]) for case in runs} != expected:
+        raise ValueError("Both CI routes require independent pass and fail evidence")
+    urls = set()
+    run_ids = set()
+    for case in runs:
+        report = case["report"]
+        signal = case["trigger"]
+        if (
+            report["revision"] != manifest["revision"]
+            or signal["reconciliations"][-1]["trigger"] != case["route"]
+            or any(row["event"] != "ping" for row in signal["deliveries"])
+            != (case["route"] == "WEBHOOK")
+        ):
+            raise ValueError("CI evidence revision or observed trigger mismatch")
+        if case["status"] == "PASS":
+            result = report["result"]
+            if (
+                result["kind"] != "VERIFIED_DRAFT_PR"
+                or report["ci_input_origin"] != "actual_github"
+            ):
+                raise ValueError("Successful CI did not produce a verified Draft PR")
+            (check,) = result["checks"]
+            draft = result["draft_pr"]
+        else:
+            if (
+                report["run_phase"] != "REPAIR"
+                or report["success_receipt"]
+                or report["success_notification"]
+            ):
+                raise ValueError("Failed CI produced a success result or did not request repair")
+            check, draft = report["check"], report["draft_pr"]
+        if (
+            check["status"] != case["status"]
+            or not check["origin_verified"]
+            or check["head_sha"] != draft["head_sha"]
+            or check["tested_sha"] != draft["head_sha"]
+            or check["base_sha"] != draft["base_sha"]
+            or draft["url"] != f"https://github.com/iwata-n/software-factory/pull/{draft['number']}"
+        ):
+            raise ValueError("Recorded CI and Draft PR do not match")
+        repo = "repos/iwata-n/software-factory"
+        pull = json.loads(
+            subprocess.check_output(
+                ["gh", "api", f"{repo}/pulls/{int(draft['number'])}"], timeout=15
+            )
+        )
+        job = json.loads(
+            subprocess.check_output(
+                ["gh", "api", f"{repo}/actions/jobs/{int(check['provider_run_id'])}"], timeout=15
+            )
+        )
+        if (
+            not pull["draft"]
+            or pull["merged"]
+            or pull["head"]["sha"] != job["head_sha"]
+            or job["head_sha"] != draft["head_sha"]
+            or pull["base"]["sha"] != draft["base_sha"]
+            or job["conclusion"] != {"PASS": "success", "FAIL": "failure"}[case["status"]]
+            or job["html_url"] != check["url"]
+            or pull["html_url"] != draft["url"]
+        ):
+            raise ValueError("Actual GitHub job or PR differs from the recorded CI evidence")
+        urls.update([check["url"], draft["url"]])
+        run_ids.add(report["run_id"])
+    if len(urls) != 8 or len(run_ids) != 4:
+        raise ValueError("CI matrix reused a Run, PR or Check")
+    return sorted(urls)
+
+
 def audit(directory: Path, *, allow_ci_pending: bool = False) -> dict:
     manifest = json.loads((directory / "manifest.json").read_text())
     current = source_manifest()
@@ -107,7 +179,7 @@ def audit(directory: Path, *, allow_ci_pending: bool = False) -> dict:
         ):
             if field not in record:
                 raise ValueError(f"{ac}: missing {field}")
-        if ac != "C-05":
+        if ac not in {"C-05", "SF-18-AC06"}:
             if not record["test_case_ids"] or not set(record["test_case_ids"]) <= case_ids:
                 raise ValueError(f"{ac}: no corresponding executed JUnit cases")
             if not all(
@@ -207,6 +279,17 @@ def audit(directory: Path, *, allow_ci_pending: bool = False) -> dict:
                 )
             )
             path.write_text(json.dumps(record, indent=2, ensure_ascii=False))
+    matrix = directory / EXTERNAL_CRITERIA["SF-18-AC06"]
+    if matrix.exists():
+        urls = verify_live_ci_matrix(json.loads(matrix.read_text()), manifest)
+        path, record = records["SF-18-AC06"]
+        record.update(
+            result="PASS",
+            external_urls=urls,
+            external_verification={"filename": matrix.name, "sha256": sha(matrix.read_bytes())},
+            evidence_paths=list(dict.fromkeys([*record["evidence_paths"], matrix.name])),
+        )
+        path.write_text(json.dumps(record, indent=2, ensure_ascii=False))
     restart = directory / EXTERNAL_CRITERIA["SF-19-AC01"]
     if restart.exists():
         report = json.loads(restart.read_text())

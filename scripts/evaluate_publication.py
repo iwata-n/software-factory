@@ -963,39 +963,39 @@ def main():
                     restart_control_plane,
                     expect_failure=args.expect_ci_failure,
                 )
-                if args.live_webhook:
-                    with Database().transaction() as session:
-                        deliveries = list(
-                            session.scalars(
-                                select(CIWebhookDelivery)
-                                .where(CIWebhookDelivery.integration_id == integration_id)
-                                .order_by(CIWebhookDelivery.received_at)
-                            )
+                with Database().transaction() as session:
+                    deliveries = list(
+                        session.scalars(
+                            select(CIWebhookDelivery)
+                            .where(CIWebhookDelivery.integration_id == integration_id)
+                            .order_by(CIWebhookDelivery.received_at)
                         )
-                        triggers = list(
-                            session.scalars(
-                                select(RunEvent)
-                                .where(
-                                    RunEvent.run_id == run_id,
-                                    RunEvent.kind == "GITHUB_CI_RECONCILED",
-                                )
-                                .order_by(RunEvent.revision)
+                    )
+                    triggers = list(
+                        session.scalars(
+                            select(RunEvent)
+                            .where(
+                                RunEvent.run_id == run_id,
+                                RunEvent.kind == "GITHUB_CI_RECONCILED",
                             )
+                            .order_by(RunEvent.revision)
                         )
-                    proof = {
-                        "deliveries": [
-                            {
-                                "id": row.delivery_id,
-                                "event": row.event,
-                                "received_at": row.received_at,
-                            }
-                            for row in deliveries
-                        ],
-                        "reconciliations": [row.body for row in triggers],
-                    }
-                    (output / "webhook.json").write_text(json.dumps(proof, indent=2) + "\n")
-                    assert any(row.event != "ping" for row in deliveries)
-                    assert triggers and triggers[-1].body.get("trigger") == "WEBHOOK"
+                    )
+                proof = {
+                    "deliveries": [
+                        {
+                            "id": row.delivery_id,
+                            "event": row.event,
+                            "received_at": row.received_at,
+                        }
+                        for row in deliveries
+                    ],
+                    "reconciliations": [row.body for row in triggers],
+                }
+                expected_trigger = "WEBHOOK" if args.live_webhook else "POLL"
+                assert any(row.event != "ping" for row in deliveries) == args.live_webhook
+                assert triggers and triggers[-1].body.get("trigger") == expected_trigger
+                (output / "ci-trigger.json").write_text(json.dumps(proof, indent=2) + "\n")
                 return
             first_publication = publication
             database = Database()
