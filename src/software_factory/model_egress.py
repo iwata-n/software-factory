@@ -5,6 +5,8 @@ import ipaddress
 import re
 import select
 import socket
+import ssl
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 HOST = re.compile(
@@ -32,6 +34,38 @@ def dial(host):
         else:
             return upstream
     raise OSError("model destination unreachable")
+
+
+def read_client_hello(client, expected_host):
+    """Use OpenSSL to parse the first ClientHello without terminating the tunnel."""
+    incoming = ssl.MemoryBIO()
+    context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    observed = None
+
+    def capture_name(_connection, server_name, _context):
+        nonlocal observed
+        observed = server_name
+        return ssl.ALERT_DESCRIPTION_UNRECOGNIZED_NAME
+
+    context.set_servername_callback(capture_name)
+    handshake = context.wrap_bio(incoming, ssl.MemoryBIO(), server_side=True)
+    prefix = bytearray()
+    deadline = time.monotonic() + 5
+    while len(prefix) < 65536 and time.monotonic() < deadline:
+        data = client.recv(min(4096, 65536 - len(prefix)))
+        if not data:
+            break
+        prefix.extend(data)
+        incoming.write(data)
+        try:
+            handshake.do_handshake()
+        except ssl.SSLWantReadError:
+            continue
+        except ssl.SSLError:
+            if observed and observed.lower() == expected_host:
+                return prefix
+        break
+    raise ValueError("TLS server name does not match the permitted destination")
 
 
 def forward(client, upstream):
@@ -70,21 +104,15 @@ def gateway(address, allowed_hosts):
             if separator != ":" or port != "443" or host not in allowed_hosts:
                 self.send_error(403)
                 return
+            self.send_response(200)
+            self.end_headers()
             try:
-                upstream = dial(host)
-            except ValueError:
-                self.send_error(403)
-                return
-            except OSError:
-                self.send_error(502)
-                return
-            with upstream:
-                self.send_response(200)
-                self.end_headers()
-                try:
+                client_hello = read_client_hello(self.connection, host)
+                with dial(host) as upstream:
+                    upstream.sendall(client_hello)
                     forward(self.connection, upstream)
-                except OSError:
-                    pass
+            except (OSError, ValueError):
+                return
 
     return ThreadingHTTPServer(address, Handler)
 

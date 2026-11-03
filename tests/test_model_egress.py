@@ -1,4 +1,5 @@
 import socket
+import ssl
 from threading import Thread
 
 import pytest
@@ -9,13 +10,22 @@ from software_factory import model_egress
 def test_connect_allows_only_the_configured_host_and_tls_port(monkeypatch):
     requests = []
 
+    def client_hello(host):
+        outgoing = ssl.MemoryBIO()
+        handshake = ssl.create_default_context().wrap_bio(
+            ssl.MemoryBIO(), outgoing, server_hostname=host
+        )
+        with pytest.raises(ssl.SSLWantReadError):
+            handshake.do_handshake()
+        return outgoing.read()
+
     def dial(host):
         requests.append(host)
         client, upstream = socket.socketpair()
 
         def echo():
             with upstream:
-                upstream.sendall(upstream.recv(100))
+                upstream.sendall(upstream.recv(65536))
 
         Thread(target=echo, daemon=True).start()
         return client
@@ -30,15 +40,22 @@ def test_connect_allows_only_the_configured_host_and_tls_port(monkeypatch):
                     client.sendall(f"CONNECT {target} HTTP/1.0\r\n\r\n".encode())
                     assert client.makefile("rb").readline().split()[1] == b"403"
             assert requests == []
-            with socket.create_connection(gateway.server_address, timeout=2) as client:
-                client.sendall(b"CONNECT model.example:443 HTTP/1.0\r\n\r\n")
-                response = client.makefile("rb")
-                assert response.readline().split()[1] == b"200"
-                for line in response:
-                    if line == b"\r\n":
-                        break
-                client.sendall(b"test tunnel")
-                assert response.read(11) == b"test tunnel"
+            for host in ("untrusted.example", None, "model.example"):
+                with socket.create_connection(gateway.server_address, timeout=2) as client:
+                    client.sendall(b"CONNECT model.example:443 HTTP/1.0\r\n\r\n")
+                    response = client.makefile("rb")
+                    assert response.readline().split()[1] == b"200"
+                    for line in response:
+                        if line == b"\r\n":
+                            break
+                    hello = client_hello(host)
+                    client.sendall(hello[:5])
+                    client.sendall(hello[5:])
+                    if host == "model.example":
+                        assert response.read(len(hello)) == hello
+                    else:
+                        assert response.read() == b""
+                        assert requests == []
             assert requests == ["model.example"]
         finally:
             gateway.shutdown()
