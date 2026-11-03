@@ -331,7 +331,7 @@ Gateは必須Jobが処理中なら待機を続ける。全必須Jobが終端ま�
 
 依存SF-17。試験追加先は `tests/acceptance/test_sf18.py`。外部CIはProfileのprovider/app/check IDに一致するものだけ信頼する。同じ表示名だけでは一致としない。
 
-先行実装で、GitHub Webhookの署名とリポジトリの照合、配送の永続化、再送と同時配送の重複排除を追加した。Inboxには配送ID、イベント種別、指紋、受信時刻を保存する。GitHub APIの定期照合とCandidateへの証拠の紐付けを追加した。実Draft PR #4では同じhead SHAに同一App・同名の `pull_request` と `push` のCheckが各1件あり、GitHubが返した仮merge SHAのCheckは0件だった。Actions用Profileに固定workflowのID・パスと保護manifestを設定し、対象PRのpull_request実行、最新試行、head確認ステップを照合する。既存の実Draft PR #4でpushを除外できることを確認した。専用workflowで成功・失敗を作り、実Webhookとpollで通す受入試験は残る。
+先行実装で、GitHub Webhookの署名とリポジトリの照合、配送の永続化、再送と同時配送の重複排除を追加した。Inboxには配送ID、イベント種別、指紋、受信時刻を保存する。GitHub APIの定期照合とCandidateへの証拠の紐付けを追加した。実Draft PR #4では同じhead SHAに同一App・同名の `pull_request` と `push` のCheckが各1件あり、GitHubが返した仮merge SHAのCheckは0件だった。Actions用Profileに固定workflowのID・パスと保護manifestを設定し、対象PRのpull_request実行、最新試行、head確認ステップを照合する。既存の実Draft PR #4でpushを除外できることを確認した。専用workflow ID `405481217` を固定し、同一base `2e914e63c4042b81459209e2310688f0fb45d443` の実Draft PRで、[失敗ジョブ](https://github.com/iwata-n/software-factory/actions/runs/41607028930/job/125819299458)と[成功ジョブ](https://github.com/iwata-n/software-factory/actions/runs/41607033739/job/125819316009)を再現した。製品のGitHub readerが両ジョブの検証SHAをそれぞれのPR headと照合し、fixture Local Gateを使ったFinal Gate判定はFAIL/PASSとなった。証拠は `.local/verification/sf18-real-fixtures/` に保存した。実Webhook受信、常駐ポーラーによるRunへの反映、実Agentからの通し試験は残る。
 
 | AC ID | 前提と操作 | 合格となる期待結果 | 検証方法と証拠 |
 |---|---|---|---|
