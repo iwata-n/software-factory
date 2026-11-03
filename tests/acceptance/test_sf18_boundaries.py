@@ -1,5 +1,6 @@
 import hmac
 import json
+import socket
 from concurrent.futures import ThreadPoolExecutor
 from uuid import uuid4
 
@@ -17,6 +18,7 @@ from software_factory.github_ci import CIReadError, GitHubCIReader, check_status
 from software_factory.models import Gate, OutboxEvent, Run, RunEvent, VerifiedRunResult
 from software_factory.service import Service
 from tests.test_assembler import runner as runner
+from tests.test_processes import start_control_plane
 from tests.test_publications import publication as publication
 
 from .test_sf10 import pipeline as pipeline
@@ -25,6 +27,7 @@ from .test_sf11 import source_bundle as source_bundle
 from .test_sf12_integration import begin_ci, pass_local
 from .test_sf13 import assemble_repair, repair, review, value_patch
 from .test_sf13_progress import synthetic_ci
+from .test_sf19_boundaries import claim
 
 pytestmark = pytest.mark.parametrize("source_bundle", ["ci"], indirect=True)
 MERGE = "3" * 40
@@ -356,6 +359,121 @@ def test_repaired_candidate_still_stops_with_ci_timeout(pipeline, clock, evidenc
     run = world.run()
     assert (run["status"], run["stop_reason"]) == ("BLOCKED", "CI_TIMEOUT")
     evidence("A repaired Candidate has the same CI timeout semantics", run)
+
+
+@pytest.mark.ac("SF-19-AC06")
+@pytest.mark.parametrize("stage", ["WAIT_CI", "PUBLISH_UNKNOWN", "BLOCKED", "SUCCEEDED"])
+def test_publication_survives_control_plane_process_kill(
+    publication, clock, request, stage, evidence
+):
+    pub = publication
+    world = pub.world
+    report_key = "report"
+    if stage in {"WAIT_CI", "SUCCEEDED"}:
+        _, _, poll, _, _, _, _, _ = request.getfixturevalue("waiting")
+        state = world.get(f"/v1/runs/{world.run_id}/publication").json()
+        (operation,) = state["operations"]
+        report_body = pub.success(operation)
+        report_body["pull_request"].update(external_id="456", merge_sha=MERGE)
+        if stage == "SUCCEEDED":
+            poll()
+            poll()
+    else:
+        operation = pub.begin().json()
+        report_body = {
+            "delivery_id": "unknown-0",
+            "target_hash": operation["target_hash"],
+            "status": "UNKNOWN",
+            "reason": "PUBLISH_UNKNOWN",
+        }
+        assert pub.report(operation, report_body, key=report_key).status_code == 200
+        if stage == "BLOCKED":
+            for attempt, delay in enumerate((1, 2, 4), 1):
+                clock.advance(delay)
+                assert claim(pub, operation, attempt, f"claim-{attempt}").status_code == 200
+                report_key = f"report-{attempt}"
+                report_body = report_body | {
+                    "delivery_id": f"unknown-{attempt}",
+                    "reconcile_attempt": attempt,
+                }
+                assert pub.report(operation, report_body, key=report_key).status_code == 200
+
+    original = pub.report(operation, report_body, key=report_key)
+    assert original.status_code == 200, original.text
+    with socket.socket() as listener:
+        listener.bind(("127.0.0.1", 0))
+        port = listener.getsockname()[1]
+    path = f"/v1/runs/{world.run_id}"
+
+    def snapshot(client):
+        responses = {}
+        for suffix in ("", "/publication", "/result", "/event-history"):
+            response = client.get(path + suffix)
+            assert response.status_code == (
+                404 if suffix == "/result" and stage != "SUCCEEDED" else 200
+            ), response.text
+            responses[suffix] = response.json()
+        with world.database.transaction() as session:
+            notices = session.scalars(
+                select(OutboxEvent).where(
+                    OutboxEvent.run_id == world.run_id, OutboxEvent.kind == "SLACK_RUN_RESULT"
+                )
+            )
+            responses["notification_ids"] = [row.id for row in notices]
+        return responses
+
+    process = start_control_plane(port)
+    old_pid = process.pid
+    try:
+        with httpx.Client(
+            base_url=f"http://127.0.0.1:{port}",
+            headers={"Authorization": f"Bearer {world.user_token}"},
+        ) as client:
+            before = snapshot(client)
+            assert stage in {before[""]["status"], before[""]["phase"]}
+            (saved,) = before["/publication"]["operations"]
+            assert saved["operation_key"] == operation["operation_key"]
+            if stage == "WAIT_CI":
+                assert before[""]["wait_context"]["deadline_at"] > clock()
+            if stage == "PUBLISH_UNKNOWN":
+                assert saved["next_reconcile_at"] == clock() + 1
+            if stage == "BLOCKED":
+                assert saved["reason"] == "PUBLISH_UNKNOWN" and saved["required_action"]
+            if stage in {"WAIT_CI", "SUCCEEDED"}:
+                assert before["/publication"]["pull_request"]["external_id"] == "456"
+            assert len(before["notification_ids"]) == (stage in {"SUCCEEDED", "BLOCKED"})
+
+            process.kill()
+            process.communicate(timeout=5)
+            assert process.returncode == -9
+            process = start_control_plane(port)
+            assert process.pid != old_pid
+            assert snapshot(client) == before
+
+            replay = client.post(
+                f"/v1/publisher/operations/{operation['operation_id']}/reports",
+                json=report_body,
+                headers={
+                    "Authorization": f"Bearer {pub.secret}",
+                    "Idempotency-Key": report_key,
+                },
+            )
+            assert replay.status_code == 200, replay.text
+            assert replay.json() == original.json()
+            assert snapshot(client) == before
+        evidence(
+            "Run, publication, deadlines, result and notification IDs survive SIGKILL and replay",
+            before,
+            run_id=world.run_id,
+            stage=stage,
+            stopped_pid=old_pid,
+            restarted_pid=process.pid,
+            publisher_report_key=report_key,
+        )
+    finally:
+        if process.poll() is None:
+            process.terminate()
+            process.communicate(timeout=10)
 
 
 @pytest.mark.ac("SF-19-AC03", "SF-19-AC04", "SF-19-AC06")
