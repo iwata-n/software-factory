@@ -816,3 +816,20 @@ GitHubの既定ブランチが `codex/sf01-07-acceptance` であることを確�
 Webhook成功の初回試験（[PR #18](https://github.com/iwata-n/software-factory/pull/18)）は配送0件でポーリングによる確定だったため、Webhook成功件数から除いた。一時Webhookは削除を確認した。条件別の自動試験38件は同じ入力digestで成功し、AC01〜05の試験結果を台帳に保存した。
 
 SF-19の公開直後の復元では、[PR #21](https://github.com/iwata-n/software-factory/pull/21) を読み取り4件で再照合した。対象PRは復元前後とも1件、再公開の送信は0件。旧Publisher資格情報は401、照合前の停止解除は409だった。各Runのローカル証拠は実行チェックアウトの `.local/evaluation/github-ci-and-restore-7c273d6.json` とリンク先の個別記録に保存した。
+
+#### 隔離Codexと最新の実環境証拠
+
+公開CI候補 `a643b338f4b8d852e5834473cf983215b92de121+inputs-1f56efb7b475979c` で、同一の評価用baseに対する4件を実施した。GitHub APIからDraft PRのheadとActionsジョブのhead・結論を再取得して、製品が記録した結果と照合した。
+
+| SF-18-AC06の経路 | 必須CI成功・検証済みDraft PR | 必須CI失敗・修正待ち |
+|---|---|---|
+| ポーリング | [PR #40](https://github.com/iwata-n/software-factory/pull/40)、[対象チェック](https://github.com/iwata-n/software-factory/actions/runs/41624942120/job/125879810769) | [PR #38](https://github.com/iwata-n/software-factory/pull/38)、[対象チェック](https://github.com/iwata-n/software-factory/actions/runs/41624780481/job/125879274146) |
+| 署名付きWebhook | [PR #39](https://github.com/iwata-n/software-factory/pull/39)、[対象チェック](https://github.com/iwata-n/software-factory/actions/runs/41624842882/job/125879484198) | [PR #41](https://github.com/iwata-n/software-factory/pull/41)、[対象チェック](https://github.com/iwata-n/software-factory/actions/runs/41625083253/job/125880283744) |
+
+Webhookの2件は受信記録と `GITHUB_CI_RECONCILED.trigger=WEBHOOK` を照合した。失敗の2件は `REPAIR` へ進み、成功レシートと成功通知の件数はともに0件。公開検証チェックアウトの `.local/verification/github-ci-a643b33/sf18-ac06.json` に証拠のSHA-256を保存した。
+
+同じ公開候補で、暗号化バックアップ復元後に[既存Draft PR #37](https://github.com/iwata-n/software-factory/pull/37)を読み取り4回で再照合した。旧資格情報401、照合前の停止解除409、PR件数は復元前後とも1件。規模演習では100 Tasks・100 Runs・30 Candidates・1,000 Artifacts（1 GiB）を照合し、8回のバックアップ取得後に7世代を保持した。RPOは3.730秒、RTOは7.505秒。実際の24時間間隔と別担当者の演習は未検証。
+
+実Codexの固定3評価は隔離版 `9d9837c` で[PR #31](https://github.com/iwata-n/software-factory/pull/31)、[PR #32](https://github.com/iwata-n/software-factory/pull/32)、[PR #33](https://github.com/iwata-n/software-factory/pull/33)まで到達した。3件の費用推計は合計218,944 microUSD、修正ラウンドと人手編集は各0件。Slack通知は3件とも `PENDING`。独立監視を追加した `a911fc3` では[PR #35](https://github.com/iwata-n/software-factory/pull/35)の実CI確定後に最終Run履歴を保存し、合成タスクと模擬Control Planeを用いた実Codexの通信断停止を0.885秒で確認した。別の実Docker試験でWorkerの強制終了後に、SIGTERMを無視する合成コンテナと専用ネットワーク、一時認証ファイルが約5.7秒で回収された。
+
+SF-23は15件のAPI境界試験が成功した。Chromeの375・390・1365pxで実行待ち・取消済みのカードと詳細を表示し、閲覧者・運用者の操作制限と管理者による緊急停止・解除の監査を照合した。成功・失敗・外部待ち・公開結果不明の詳細は別途照合する。SF-22の実Jira専用欄の取込みと実Slack Bot配送は未検証。
