@@ -62,6 +62,8 @@ uv run python scripts/create_demo.py --workspace-id '<bootstrapのworkspace_id>'
 
 通常のWorkerと実GitHubに公開する評価は `execution_mode=isolated_linux` を必須にします。管理者は固定されたLinux用CodexバイナリのSHA-256とCLI版をmanifestへ設定し、`isolation.image_digest` にローカルRunnerの固定digest、`isolation.allowed_hosts` に必要なモデル接続先の完全修飾ホスト名を指定します。Workerには `FACTORY_CODEX_BINARY`、`FACTORY_CODEX_MANIFEST`、所有者のみが読める既存認証ファイルの `FACTORY_CODEX_AUTH_FILE` を設定します。公開を伴わないローカル評価では、評価ハーネスがループバック上の使い切りWorkerにホスト版manifestを明示的に許可します。
 
+隔離Runnerで内部ツールの呼び出しも記録する場合は、同じCLI配布物の `codex-code-mode-host` を `FACTORY_CODEX_BINARY` と同じディレクトリに置き、manifestにそのSHA-256を `code_mode_host_sha256` として指定します。この設定ではApp Serverを使い、TaskSpecの条件を読み取るツールだけに応答します。利用量台帳には呼び出しIDとツール名を保存し、トークン料金はターン合計から計算します。
+
 Project Policyは `agent_adapter=codex_cli`、`allow_external_model=true`、`agent_configuration.engine_manifest_hash` にmanifestの正規化hash、`pricing_manifest` に[予算用推計設定](config/codex_pricing.json)を指定します。Model Workerは管理者が `--managed --usage-authority --adapter codex_cli --kinds PLAN IMPLEMENT REPAIR` で登録し、管理対象pipeline Workerは同じadapterの `ASSEMBLE_CANDIDATE VERIFY REVIEW` を担当します。
 
 Codexは空の一時作業領域で、shell・apps・plugins・browser・画像・sub-agent・hooksを無効にして非対話実行します。Repositoryは許可されたUTF-8ソースのデータとしてだけ渡し、hostへcheckout・実行しません。CP／Worker／GitHub／APIキーの環境変数をCodexプロセスへ渡しません。認証はこの信頼されたCLIクライアントだけが利用します。モデルが返した変更は許可path・保護path・採用Planと照合してpatch化し、適用・実行・PASSの判断は管理対象の隔離Assembler／Verifier／Gateが担当します。OSによる全Sandbox保証の受け入れはSF-21に残ります。
