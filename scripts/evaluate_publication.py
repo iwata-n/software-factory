@@ -235,6 +235,76 @@ def verify_live_ci(
     print(json.dumps({"run_id": run_id, "pr": draft["url"], "ci": check["url"]}), flush=True)
 
 
+def verify_live_pr_drift(user, run_id, output, identity, restart_control_plane):
+    path = f"/v1/runs/{run_id}/result"
+    original = user.get(path).raise_for_status().json()
+    draft = original["draft_pr"]
+    head_ref = f"codex/factory/{run_id}"
+    assert draft["head_ref"] == head_ref
+    assert draft["base_ref"].startswith("codex/factory-evaluation/")
+
+    def mutate(method, resource, body):
+        return json.loads(
+            subprocess.check_output(
+                ["gh", "api", "--method", method, f"repos/{REPOSITORY}/{resource}", "--input", "-"],
+                input=json.dumps(body).encode(),
+                timeout=25,
+            )
+        )
+
+    commit = github(f"git/commits/{draft['head_sha']}")
+    new_head = mutate(
+        "POST",
+        "git/commits",
+        {
+            "message": "Synthetic operator follow-up after Factory verification",
+            "tree": commit["tree"]["sha"],
+            "parents": [draft["head_sha"]],
+        },
+    )["sha"]
+    assert new_head != draft["head_sha"]
+    mutate("PATCH", f"git/refs/heads/{head_ref}", {"sha": new_head, "force": False})
+    deadline = time.monotonic() + 240
+    while time.monotonic() < deadline:
+        moved = user.get(path + "/current-pr").raise_for_status().json()
+        runs = github(f"actions/runs?head_sha={new_head}&event=pull_request")["workflow_runs"]
+        current_ci = next(
+            (
+                run
+                for run in runs
+                if run["path"] == EVALUATION_WORKFLOW and run["status"] == "completed"
+            ),
+            None,
+        )
+        if moved.get("head_sha") == new_head and current_ci:
+            break
+        time.sleep(3)
+    else:
+        raise RuntimeError("GitHub did not expose the changed head and completed CI")
+    assert not moved["target_matches"] and current_ci["head_sha"] == new_head
+    assert user.get(path).raise_for_status().json() == original
+    closed = mutate("PATCH", f"pulls/{draft['number']}", {"state": "closed"})
+    assert closed["state"] == "closed" and not closed["merged"]
+    restart_control_plane()
+    current = user.get(path + "/current-pr").raise_for_status().json()
+    assert current["state"] == "CLOSED" and not current["target_matches"]
+    assert current["head_sha"] == new_head
+    assert user.get(path).raise_for_status().json() == original
+    report = {
+        "revision": identity["revision"],
+        "run_id": run_id,
+        "pr_url": draft["url"],
+        "historical_head": draft["head_sha"],
+        "current_head": new_head,
+        "current_ci": {"url": current_ci["html_url"], "conclusion": current_ci["conclusion"]},
+        "current_pr": current,
+        "historical_result_unchanged": True,
+        "merged": closed["merged"],
+    }
+    (output / "current-pr-drift.json").write_text(json.dumps(report, indent=2) + "\n")
+    print(json.dumps(report), flush=True)
+
+
 def verify_live_ci_failure(user, run, publication, state, output, identity, restart_control_plane):
     run_id = run["run_id"]
     candidate_id = run["current_candidate_id"]
@@ -580,12 +650,15 @@ def main():
     parser.add_argument("--fixture-base-sha")
     parser.add_argument("--restore-publication", action="store_true")
     parser.add_argument("--restart-publisher", action="store_true")
+    parser.add_argument("--drift-current-pr", action="store_true")
     parser.add_argument("--expect-ci-failure", action="store_true")
     parser.add_argument("--live-webhook", action="store_true")
     args = parser.parse_args()
     live_ci = args.actions_workflow_id is not None
     recovery = args.restore_publication or args.restart_publisher
-    if (recovery or args.expect_ci_failure or args.live_webhook) and not live_ci:
+    if (
+        recovery or args.expect_ci_failure or args.live_webhook or args.drift_current_pr
+    ) and not live_ci:
         parser.error("restore and failure rehearsals require the fixed Actions evaluation profile")
     if recovery and (
         args.expect_ci_failure
@@ -593,6 +666,8 @@ def main():
         or (args.restore_publication and args.restart_publisher)
     ):
         parser.error("select one rehearsal at a time")
+    if args.drift_current_pr and (recovery or args.expect_ci_failure or args.live_webhook):
+        parser.error("PR drift rehearsal requires the successful polling profile")
     if live_ci != bool(args.fixture_base_sha):
         parser.error("--actions-workflow-id and --fixture-base-sha must be specified together")
     if live_ci and (
@@ -996,6 +1071,8 @@ def main():
                 assert any(row.event != "ping" for row in deliveries) == args.live_webhook
                 assert triggers and triggers[-1].body.get("trigger") == expected_trigger
                 (output / "ci-trigger.json").write_text(json.dumps(proof, indent=2) + "\n")
+                if args.drift_current_pr:
+                    verify_live_pr_drift(user, run_id, output, identity, restart_control_plane)
                 return
             first_publication = publication
             database = Database()
