@@ -125,13 +125,13 @@ class CIPoller:
         context = run.wait_context or {}
         if not context.get("quality_gate") or not context["required_ci"]:
             return None, None
-        if run.current_candidate_id != context["target"]["candidate_id"]:
-            transition(session, run, "BLOCKED", "PUBLICATION_GATE_STALE")
-            return None, None
         if not self.service.repository_allowed(session, run):
             return None, None
         repo = owned(session, Repository, run.repository_id, workspace_id)
         if not self.matches_repository(repo, config):
+            return None, None
+        if run.current_candidate_id != context["target"]["candidate_id"]:
+            transition(session, run, "BLOCKED", "PUBLICATION_GATE_STALE")
             return None, None
         return run, context
 
