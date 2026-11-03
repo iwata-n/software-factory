@@ -76,3 +76,26 @@ def test_mixed_dns_answers_fail_closed(monkeypatch, private):
     )
     with pytest.raises(ValueError, match="non-public"):
         model_egress.public_addresses("model.example")
+
+
+def test_model_network_cleans_up_in_reverse_order_when_caller_fails(monkeypatch):
+    from subprocess import CompletedProcess
+
+    from software_factory.codex_container import model_network
+    from software_factory.sandbox import DockerRunner
+
+    calls = []
+
+    def docker(*args, **kwargs):
+        calls.append(args)
+        return CompletedProcess(args, 0, b"", b"")
+
+    monkeypatch.setattr(DockerRunner, "docker", staticmethod(docker))
+    with pytest.raises(RuntimeError, match="injected"):
+        with model_network("sha256:" + "a" * 64, ["chatgpt.com"]) as (network, proxy_url):
+            assert proxy_url == "http://model-gateway:8080"
+            assert calls[0] == ("network", "create", "--internal", network)
+            raise RuntimeError("injected")
+    assert calls[-3] == ("rm", "--force", calls[2][calls[2].index("--name") + 1])
+    assert calls[-2] == ("network", "rm", calls[1][-1])
+    assert calls[-1] == ("network", "rm", network)
