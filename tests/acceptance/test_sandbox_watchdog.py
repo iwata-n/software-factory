@@ -235,7 +235,7 @@ def test_admission_rejects_before_create(remaining, bad_image, code, evidence):
         evidence("Rejected before container creation", trace, remaining_seconds=remaining)
 
 
-@pytest.mark.ac("SF-21-AC04")
+@pytest.mark.ac("SF-21-AC03", "SF-21-AC04")
 def test_live_isolation_and_limits(tmp_path, monkeypatch, evidence):
     host_canary = tmp_path / "secret"
     host_canary.write_text("host-only")
@@ -331,6 +331,7 @@ raise SystemExit(72)
             "The kernel rejects writes and forks past the fixed quota",
             {
                 "limits": metrics["limits"],
+                "direct_public_private_metadata_routes": metrics["network"],
                 "work_bytes_before_enospc": metrics["work_bytes"],
                 "peak_pids_before_eagain": metrics["peak_pids"],
                 "exit_code": event(trace_file, "exited")["exit_code"],

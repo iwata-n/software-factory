@@ -196,7 +196,7 @@ def test_adapter_classifies_cli_process_failure(
             engine.cancel()
 
 
-@pytest.mark.ac("SF-20-AC05", "SF-21-AC01", "SF-21-AC06")
+@pytest.mark.ac("SF-20-AC05", "SF-21-AC01", "SF-21-AC03", "SF-21-AC06")
 def test_project_model_policy_and_untrusted_repository_on_real_runner(
     job, cli, tmp_path, monkeypatch, evidence
 ):
@@ -250,6 +250,16 @@ except OSError as error:
     assert error.errno == errno.EROFS
 else:
     raise AssertionError("root filesystem was writable")
+for address in ("1.1.1.1", "10.0.0.1", "169.254.169.254"):
+    with socket.socket() as connection:
+        connection.settimeout(0.5)
+        assert connection.connect_ex((address, 443)) == errno.ENETUNREACH
+try:
+    socket.getaddrinfo("chatgpt.com", 443)
+except socket.gaierror:
+    pass
+else:
+    raise AssertionError("isolated agent could resolve public DNS directly")
 with socket.create_connection(("model-gateway", 8080), timeout=3) as proxy:
     proxy.sendall({request!r})
     assert proxy.makefile("rb").readline().split()[1] == b"403"
@@ -306,6 +316,8 @@ sys.stdout.write({output!r})
             "read_only_root": True,
             "isolated_pid_namespace": True,
             "metadata_connect_status": 403,
+            "direct_public_private_metadata_routes": "ENETUNREACH",
+            "direct_external_dns": "DENIED",
             "temporary_auth_directory_removed": True,
         },
         image_digest=image,

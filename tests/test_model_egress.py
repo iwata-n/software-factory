@@ -7,6 +7,7 @@ import pytest
 from software_factory import model_egress
 
 
+@pytest.mark.ac("SF-21-AC03")
 def test_connect_allows_only_the_configured_host_and_tls_port(monkeypatch):
     requests = []
 
@@ -76,6 +77,31 @@ def test_mixed_dns_answers_fail_closed(monkeypatch, private):
     )
     with pytest.raises(ValueError, match="non-public"):
         model_egress.public_addresses("model.example")
+
+
+@pytest.mark.ac("SF-21-AC03")
+def test_model_dial_reuses_checked_sockaddr_without_second_dns_lookup(monkeypatch):
+    resolutions, connections = [], []
+    address = ("93.184.216.34", 443)
+
+    def resolve(host, *args, **kwargs):
+        resolutions.append(host)
+        if len(resolutions) > 1:
+            pytest.fail("a second DNS lookup could change the destination")
+        return [(socket.AF_INET, socket.SOCK_STREAM, socket.IPPROTO_TCP, "", address)]
+
+    class Upstream:
+        def settimeout(self, seconds):
+            assert seconds == 5
+
+        def connect(self, endpoint):
+            connections.append(endpoint)
+
+    upstream = Upstream()
+    monkeypatch.setattr(model_egress.socket, "getaddrinfo", resolve)
+    monkeypatch.setattr(model_egress.socket, "socket", lambda *args: upstream)
+    assert model_egress.dial("model.example") is upstream
+    assert resolutions == ["model.example"] and connections == [address]
 
 
 def test_model_network_cleans_up_in_reverse_order_when_caller_fails(monkeypatch):
