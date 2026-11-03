@@ -13,7 +13,20 @@ from sqlalchemy.engine import make_url
 from software_factory.api import create_app
 from software_factory.db import Database, db_now
 from software_factory.models import Enrollment, Principal, Workspace
+from software_factory.security import redact
 from software_factory.service import issue_token, token_hash
+
+
+@pytest.fixture
+def evidence(request, pytestconfig):
+    reporter = pytestconfig.pluginmanager.get_plugin("factory-acceptance-reporter")
+
+    def observe(expected, observed, **identifiers):
+        if reporter is not None:
+            records = reporter.observations.setdefault(request.node.nodeid, [])
+            records.append(redact({"expected": expected, "observed": observed, **identifiers}))
+
+    return observe
 
 
 @pytest.fixture(scope="session")

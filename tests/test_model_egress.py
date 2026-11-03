@@ -8,7 +8,7 @@ from software_factory import model_egress
 
 
 @pytest.mark.ac("SF-21-AC03")
-def test_connect_allows_only_the_configured_host_and_tls_port(monkeypatch):
+def test_connect_allows_only_the_configured_host_and_tls_port(monkeypatch, evidence):
     requests = []
 
     def client_hello(host):
@@ -61,13 +61,17 @@ def test_connect_allows_only_the_configured_host_and_tls_port(monkeypatch):
         finally:
             gateway.shutdown()
             thread.join(timeout=2)
+    evidence(
+        "Only matching TLS server name reached the permitted upstream",
+        {"dialed": requests},
+    )
 
 
 @pytest.mark.ac("SF-21-AC03")
 @pytest.mark.parametrize(
     "private", ["127.0.0.1", "169.254.169.254", "192.168.1.1", "::1", "224.0.0.1"]
 )
-def test_mixed_dns_answers_fail_closed(monkeypatch, private):
+def test_mixed_dns_answers_fail_closed(monkeypatch, private, evidence):
     monkeypatch.setattr(
         model_egress.socket,
         "getaddrinfo",
@@ -78,10 +82,14 @@ def test_mixed_dns_answers_fail_closed(monkeypatch, private):
     )
     with pytest.raises(ValueError, match="non-public"):
         model_egress.public_addresses("model.example")
+    evidence(
+        "Mixed public and private DNS answers fail closed",
+        {"rejected_address": private},
+    )
 
 
 @pytest.mark.ac("SF-21-AC03")
-def test_model_dial_reuses_checked_sockaddr_without_second_dns_lookup(monkeypatch):
+def test_model_dial_reuses_checked_sockaddr_without_second_dns_lookup(monkeypatch, evidence):
     resolutions, connections = [], []
     address = ("93.184.216.34", 443)
 
@@ -103,6 +111,10 @@ def test_model_dial_reuses_checked_sockaddr_without_second_dns_lookup(monkeypatc
     monkeypatch.setattr(model_egress.socket, "socket", lambda *args: upstream)
     assert model_egress.dial("model.example") is upstream
     assert resolutions == ["model.example"] and connections == [address]
+    evidence(
+        "The dial uses the validated socket address",
+        {"lookups": resolutions, "endpoints": connections},
+    )
 
 
 def test_model_network_cleans_up_in_reverse_order_when_caller_fails(monkeypatch):

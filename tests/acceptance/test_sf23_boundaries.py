@@ -248,7 +248,7 @@ def test_rotation_preserves_worker_slot_and_fences_old_token_at_grace(
 
 
 @pytest.mark.ac("SF-23-AC04")
-def test_unrotated_worker_token_expires_after_twenty_four_hours(world, clock):
+def test_unrotated_worker_token_expires_after_twenty_four_hours(world, clock, evidence):
     worker = world.make_worker()
     token = worker["worker_token"]
     assert worker["token_expires_at"] == clock.value + 86400
@@ -257,10 +257,14 @@ def test_unrotated_worker_token_expires_after_twenty_four_hours(world, clock):
     clock.advance(1)
     assert world.claim(token=token).status_code == 401
     assert world.post("/v1/worker/credentials/rotate", {}, token=token).status_code == 401
+    evidence(
+        "An unrotated credential expires exactly at 24 hours",
+        {"valid_before_expiry": 200, "expired_claim": 401, "expired_rotation": 401},
+    )
 
 
 @pytest.mark.ac("SF-23-AC04")
-def test_concurrent_rotation_issues_only_one_new_token(world):
+def test_concurrent_rotation_issues_only_one_new_token(world, evidence):
     barrier = Barrier(2)
 
     def rotate(_):
@@ -269,7 +273,9 @@ def test_concurrent_rotation_issues_only_one_new_token(world):
 
     with ThreadPoolExecutor(max_workers=2) as pool:
         responses = list(pool.map(rotate, range(2)))
-    assert sorted(response.status_code for response in responses) == [200, 409]
+    statuses = sorted(response.status_code for response in responses)
+    assert statuses == [200, 409]
+    evidence("Only one concurrent rotation succeeds", {"responses": statuses})
 
 
 @pytest.mark.ac("SF-23-AC04")
@@ -662,7 +668,9 @@ def test_worker_health_separates_overdue_expired_and_reported_stop(world, clock,
 
 
 @pytest.mark.ac("SF-23-AC04")
-def test_worker_recovers_rotation_after_lost_response_and_grace_expiry(world, clock, tmp_path):
+def test_worker_recovers_rotation_after_lost_response_and_grace_expiry(
+    world, clock, tmp_path, evidence
+):
     private = tmp_path / "private"
     private.mkdir(mode=0o700)
     path = private / "worker.json"
@@ -694,6 +702,11 @@ def test_worker_recovers_rotation_after_lost_response_and_grace_expiry(world, cl
         assert len(rotations) == 1
     assert world.claim(token=rotations[0]).status_code == 200
     assert path.stat().st_mode & 0o777 == 0o600
+    evidence(
+        "Lost rotation response recovers after grace using the saved idempotency key",
+        {"issued_count": len(rotations), "file_mode": oct(path.stat().st_mode & 0o777)},
+        worker_id=world.worker_id,
+    )
 
 
 @pytest.mark.ac("SF-21-AC05", "SF-23-AC02")

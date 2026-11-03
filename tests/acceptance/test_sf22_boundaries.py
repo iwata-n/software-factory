@@ -194,7 +194,9 @@ def notifications(world):
 @pytest.mark.ac("SF-22-AC04")
 @pytest.mark.parametrize("status", ["SUCCEEDED", "FAILED", "BLOCKED"])
 @pytest.mark.parametrize("history_access", [True, False])
-def test_recover_after_post_before_db_ack(world, clock, status, history_access, monkeypatch):
+def test_recover_after_post_before_db_ack(
+    world, clock, status, history_access, monkeypatch, evidence
+):
     snapshot = outbox(world, status)
     (pending,) = notifications(world)
     assert pending["state"] == "PENDING"
@@ -238,6 +240,10 @@ def test_recover_after_post_before_db_ack(world, clock, status, history_access, 
     assert delivery["attempts"] == 1
     assert delivery["message_id"] == ("1.000001" if history_access else None)
     assert len(posts) == 1 and world.run() == snapshot
+    evidence(
+        "An interrupted delivery is reconciled without repeating the provider POST",
+        {"provider_posts": len(posts), "run_status": status, "delivery": delivery},
+    )
 
 
 @pytest.mark.ac("SF-22-AC04")
