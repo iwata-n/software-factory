@@ -404,6 +404,8 @@ def verify_live_restart(output, identity, publisher, run_id, cp_url, publish):
         "journal_phase_at_crash": "STARTED",
         "states": ["IN_FLIGHT", *recovered_states],
         "operation_id": operation["operation_id"],
+        "operation_key": operation["operation_key"],
+        "base_sha": operation["target"]["candidate"]["base_sha"],
         "pull_request": observed["url"],
         "head_sha": observed["head_sha"],
         "provider_requests": reads,

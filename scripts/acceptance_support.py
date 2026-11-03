@@ -12,7 +12,7 @@ EXTERNAL_CRITERIA = {
     "SF-17-AC01": "publication-verification.json",
     "SF-17-AC02": "publication-verification.json",
     "SF-17-AC03": "publication-verification.json",
-    "SF-19-AC01": "sf19-verification.json",
+    "SF-19-AC01": "sf19-restart-verification.json",
     "SF-19-AC06": "sf19-verification.json",
 }
 
@@ -83,7 +83,13 @@ def acceptance_scenarios() -> dict[str, list[str]]:
 
 def required_criteria() -> list[str]:
     # A boundary criterion can be audited once its complete acceptance matrix is collected.
-    complete_boundary_criteria = {"SF-18-AC03", "SF-19-AC02", "SF-19-AC04", "SF-21-AC02"}
+    complete_boundary_criteria = {
+        "SF-18-AC03",
+        "SF-19-AC01",
+        "SF-19-AC02",
+        "SF-19-AC04",
+        "SF-21-AC02",
+    }
     implemented = {
         int(path.stem.removeprefix("test_sf"))
         for path in (ROOT / "tests/acceptance").glob("test_sf[0-9][0-9].py")

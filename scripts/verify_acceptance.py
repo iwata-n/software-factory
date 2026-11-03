@@ -3,6 +3,7 @@
 import argparse
 import json
 import re
+import subprocess
 import xml.etree.ElementTree as ET
 from pathlib import Path
 
@@ -31,6 +32,43 @@ def completion_status(verified):
         "pending_scenarios": missing_scenarios,
         "mvp_accepted": not (pending or missing_scenarios),
     }
+
+
+def verify_publisher_restart(report, manifest):
+    match = re.fullmatch(
+        r"https://github\.com/iwata-n/software-factory/pull/([1-9][0-9]*)",
+        report["pull_request"],
+    )
+    requests = report["provider_requests"]
+    if (
+        not match
+        or report["revision"] != manifest["revision"]
+        or report["publisher_exit_signal"] != "SIGKILL"
+        or report["journal_phase_at_crash"] != "STARTED"
+        or report["states"] != ["IN_FLIGHT", "UNKNOWN", "RECONCILING", "SUCCEEDED"]
+        or report["matching_prs_before"] != 1
+        or report["matching_prs_after"] != 1
+        or not requests
+        or any(row["method"] != "GET" or row["status_code"] != 200 for row in requests)
+    ):
+        raise ValueError("Publisher recovery evidence is incomplete or for a different revision")
+    pull = json.loads(
+        subprocess.check_output(
+            ["gh", "api", f"repos/iwata-n/software-factory/pulls/{match[1]}"], timeout=15
+        )
+    )
+    markers = set((pull["body"] or "").splitlines())
+    if (
+        pull["html_url"] != report["pull_request"]
+        or not pull["draft"]
+        or pull["merged"]
+        or pull["head"]["ref"] != f"codex/factory/{report['run_id']}"
+        or pull["head"]["sha"] != report["head_sha"]
+        or pull["base"]["sha"] != report["base_sha"]
+        or f"<!-- factory-run:{report['run_id']} -->" not in markers
+        or f"<!-- factory-operation:{report['operation_key']} -->" not in markers
+    ):
+        raise ValueError("actual GitHub Draft PR does not match the recovered publication")
 
 
 def audit(directory: Path, *, allow_ci_pending: bool = False) -> dict:
@@ -169,6 +207,18 @@ def audit(directory: Path, *, allow_ci_pending: bool = False) -> dict:
                 )
             )
             path.write_text(json.dumps(record, indent=2, ensure_ascii=False))
+    restart = directory / EXTERNAL_CRITERIA["SF-19-AC01"]
+    if restart.exists():
+        report = json.loads(restart.read_text())
+        verify_publisher_restart(report, manifest)
+        path, record = records["SF-19-AC01"]
+        record.update(
+            result="PASS",
+            external_urls=[report["pull_request"]],
+            external_verification={"filename": restart.name, "sha256": sha(restart.read_bytes())},
+            evidence_paths=list(dict.fromkeys([*record["evidence_paths"], restart.name])),
+        )
+        path.write_text(json.dumps(record, indent=2, ensure_ascii=False))
     for ac, (_, record) in records.items():
         if record["result"] != "PASS":
             if allow_ci_pending and ac in EXTERNAL_CRITERIA and record["result"] == "未検証":
