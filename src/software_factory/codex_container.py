@@ -232,6 +232,7 @@ class DockerCodexCLI(CodexCLI):
         with self._stop_lock:
             with self._lock:
                 container = self._container
+                process = self._process
             if container is not None:
                 try:
                     DockerRunner.docker("stop", "--timeout", "5", container, timeout=7)
@@ -245,7 +246,15 @@ class DockerCodexCLI(CodexCLI):
                 except (OSError, subprocess.SubprocessError):
                     raise CodexError(STOP_UNCONFIRMED, "INFRASTRUCTURE") from None
                 self._container = None
-            super().cancel()
+            if process is not None:
+                try:
+                    try:
+                        process.wait(timeout=0.5)
+                    except subprocess.TimeoutExpired:
+                        process.kill()
+                        process.wait(timeout=1)
+                except (OSError, subprocess.SubprocessError):
+                    raise CodexError(STOP_UNCONFIRMED, "INFRASTRUCTURE") from None
 
     def run(self, context, output_model, cancelled, *, timeout=None):
         if cancelled.is_set():

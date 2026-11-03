@@ -211,13 +211,18 @@ def test_candidate_cleanup_does_not_mask_unconfirmed_stop(source_bundle, runner,
             assert docker("volume", "rm", volume, timeout=7).returncode == 0
 
 
-def test_codex_isolated_manifest_executes_cli_inside_docker(runner, tmp_path, monkeypatch):
+@pytest.mark.parametrize("cancel_run", [False, True])
+def test_codex_isolated_manifest_executes_cli_inside_docker(
+    runner, tmp_path, monkeypatch, cancel_run
+):
     import json
+    import time
+    from concurrent.futures import ThreadPoolExecutor
     from threading import Event
 
     from pydantic import BaseModel
 
-    from software_factory.codex_engine import CodexCLI, file_hash
+    from software_factory.codex_engine import CodexCLI, CodexError, file_hash
 
     class Reply(BaseModel):
         value: str
@@ -252,6 +257,13 @@ for item in [
     print(json.dumps(item), flush=True)
 """
     )
+    if cancel_run:
+        binary.write_text(
+            binary.read_text().replace(
+                "assert 'isolated fixture' in sys.stdin.read()",
+                "assert 'isolated fixture' in sys.stdin.read(); __import__('time').sleep(60)",
+            )
+        )
     binary.chmod(0o555)
     auth = tmp_path / "auth.json"
     auth.write_text("{}")
@@ -268,7 +280,33 @@ for item in [
     monkeypatch.setenv("FACTORY_CODEX_AUTH_FILE", str(auth))
     monkeypatch.setenv("FACTORY_WORKER_TOKEN", "worker-canary")
     engine = CodexCLI.from_file(binary, manifest_path)
-    result = engine.run({"task": "isolated fixture"}, Reply, Event())
-    assert result.value == {"value": "ok"} and result.usage.input_tokens == 10
+    cancelled = Event()
+    if cancel_run:
+        with ThreadPoolExecutor(1) as pool:
+            pending = pool.submit(engine.run, {"task": "isolated fixture"}, Reply, cancelled)
+            try:
+                deadline = time.monotonic() + 8
+                while time.monotonic() < deadline:
+                    name = engine._container
+                    if name:
+                        inspected = runner.docker(
+                            "inspect", name, "--format", "{{.State.Running}}", timeout=2
+                        )
+                        if inspected.returncode == 0 and inspected.stdout.strip() == b"true":
+                            break
+                    if pending.done():
+                        pending.result()
+                    time.sleep(0.05)
+                else:
+                    pytest.fail("CLI container did not start")
+                cancelled.set()
+                engine.cancel()
+                with pytest.raises(CodexError, match="^CODEX_CANCELLED$"):
+                    pending.result(timeout=8)
+            finally:
+                cancelled.set()
+    else:
+        result = engine.run({"task": "isolated fixture"}, Reply, cancelled)
+        assert result.value == {"value": "ok"} and result.usage.input_tokens == 10
     assert engine._process is engine._container is None
     assert runner.docker("network", "inspect", engine._network, timeout=5).returncode != 0
