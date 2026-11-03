@@ -184,10 +184,12 @@ def parse_events(raw):
 
 
 class CodexCLI:
+    isolated = False
+
     def __init__(self, binary, manifest):
         self.binary = str(Path(binary).resolve(strict=True))
         self.manifest = EngineManifest.model_validate(manifest)
-        if self.manifest.isolation is not None:
+        if (self.manifest.isolation is not None) != self.isolated:
             raise CodexError("ISOLATED_CODEX_RUNNER_REQUIRED", "POLICY", before_launch=True)
         self.manifest_hash = digest(self.manifest.model_dump(exclude_none=True))
         self._lock = Lock()
@@ -196,7 +198,12 @@ class CodexCLI:
 
     @classmethod
     def from_file(cls, binary, manifest_path):
-        return cls(binary, json.loads(Path(manifest_path).read_text()))
+        manifest = json.loads(Path(manifest_path).read_text())
+        if cls is CodexCLI and manifest.get("execution_mode") == "isolated_linux":
+            from .codex_container import DockerCodexCLI
+
+            return DockerCodexCLI(binary, manifest, os.environ.get("FACTORY_CODEX_AUTH_FILE"))
+        return cls(binary, manifest)
 
     def environment(self):
         # Authentication belongs only to this trusted client. No CP/GitHub/API-key env forwarding.
@@ -316,8 +323,11 @@ class CodexCLI:
                             raise CodexError("CODEX_ALREADY_RUNNING", "POLICY")
                         if cancelled.is_set():
                             raise CodexError("CODEX_CANCELLED", "POLICY")
+                        command = self.argv(schema)
+                        if cancelled.is_set():
+                            raise CodexError("CODEX_CANCELLED", "POLICY", before_launch=True)
                         self._process = subprocess.Popen(
-                            self.argv(schema),
+                            command,
                             cwd=root,
                             env=self.environment(),
                             stdin=subprocess.PIPE,

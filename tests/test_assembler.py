@@ -209,3 +209,66 @@ def test_candidate_cleanup_does_not_mask_unconfirmed_stop(source_bundle, runner,
             assert docker("rm", "--force", name, timeout=7).returncode == 0
         for volume in volumes:
             assert docker("volume", "rm", volume, timeout=7).returncode == 0
+
+
+def test_codex_isolated_manifest_executes_cli_inside_docker(runner, tmp_path, monkeypatch):
+    import json
+    from threading import Event
+
+    from pydantic import BaseModel
+
+    from software_factory.codex_engine import CodexCLI, file_hash
+
+    class Reply(BaseModel):
+        value: str
+
+    binary = tmp_path / "codex"
+    binary.write_text(
+        """#!/usr/local/bin/python
+import json
+import os
+import sys
+from pathlib import Path
+if '--version' in sys.argv:
+    print('codex-cli fixture')
+    raise SystemExit(0)
+assert os.getuid() == 65532
+assert os.environ['HOME'] == '/work'
+assert os.environ['HTTPS_PROXY'] == 'http://model-gateway:8080'
+assert 'FACTORY_WORKER_TOKEN' not in os.environ
+assert Path('/work/auth.json').read_text() == '{}'
+assert Path('/opt/schema.json').is_file()
+assert 'isolated fixture' in sys.stdin.read()
+for item in [
+    {'type': 'thread.started', 'thread_id': 'fixture-thread'},
+    {'type': 'turn.started'},
+    {'type': 'item.completed', 'item': {
+        'id': '1', 'type': 'agent_message', 'text': json.dumps({'value': 'ok'}),
+    }},
+    {'type': 'turn.completed', 'usage': {
+        'input_tokens': 10, 'cached_input_tokens': 0, 'output_tokens': 3,
+    }},
+]:
+    print(json.dumps(item), flush=True)
+"""
+    )
+    binary.chmod(0o555)
+    auth = tmp_path / "auth.json"
+    auth.write_text("{}")
+    auth.chmod(0o600)
+    manifest = json.loads(open("config/codex_cli.json").read())
+    manifest.update(
+        version="fixture",
+        binary_sha256=file_hash(binary),
+        execution_mode="isolated_linux",
+        isolation={"image_digest": runner.image_digest, "allowed_hosts": ["chatgpt.com"]},
+    )
+    manifest_path = tmp_path / "manifest.json"
+    manifest_path.write_text(json.dumps(manifest))
+    monkeypatch.setenv("FACTORY_CODEX_AUTH_FILE", str(auth))
+    monkeypatch.setenv("FACTORY_WORKER_TOKEN", "worker-canary")
+    engine = CodexCLI.from_file(binary, manifest_path)
+    result = engine.run({"task": "isolated fixture"}, Reply, Event())
+    assert result.value == {"value": "ok"} and result.usage.input_tokens == 10
+    assert engine._process is engine._container is None
+    assert runner.docker("network", "inspect", engine._network, timeout=5).returncode != 0
