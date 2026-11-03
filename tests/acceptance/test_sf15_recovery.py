@@ -388,7 +388,14 @@ def test_migration_preserves_actual_and_reserved_or_provisional_balances(world, 
         assert money["spent_microusd"] == (25000 if state == "active" else 100000)
         assert money["reserved_microusd"] == (100000 if state == "active" else 0)
         after = dump(old)
-        for name in ("tasks", "task_spec_versions", "job_attempts"):
+        tasks = {row["id"]: dict(row) for row in after["tasks"]}
+        assert len(tasks) == len(before["tasks"])
+        for row in before["tasks"]:
+            migrated = tasks[row["id"]]
+            retention_touched_at = migrated.pop("retention_touched_at")
+            assert retention_touched_at >= min(item["created_at"] for item in original["runs"])
+            assert migrated == row
+        for name in ("task_spec_versions", "job_attempts"):
             assert after[name] == before[name]
         client = TestClient(create_app(old))
         if state == "expired":
