@@ -35,6 +35,7 @@ class Supervisor:
         self.adapter = adapter
         self.heartbeat_interval = heartbeat_interval
         self._pending_usage = {}
+        self._quarantined = False
 
     def _queue_usage(self, attempt_id, result):
         if result is None:
@@ -68,6 +69,8 @@ class Supervisor:
                     break
 
     def run_once(self, *, wait_seconds: int = 0) -> dict | None:
+        if self._quarantined:
+            raise RuntimeError("Worker quarantined after an unconfirmed stop")
         # Late financial receipts have their own authority and do not renew execution rights.
         self._flush_usage()
         response = self.client.post(
@@ -207,6 +210,8 @@ class Supervisor:
                     pending_heartbeat = background_heartbeat()
                 time.sleep(min(0.1, max(0, deadline - time.monotonic())))
             result = preparation_error or self.adapter.result()
+            if result.reason == "STOP_UNCONFIRMED":
+                self._quarantined = True
             if time.monotonic() >= deadline:
                 if not started:
                     self.adapter.cancel()
@@ -325,8 +330,11 @@ class Supervisor:
                 # Capture a completed result before cancel() can replace it.
                 result = self.adapter.result()
                 self.adapter.cancel()
+                stopped = self.adapter.result()
+                if stopped and stopped.reason == "STOP_UNCONFIRMED":
+                    self._quarantined = True
                 if not usage_queued:
-                    self._queue_usage(job["attempt_id"], result or self.adapter.result())
+                    self._queue_usage(job["attempt_id"], result or stopped)
             raise
 
 

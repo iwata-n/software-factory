@@ -266,3 +266,34 @@ def test_failed_heartbeat_cancels_running_agent_before_replaying_usage():
         assert agent.result().outcome == "CANCELLED"
         assert supervisor.run_once() is None
     assert paths == ["claims", "heartbeat", "heartbeat", "usage", "claims"]
+
+
+def test_unconfirmed_stop_quarantines_supervisor_even_if_report_is_lost():
+    calls = []
+
+    class UnconfirmedAgent(FakeAgent):
+        def start(self, job):
+            self._result = AgentResult(
+                "FAILED", {}, category="INFRASTRUCTURE", reason="STOP_UNCONFIRMED"
+            )
+
+    def handle(request):
+        endpoint = request.url.path.rsplit("/", 1)[-1]
+        calls.append(endpoint)
+        if endpoint == "claims":
+            return httpx.Response(200, json=assignment())
+        if endpoint == "heartbeat":
+            return httpx.Response(
+                200, json={"cancel_requested": False, "lease_expires_in_seconds": 90}
+            )
+        assert endpoint == "fail"
+        assert json.loads(request.content)["reason"] == "STOP_UNCONFIRMED"
+        raise httpx.ReadError("lost failure report", request=request)
+
+    with httpx.Client(base_url="http://localhost", transport=httpx.MockTransport(handle)) as client:
+        supervisor = Supervisor(client, UnconfirmedAgent())
+        with pytest.raises(httpx.ReadError):
+            supervisor.run_once()
+        with pytest.raises(RuntimeError, match="quarantined"):
+            supervisor.run_once()
+    assert calls == ["claims", "heartbeat", "fail", "fail", "fail"]

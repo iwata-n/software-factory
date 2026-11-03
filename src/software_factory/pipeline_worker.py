@@ -8,7 +8,7 @@ from threading import Event, Lock, Thread
 import httpx
 
 from .adapters import AgentExecutionError, AgentResult, Capabilities, ProducedArtifact
-from .sandbox import DockerRunner, RunnerError
+from .sandbox import STOP_UNCONFIRMED, DockerRunner, RunnerError
 
 
 class PipelineAdapter:
@@ -154,7 +154,7 @@ class PipelineAdapter:
                 "FAILED", {}, category="INFRASTRUCTURE", reason="MANAGED_STAGE_CRASHED"
             )
         finally:
-            if cancelled.is_set():
+            if cancelled.is_set() and result_value.reason != STOP_UNCONFIRMED:
                 result_value = AgentResult(
                     "CANCELLED",
                     {},
@@ -320,6 +320,8 @@ class PipelineAdapter:
         with self._lock:
             if generation == self._generation:
                 result = self._result
+                if result and result.reason == STOP_UNCONFIRMED:
+                    return
                 self._result = AgentResult(
                     "CANCELLED",
                     {},
