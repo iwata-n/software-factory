@@ -1,4 +1,8 @@
 import json
+import os
+import signal
+import subprocess
+import sys
 from concurrent.futures import ThreadPoolExecutor
 from copy import deepcopy
 
@@ -71,7 +75,7 @@ def receive(jira, body, token=JIRA_TOKEN):
 
 
 @pytest.mark.ac("SF-22-AC01", "SF-22-AC02")
-def test_jira_uses_core_spec_and_keeps_active_run_fixed(world, jira):
+def test_jira_uses_core_spec_and_keeps_active_run_fixed(world, jira, evidence):
     assert world.client.post(JIRA_PATH, json={}).status_code == 404
     manual_run = world.run()
     first = input_for(world, 2, json.dumps(example_spec(world.repository_id)))
@@ -106,10 +110,23 @@ def test_jira_uses_core_spec_and_keeps_active_run_fixed(world, jira):
         assert session.scalar(select(func.count()).select_from(Run)) == 2
         assert session.scalar(select(func.count()).select_from(SpecVersion)) == 3
         assert session.scalar(select(func.count()).select_from(JiraIssueRevision)) == 4
+    evidence(
+        "Jira and manual TaskSpec produce the same effective Run snapshot",
+        {
+            "task_spec_hash": imported_run["snapshot"]["task_spec_hash"],
+            "duplicate_deliveries": len(replies),
+            "tasks": 2,
+            "runs": 2,
+            "spec_versions": 3,
+            "issue_revisions": 4,
+            "active_snapshot_unchanged": True,
+        },
+        issue_url=accepted["issue_url"],
+    )
 
 
 @pytest.mark.ac("SF-22-AC03")
-def test_jira_mapping_revocation_and_quarantine(world, jira, caplog):
+def test_jira_mapping_revocation_and_quarantine(world, jira, caplog, evidence):
     body = input_for(world, 1)
     assert receive(jira, body, world.user_token).status_code == 401
     assert receive(jira, {**body, "project_key": "OTHER"}).status_code == 403
@@ -128,6 +145,18 @@ def test_jira_mapping_revocation_and_quarantine(world, jira, caplog):
             assert canary not in str(session.scalars(select(column).select_from(model)).all())
         session.get(Principal, jira[1]["principal_id"]).active = False
     assert receive(jira, input_for(world, 2)).status_code == 403
+    evidence(
+        "Jira mapping enforces identity, tenant and revocation and quarantines unsafe content",
+        {
+            "invalid_relay": 401,
+            "foreign_project": 403,
+            "foreign_workspace": 422,
+            "foreign_site": 403,
+            "unsafe_input_state": result.json()["state"],
+            "revoked_principal": 403,
+            "canary_absent_from_logs_and_persisted_payloads": True,
+        },
+    )
 
 
 def outbox(world, status):
@@ -211,11 +240,98 @@ def test_recover_after_post_before_db_ack(world, clock, status, history_access, 
     assert len(posts) == 1 and world.run() == snapshot
 
 
+@pytest.mark.ac("SF-22-AC04")
+@pytest.mark.parametrize("crash_point", ["outbox_saved", "provider_acknowledged"])
+def test_slack_dispatcher_sigkill_preserves_one_delivery(
+    world, clock, tmp_path, evidence, crash_point
+):
+    original = outbox(world, "SUCCEEDED")
+    (pending,) = notifications(world)
+    journal = tmp_path / "provider.json"
+    script = """
+import json, os, signal, sys
+from pathlib import Path
+import httpx
+from sqlalchemy import select
+from software_factory.db import Database
+from software_factory.models import OutboxEvent
+from software_factory.slack_delivery import SlackClient, SlackDispatcher
+point, path, workspace, channel, key = sys.argv[1:]
+db = Database()
+with db.transaction() as session:
+    assert session.scalar(select(OutboxEvent.id).where(OutboxEvent.id == key)) == key
+if point == "outbox_saved":
+    os.kill(os.getpid(), signal.SIGKILL)
+def receive(request):
+    assert request.method == "POST"
+    Path(path).write_text(request.content.decode())
+    return httpx.Response(200, json={"ok": True, "channel": channel, "ts": "1.000001"})
+with httpx.Client(transport=httpx.MockTransport(receive)) as client:
+    slack = SlackClient(client, "fixture")
+    post = slack.post
+    def kill_after_ack(*args):
+        assert post(*args).state == "SENT"
+        os.kill(os.getpid(), signal.SIGKILL)
+    slack.post = kill_after_ack
+    SlackDispatcher(db, slack, workspace, channel).deliver_one()
+"""
+    stopped = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            script,
+            crash_point,
+            str(journal),
+            world.workspace_id,
+            CHANNEL,
+            pending["delivery_key"],
+        ],
+        env=os.environ
+        | {
+            "FACTORY_DATABASE_URL": world.database.engine.url.render_as_string(hide_password=False),
+        },
+        capture_output=True,
+        timeout=15,
+        check=False,
+    )
+    assert stopped.returncode == -signal.SIGKILL, stopped.stderr.decode()
+    methods = []
+
+    def receive(request):
+        methods.append(request.method)
+        if request.method == "POST":
+            assert not journal.exists()
+            journal.write_text(request.content.decode())
+            return httpx.Response(200, json={"ok": True, "channel": CHANNEL, "ts": "1.000001"})
+        message = json.loads(journal.read_text())
+        return httpx.Response(
+            200,
+            json={"ok": True, "messages": [{"metadata": message["metadata"], "ts": "1.000001"}]},
+        )
+
+    recovery = dispatcher(world, receive)
+    if crash_point == "provider_acknowledged":
+        assert journal.exists()
+        assert recovery.deliver_one() is None
+        clock.advance(CLAIM_SECONDS + 2)
+    assert recovery.deliver_one() == "SENT"
+    assert recovery.deliver_one() is None
+    assert methods == (["GET"] if crash_point == "provider_acknowledged" else ["POST"])
+    (final,) = notifications(world)
+    assert final["delivery_key"] == pending["delivery_key"]
+    assert final["attempts"] == 1 and final["message_id"] == "1.000001"
+    assert world.run() == original
+    evidence(
+        "Dispatcher SIGKILL preserves the Outbox key and one provider message",
+        {"crash_point": crash_point, "recovery_methods": methods, "delivery": final},
+    )
+
+
 @pytest.mark.ac("SF-22-AC05")
 @pytest.mark.parametrize("auth_error", [True, False])
 @pytest.mark.parametrize("retry_after", [0, 7])
 def test_slack_delivery_backoff_and_terminal_run_are_independent(
-    world, clock, auth_error, retry_after
+    world, clock, auth_error, retry_after, evidence
 ):
     snapshot = outbox(world, "SUCCEEDED")
     keys = []
@@ -246,10 +362,20 @@ def test_slack_delivery_backoff_and_terminal_run_are_independent(
     assert delivery["reason"] == ("SLACK_REJECTED" if auth_error else "RETRIES_EXHAUSTED")
     assert delivery["attempts"] == len(keys) == (1 if auth_error else 3)
     assert len(set(keys)) == 1 and world.run() == snapshot
+    evidence(
+        "Bounded retry or immediate rejection leaves the Run unchanged",
+        {
+            "retry_wait_seconds": [] if auth_error else [max(2, retry_after), 4],
+            "attempts": delivery["attempts"],
+            "reason": delivery["reason"],
+            "run_unchanged": True,
+        },
+        delivery_key=delivery["delivery_key"],
+    )
 
 
 @pytest.mark.ac("SF-22-AC04", "SF-22-AC05")
-def test_ambiguous_5xx_is_reconciled_and_never_reposted(world):
+def test_ambiguous_5xx_is_reconciled_and_never_reposted(world, evidence):
     outbox(world, "SUCCEEDED")
     methods = []
 
@@ -266,10 +392,14 @@ def test_ambiguous_5xx_is_reconciled_and_never_reposted(world):
     (delivery,) = notifications(world)
     assert delivery["reason"] == "AMBIGUOUS_RESPONSE"
     assert delivery["attempts"] == 1
+    evidence(
+        "An ambiguous provider response is read back once and remains UNKNOWN",
+        {"provider_methods": methods, "delivery": delivery},
+    )
 
 
 @pytest.mark.ac("SF-22-AC01", "SF-22-AC02")
-def test_jira_rest_relay_imports_adf_and_rejects_wrong_project(world, jira):
+def test_jira_rest_relay_imports_adf_and_rejects_wrong_project(world, jira, evidence):
     relay, settings = jira
     mapping = JiraMapping.model_validate(settings)
     spec = example_spec(world.repository_id)
@@ -328,12 +458,25 @@ def test_jira_rest_relay_imports_adf_and_rejects_wrong_project(world, jira):
     with world.database.transaction() as session:
         rows = session.scalars(select(JiraIssueRevision)).all()
         assert len(rows) == 1 and rows[0].task_id == first["task_id"]
+    evidence(
+        "The relay normalizes the ADF field, reuses the revision and rejects a foreign project",
+        {
+            "provider_methods": calls,
+            "issue_revisions": len(rows),
+            "spec_version": first["spec_version"],
+        },
+        issue_url=first["issue_url"],
+    )
 
 
 @pytest.mark.ac("SF-22-AC03")
-def test_jira_mapping_cannot_elevate_viewer(world, jira):
+def test_jira_mapping_cannot_elevate_viewer(world, jira, evidence):
     _, mapping = jira
     with world.database.transaction() as session:
         session.get(Principal, mapping["principal_id"]).user_access = "VIEWER"
     result = receive(jira, input_for(world, 1))
     assert result.status_code == 403 and result.json()["code"] == "JIRA_INTEGRATION_REVOKED"
+    evidence(
+        "A configured Jira mapping cannot elevate a Viewer",
+        {"status": result.status_code, "reason": result.json()["code"]},
+    )
