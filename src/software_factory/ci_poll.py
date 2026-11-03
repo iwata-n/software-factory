@@ -156,12 +156,14 @@ class CIPoller:
                 )
             )
             triggered = signal is not None and signal > poll.get("signal", -1)
-            if poll.get("phase") == run.phase and now < poll.get("next_at", 0) and not triggered:
+            waiting_for_poll = poll.get("phase") == run.phase and now < poll.get("next_at", 0)
+            if waiting_for_poll and not triggered:
                 return None
             run.wait_context = context | {
                 "github_ci_poll": {
                     "claim": str(uuid4()),
                     "phase": run.phase,
+                    "trigger": "WEBHOOK" if waiting_for_poll and triggered else "POLL",
                     "revision": run.state_revision,
                     "next_at": now + POLL_SECONDS,
                     "signal": signal if signal is not None else -1,
@@ -200,7 +202,12 @@ class CIPoller:
                 event(session, run, "GITHUB_CI_READ_DEFERRED", {"reason": error})
                 return
             if checks != context["checks"]:
-                event(session, run, "GITHUB_CI_RECONCILED", {"check_count": len(checks)})
+                event(
+                    session,
+                    run,
+                    "GITHUB_CI_RECONCILED",
+                    {"check_count": len(checks), "trigger": claim["trigger"]},
+                )
             confirming = run.phase == "FINAL_GATE_READY"
             if confirming and not self.current_publication(session, run, context):
                 transition(session, run, "BLOCKED", "PUBLICATION_GATE_STALE")

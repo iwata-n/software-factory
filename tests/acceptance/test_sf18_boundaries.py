@@ -249,6 +249,15 @@ def test_inbox_signal_advances_poll_without_waiting_sixty_seconds(waiting, evide
     signal()
     poll()
     assert world.run()["phase"] == "FINAL_GATE_READY"
+    with world.database.transaction() as session:
+        triggers = list(
+            session.scalars(
+                select(RunEvent)
+                .where(RunEvent.run_id == world.run_id, RunEvent.kind == "GITHUB_CI_RECONCILED")
+                .order_by(RunEvent.revision)
+            )
+        )
+        assert [item.body["trigger"] for item in triggers] == ["POLL", "WEBHOOK"]
     evidence("Inbox signal triggers the same API reconciliation as a periodic poll", world.run())
 
 
