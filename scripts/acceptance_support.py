@@ -64,14 +64,18 @@ def source_manifest() -> dict:
     }
 
 
+def task_criteria() -> list[str]:
+    return re.findall(
+        r"^\| (SF-\d{2}-AC\d{2}) \|",
+        (ROOT / "docs/Implementation_Plan.md").read_text(),
+        re.M,
+    )
+
+
 def required_criteria() -> list[str]:
-    # A task enters the executed ledger only when its acceptance module exists.
-    # The implementation plan retains unimplemented/unverified tasks separately.
+    # Only tasks with complete acceptance modules enter the strict CI audit.
     implemented = {
         int(path.stem.removeprefix("test_sf"))
         for path in (ROOT / "tests/acceptance").glob("test_sf[0-9][0-9].py")
     }
-    criteria = re.findall(
-        r"^\| (SF-(\d{2})-AC\d{2}) \|", (ROOT / "docs/Implementation_Plan.md").read_text(), re.M
-    )
-    return [ac for ac, task in criteria if int(task) in implemented]
+    return [ac for ac in task_criteria() if int(ac[3:5]) in implemented]
