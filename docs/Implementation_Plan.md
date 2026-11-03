@@ -523,6 +523,14 @@ uv run ruff format --check .
 
 上記に加えC-01の既存回帰を実行し、C-05のresult JSON・環境・DB/Artifact/API・実サービス証拠を保存する。JUnitだけでは、対象コードや実GitHubとの一致を証明したことにしない。
 
+MVPの最終判定では、実CIと実サービスの証拠を対象revisionの台帳へ照合した後、次を実行する。
+
+```sh
+uv run python scripts/verify_acceptance.py ".local/acceptance/${factory_acceptance_revision}" --require-mvp
+```
+
+通常の証拠監査は対象タスクの条件を照合し、MVPに残る条件とATを `pending_criteria` と `pending_scenarios` に出力する。`--require-mvp` は残りが1件でもあれば終了コード1を返す。
+
 ## 初期実装で固定した判断
 
 - Control Planeは同期SQLAlchemyとFastAPI、DBはPostgreSQL。WorkerはAPIだけを使う別エントリーポイントとする。
