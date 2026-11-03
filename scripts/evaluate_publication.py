@@ -10,6 +10,7 @@ import difflib
 import hashlib
 import json
 import os
+import signal
 import socket
 import subprocess
 import sys
@@ -277,34 +278,65 @@ def verify_live_ci_failure(user, run, publication, state, output, identity, rest
     print(json.dumps({"run_id": run_id, "pr": draft["url"], "ci": check["url"]}), flush=True)
 
 
+def crash_publisher_before_report():
+    """Run the isolated fault-injection child with credentials supplied only on stdin."""
+    settings = json.load(sys.stdin)
+
+    class InterruptedPublisher(GitHubDraftPublisher):
+        def publish(self, inputs):
+            super().publish(inputs)
+            os.kill(os.getpid(), signal.SIGKILL)
+
+    with httpx.Client(
+        base_url=settings["cp_url"],
+        trust_env=False,
+        headers={"Authorization": f"Bearer {settings['publisher_token']}"},
+    ) as client:
+        PublisherSupervisor(
+            client,
+            InterruptedPublisher(SourcePolicy((REMOTE,)), settings["github_token"]),
+            PublicationJournal(Path(settings["journal"])),
+        ).run_once()
+    raise RuntimeError("Publisher did not reach the lost-response injection point")
+
+
 def verify_live_restore(output, identity, account, publisher, run_id, cp_url, cp_environment):
-    """Lose the provider response before CP persistence, then recover from an encrypted backup."""
-
-    class LostPublicationReport(Exception):
-        pass
-
-    def interrupt(point):
-        if point == "publisher.after_external":
-            raise LostPublicationReport
-
+    """Kill the Publisher before result persistence, then recover from an encrypted backup."""
     github_token = subprocess.check_output(
         ["gh", "auth", "token", "--hostname", "github.com"], text=True
     ).strip()
     original_token = publisher["publisher_token"]
     backend = GitHubDraftPublisher(SourcePolicy((REMOTE,)), github_token)
-    journal = PublicationJournal(output / "interrupted-publisher")
-    with httpx.Client(
-        base_url=cp_url, trust_env=False, headers={"Authorization": f"Bearer {original_token}"}
-    ) as client:
-        try:
-            PublisherSupervisor(client, backend, journal, checkpoint=interrupt).run_once()
-        except LostPublicationReport:
-            pending = journal.read()
-        else:
-            raise RuntimeError("Publisher did not reach the lost-report injection point")
-    if pending["report"]["status"] != "SUCCEEDED":
-        raise RuntimeError(f"GitHub publication failed: {pending['report'].get('reason')}")
-    pull = pending["report"]["pull_request"]
+    journal_path = output / "interrupted-publisher"
+    child = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "import sys; sys.path.insert(0, 'scripts'); "
+            "from evaluate_publication import crash_publisher_before_report; "
+            "crash_publisher_before_report()",
+        ],
+        cwd=ROOT,
+        env={
+            **{key: os.environ[key] for key in ("PATH", "HOME", "LANG") if key in os.environ},
+            "PYTHONPATH": str(ROOT / "src"),
+        },
+        input=json.dumps(
+            {
+                "cp_url": cp_url,
+                "publisher_token": original_token,
+                "github_token": github_token,
+                "journal": str(journal_path),
+            }
+        ),
+        text=True,
+        capture_output=True,
+        timeout=180,
+    )
+    if child.returncode != -signal.SIGKILL:
+        raise RuntimeError("Publisher did not terminate at the lost-response injection point")
+    pending = PublicationJournal(journal_path).read()
+    assert pending["phase"] == "STARTED" and "report" not in pending
     operation = pending["operation"]
     source = Database()
     with source.transaction() as session:
@@ -312,17 +344,18 @@ def verify_live_restore(output, identity, account, publisher, run_id, cp_url, cp
         assert stored.state == "IN_FLIGHT"
 
     def remote_matches():
+        target = operation["target"]
         params = httpx.QueryParams(
             state="all",
-            head=f"{REPOSITORY.split('/')[0]}:{pull['head_ref']}",
-            base=pull["base_ref"],
+            head=f"{REPOSITORY.split('/')[0]}:{target['head_ref']}",
+            base=target["base_ref"],
         )
-        return [
-            (item["id"], item["number"], item["head"]["sha"]) for item in github(f"pulls?{params}")
-        ]
+        return github(f"pulls?{params}")
 
-    before = remote_matches()
-    assert len(before) == 1 and before[0][1:] == (pull["number"], pull["head_sha"])
+    (pull,) = remote_matches()
+    assert pull["draft"] and not pull.get("merged")
+    assert pull["head"]["sha"] == operation["target"]["candidate"]["head_sha"]
+    before = [(pull["id"], pull["number"], pull["head"]["sha"])]
     name = "sf24_publication_" + uuid4().hex
     with source.engine.connect().execution_options(isolation_level="AUTOCOMMIT") as connection:
         connection.execute(text(f"CREATE DATABASE {name}"))
@@ -419,9 +452,9 @@ def verify_live_restore(output, identity, account, publisher, run_id, cp_url, cp
                     assert reads and all(item["method"] == "GET" for item in reads)
                     result = client.get(f"/v1/runs/{run_id}/publication").json()
                     assert result["pull_request"]["number"] == pull["number"]
-                    assert result["pull_request"]["head_sha"] == pull["head_sha"]
+                    assert result["pull_request"]["head_sha"] == pull["head"]["sha"]
                     post(client, path, action)
-                after = remote_matches()
+                after = [(p["id"], p["number"], p["head"]["sha"]) for p in remote_matches()]
                 assert after == before
             finally:
                 process.terminate()
@@ -430,8 +463,10 @@ def verify_live_restore(output, identity, account, publisher, run_id, cp_url, cp
             "evaluation": "SF24_LIVE_PUBLICATION_RESTORE",
             "revision": identity["revision"],
             "run_id": run_id,
-            "pull_request": pull["url"],
-            "head_sha": pull["head_sha"],
+            "pull_request": pull["html_url"],
+            "head_sha": pull["head"]["sha"],
+            "publisher_exit_signal": "SIGKILL",
+            "journal_phase_at_crash": pending["phase"],
             "pre_restore_operation": "IN_FLIGHT",
             "recovered_operation": recovery["state"],
             "provider_requests": reads,
