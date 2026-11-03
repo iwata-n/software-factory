@@ -832,4 +832,4 @@ Webhookの2件は受信記録と `GITHUB_CI_RECONCILED.trigger=WEBHOOK` を照�
 
 実Codexの固定3評価は隔離版 `9d9837c` で[PR #31](https://github.com/iwata-n/software-factory/pull/31)、[PR #32](https://github.com/iwata-n/software-factory/pull/32)、[PR #33](https://github.com/iwata-n/software-factory/pull/33)まで到達した。3件の費用推計は合計218,944 microUSD、修正ラウンドと人手編集は各0件。Slack通知は3件とも `PENDING`。独立監視を追加した `a911fc3` では[PR #35](https://github.com/iwata-n/software-factory/pull/35)の実CI確定後に最終Run履歴を保存し、合成タスクと模擬Control Planeを用いた実Codexの通信断停止を0.885秒で確認した。別の実Docker試験でWorkerの強制終了後に、SIGTERMを無視する合成コンテナと専用ネットワーク、一時認証ファイルが約5.7秒で回収された。
 
-SF-23は15件のAPI境界試験が成功した。Chromeの375・390・1365pxで実行待ち・取消済みのカードと詳細を表示し、閲覧者・運用者の操作制限と管理者による緊急停止・解除の監査を照合した。成功・失敗・外部待ち・公開結果不明の詳細は別途照合する。SF-22の実Jira専用欄の取込みと実Slack Bot配送は未検証。
+SF-23は15件のAPI境界試験が成功した。Chromeの375・390・1365pxで実行待ち・取消済みのカードと詳細を表示し、閲覧者・運用者の操作制限と管理者による緊急停止・解除の監査を照合した。別のChrome検証では375・1365pxで成功・失敗・CI待ち・公開結果不明の4状態を表示し、状態・段階・revision・費用をローカルAPIと照合した。状態は専用DBの合成fixture、成功時のPR/CI詳細は保存済みの実応答、公開結果不明の公開操作詳細は合成応答を使用した。SF-22の実Jira専用欄の取込みと実Slack Bot配送は未検証。
