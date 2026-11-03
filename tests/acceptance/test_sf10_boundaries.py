@@ -8,7 +8,9 @@ import pytest
 from sqlalchemy import select
 
 from software_factory.models import Attempt, Project
+from software_factory.pipeline_worker import PipelineAdapter
 from software_factory.sandbox import DockerRunner, RunnerError
+from software_factory.worker import Supervisor
 from tests.conftest import example_policy
 from tests.test_assembler import PATCH, request
 from tests.test_assembler import runner as runner
@@ -184,3 +186,66 @@ def test_protected_token_filename_preserves_its_hash_without_allowing_credential
             "rejected_status": rejected.status_code,
         },
     )
+
+
+@pytest.mark.ac("SF-21-AC05", "SF-23-AC02")
+def test_managed_lease_cancel_confirms_container_removed_before_reporting(
+    pipeline, tmp_path, monkeypatch, evidence
+):
+    class PausedRunner(DockerRunner):
+        def execute(self, request, **kwargs):
+            return super().execute(request, pause_at="patch_applied", **kwargs)
+
+    pipeline.prepare()
+    world = pipeline.world
+    monkeypatch.setenv("FACTORY_RUNNER_STATE_ROOT", str(tmp_path / "cancel-owners"))
+    runner = PausedRunner(pipeline.runner.image_digest)
+    adapter = PipelineAdapter(runner)
+    supervisor = Supervisor(pipeline.client, adapter, heartbeat_interval=0.1)
+    container = None
+    confirmed = []
+
+    def check_before_report(request):
+        if not request.url.path.endswith("/complete"):
+            return
+        assert container is not None
+        listing = runner.docker("ps", "-aq", "--filter", f"name=^/{container}$", timeout=5)
+        assert listing.returncode == 0 and not listing.stdout.strip()
+        confirmed.append(container)
+
+    pipeline.client.event_hooks["request"].append(check_before_report)
+    with ThreadPoolExecutor(1) as pool:
+        pending = pool.submit(supervisor.run_once)
+        try:
+            deadline = time.monotonic() + 10
+            while time.monotonic() < deadline:
+                with runner._lock:
+                    names = list(runner._active)
+                if names:
+                    logs = runner.docker("logs", names[0], timeout=3)
+                    if b"FACTORY_STAGE:patch_applied" in logs.stdout + logs.stderr:
+                        container = names[0]
+                        break
+                time.sleep(0.05)
+            assert container is not None
+            response = world.post(
+                f"/v1/runs/{world.run_id}/cancel",
+                {"expected_run_revision": world.run()["state_revision"], "reason": "test stop"},
+            )
+            assert response.status_code == 202
+            assert pending.result(timeout=12)["run"]["status"] == "CANCELLED"
+            assert confirmed == [container]
+            assert adapter.result().outcome == "CANCELLED"
+            workers = world.get(f"/v1/workspaces/{world.workspace_id}/workers").json()["workers"]
+            managed = next(
+                worker for worker in workers if worker["worker_id"] == pipeline.managed.worker_id
+            )
+            assert managed["stop_confirmation"] == "WORKER_REPORTED_STOP"
+            evidence(
+                "real managed assembler stops and removes container before confirming cancellation",
+                {"run": "CANCELLED", "container_removed": True, "worker": managed},
+                container_id=container,
+            )
+        finally:
+            if container and not pending.done():
+                runner.docker("rm", "--force", container, timeout=7)
