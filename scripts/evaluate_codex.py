@@ -145,17 +145,27 @@ def probe_disconnect(cp_url, secret, engine):
     """Inject a Worker-to-CP transport failure only after the real CLI has started."""
     trace = {}
     process = None
+    container = None
     adapter = CodexAdapter(engine)
     started_at = time.monotonic()
     with httpx.HTTPTransport() as network:
 
         def route(request):
-            nonlocal process
+            nonlocal process, container
             path = request.url.path
             if path.endswith("/heartbeat") and engine._process is not None:
-                process = engine._process
-                trace["disconnect_seconds"] = time.monotonic() - started_at
-                raise httpx.ConnectError("evaluation transport disconnected", request=request)
+                if engine.isolated:
+                    candidate = engine._container
+                    if candidate is not None:
+                        inspected = DockerRunner.docker(
+                            "inspect", candidate, "--format", "{{.State.Running}}", timeout=2
+                        )
+                        if inspected.returncode == 0 and inspected.stdout.strip() == b"true":
+                            container = candidate
+                if not engine.isolated or container is not None:
+                    process = engine._process
+                    trace["disconnect_seconds"] = time.monotonic() - started_at
+                    raise httpx.ConnectError("evaluation transport disconnected", request=request)
             if path.endswith(("/complete", "/fail", "/artifacts", "/events")):
                 raise AssertionError("disconnected attempt tried to submit output")
             sent_at = time.monotonic()
@@ -189,6 +199,14 @@ def probe_disconnect(cp_url, secret, engine):
         mode="injected_worker_transport_error",
         usage_observed=bool(result.usage_deliveries),
     )
+    if engine.isolated:
+        for resource, command in (
+            (container, ("inspect", container)),
+            (engine._network, ("network", "inspect", engine._network)),
+        ):
+            if resource is None or DockerRunner.docker(*command, timeout=5).returncode == 0:
+                raise RuntimeError("disconnect did not remove the isolated model resources")
+        trace["container_and_network_removed"] = True
     if trace["returned_seconds"] >= trace["confirmed_deadline_seconds"]:
         raise RuntimeError("disconnect returned control after the confirmed lease deadline")
     return trace
@@ -239,10 +257,14 @@ def main():
         "evaluation_task": profile["id"],
         "started_at": datetime.now(UTC).isoformat(),
         "implementation": identity,
-        "engine_manifest": engine.manifest.model_dump(),
+        "engine_manifest": engine.manifest.model_dump(exclude_none=True),
         "engine_manifest_hash": engine.manifest_hash,
         "runner_image_digest": image,
-        "scope": "real Codex CLI, live HTTP Workers, isolated Linux assembly and verification",
+        "scope": (
+            "isolated Linux Codex CLI, live HTTP Workers, Linux assembly and verification"
+            if engine.isolated
+            else "real Codex CLI, live HTTP Workers, isolated Linux assembly and verification"
+        ),
         "github_writes": 0,
         "notifications_sent": 0,
     }
@@ -264,6 +286,8 @@ def main():
             "DOCKER_CONFIG",
         }
     }
+    # Child services must use the same checkout as the measured implementation.
+    base_env["PYTHONPATH"] = str(ROOT / "src")
     source_port, cp_port = available_port(), available_port()
     while cp_port == source_port:
         cp_port = available_port()
@@ -539,6 +563,8 @@ def main():
                     "FACTORY_RUNNER_IMAGE_DIGEST": image,
                     "FACTORY_RUNNER_STATE_ROOT": str(output / "stage-runner"),
                 }
+                if engine.isolated:
+                    environment["FACTORY_CODEX_AUTH_FILE"] = str(engine.auth_file)
                 assert "FACTORY_DATABASE_URL" not in environment
                 process = subprocess.Popen(argv, cwd=ROOT, env=environment, stdout=log, stderr=log)
                 processes.append(process)
@@ -725,6 +751,22 @@ def main():
                 ]
                 report["github_writes"] = len(report["github_write_requests"])
                 current = state()
+                final_result = report["publication"]["result"]
+                terminal = {"run": current}
+                for name, suffix in [("graph", "graph"), ("events", "event-history")]:
+                    reply = user.get(f"/v1/runs/{run_id}/{suffix}")
+                    reply.raise_for_status()
+                    terminal[name] = reply.json()
+                if not any(
+                    event["kind"] == "VERIFIED_DRAFT_PR"
+                    and event["body"]["result_id"] == final_result["result_id"]
+                    for event in terminal["events"]["events"]
+                ):
+                    raise RuntimeError("verified result was missing from the terminal Run history")
+                for name, body in terminal.items():
+                    (output / f"terminal-{name}.json").write_text(
+                        json.dumps(body, ensure_ascii=False, indent=2)
+                    )
             report.update(
                 result="PASS",
                 candidate_id=candidate_id,

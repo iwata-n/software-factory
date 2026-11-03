@@ -46,6 +46,7 @@ def test_run_index_requires_user_and_scopes_rows_and_cursor(world):
     assert world.get("/v1/runs?limit=101").status_code == 422
 
 
+@pytest.mark.ac("SF-23-AC01")
 def test_run_index_paginates_timestamp_ties_and_matches_run_details(world):
     spec = example_spec(world.repository_id)
     spec["task"]["title"] = "Second Run"
@@ -76,6 +77,7 @@ def test_run_index_paginates_timestamp_ties_and_matches_run_details(world):
     assert {card["status"] for card in cards} == {"QUEUED", "RUNNING"}
 
 
+@pytest.mark.ac("SF-23-AC03")
 def test_event_stream_resumes_from_last_run_revision_after_restart(world):
     history = f"/v1/runs/{world.run_id}/event-history"
     path = f"/v1/runs/{world.run_id}/events?wait_seconds=0"
@@ -98,6 +100,7 @@ def test_event_stream_resumes_from_last_run_revision_after_restart(world):
     assert not sse_revisions(world.client.get(path, headers=headers))
 
 
+@pytest.mark.ac("SF-23-AC03")
 def test_event_stream_scopes_cursor_and_reports_retained_history_gap(world):
     path = f"/v1/runs/{world.run_id}/events?wait_seconds=0"
     headers = {"Authorization": f"Bearer {world.user_token}"}
@@ -139,6 +142,7 @@ def sse_revisions(response):
     return records
 
 
+@pytest.mark.ac("SF-23-AC04")
 def test_rotation_preserves_worker_slot_and_fences_old_token_at_grace(world, clock, monkeypatch):
     claimed = world.claim().json()
     lease = claimed["lease"]
@@ -195,6 +199,7 @@ def test_rotation_preserves_worker_slot_and_fences_old_token_at_grace(world, clo
             session.execute(update(AuditEvent).values(operation="overwrite"))
 
 
+@pytest.mark.ac("SF-23-AC04")
 def test_unrotated_worker_token_expires_after_twenty_four_hours(world, clock):
     worker = world.make_worker()
     token = worker["worker_token"]
@@ -206,6 +211,7 @@ def test_unrotated_worker_token_expires_after_twenty_four_hours(world, clock):
     assert world.post("/v1/worker/credentials/rotate", {}, token=token).status_code == 401
 
 
+@pytest.mark.ac("SF-23-AC04")
 def test_concurrent_rotation_issues_only_one_new_token(world):
     barrier = Barrier(2)
 
@@ -218,6 +224,7 @@ def test_concurrent_rotation_issues_only_one_new_token(world):
     assert sorted(response.status_code for response in responses) == [200, 409]
 
 
+@pytest.mark.ac("SF-23-AC05")
 def test_workspace_user_access_separates_read_run_operations_and_worker_administration(world):
     viewer, operator = issue_token(), issue_token()
     with world.database.transaction() as session:
@@ -303,6 +310,7 @@ def test_workspace_user_access_separates_read_run_operations_and_worker_administ
     assert world.claim(token=new_worker.json()["worker_token"]).status_code == 204
 
 
+@pytest.mark.ac("SF-23-AC06")
 def test_emergency_stop_survives_restart_and_requires_current_workspace_revision(world):
     path = f"/v1/workspaces/{world.workspace_id}/execution-control"
     stop = {"stopped": True, "expected_revision": 0, "reason": "exercise stop"}
@@ -343,6 +351,7 @@ def test_emergency_stop_survives_restart_and_requires_current_workspace_revision
         ) == [(0, 1), (1, 2)]
 
 
+@pytest.mark.ac("SF-23-AC06")
 def test_emergency_stop_requests_running_worker_stop_and_preserves_outcome(world):
     assignment = world.claim().json()
     lease = assignment["lease"]
@@ -365,6 +374,7 @@ def test_emergency_stop_requests_running_worker_stop_and_preserves_outcome(world
     assert world.run()["stop_reason"] == "WORKSPACE_EMERGENCY_STOP"
 
 
+@pytest.mark.ac("SF-23-AC06")
 def test_claim_racing_workspace_stop_is_either_denied_or_cancelled(world):
     barrier = Barrier(2)
 
@@ -398,6 +408,7 @@ def test_claim_racing_workspace_stop_is_either_denied_or_cancelled(world):
         assert world.run()["status"] == "QUEUED"
 
 
+@pytest.mark.ac("SF-23-AC02")
 def test_worker_health_separates_overdue_expired_and_reported_stop(world, clock):
     path = f"/v1/workspaces/{world.workspace_id}/workers"
     assert world.get(path, token=world.other_user_token).status_code == 404
@@ -442,6 +453,7 @@ def test_worker_health_separates_overdue_expired_and_reported_stop(world, clock)
     assert current["last_heartbeat_at"] > initial["last_heartbeat_at"]
 
 
+@pytest.mark.ac("SF-23-AC04")
 def test_worker_recovers_rotation_after_lost_response_and_grace_expiry(world, clock, tmp_path):
     private = tmp_path / "private"
     private.mkdir(mode=0o700)
@@ -477,6 +489,7 @@ def test_worker_recovers_rotation_after_lost_response_and_grace_expiry(world, cl
 
 
 @pytest.mark.ac("SF-21-AC05", "SF-23-AC02")
+@pytest.mark.ac("SF-23-AC02")
 def test_unconfirmed_stop_revokes_worker_across_control_plane_restart(world):
     lease = world.claim().json()["lease"]
     result = world.post(

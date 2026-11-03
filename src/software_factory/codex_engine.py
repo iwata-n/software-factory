@@ -13,9 +13,10 @@ from pathlib import Path
 from threading import Lock
 from typing import Annotated, Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from .contracts import ModelCallUsage, Name, digest
+from .model_egress import validate_hosts
 from .sandbox import STOP_UNCONFIRMED
 from .security import redact
 
@@ -55,6 +56,19 @@ def sensitive_input(value):
     return False
 
 
+class LinuxIsolation(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+    image_digest: Annotated[str, Field(pattern=r"^sha256:[0-9a-f]{64}$")]
+    allowed_hosts: Annotated[tuple[str, ...], Field(min_length=1, max_length=8)]
+
+    @model_validator(mode="after")
+    def validate_destinations(self):
+        validate_hosts(self.allowed_hosts)
+        if len(set(self.allowed_hosts)) != len(self.allowed_hosts):
+            raise ValueError("model destinations must be unique")
+        return self
+
+
 class EngineManifest(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
     schema_version: Literal[1]
@@ -64,10 +78,17 @@ class EngineManifest(BaseModel):
     binary_sha256: Annotated[str, Field(pattern=r"^[0-9a-f]{64}$")]
     model: Name
     reasoning_effort: Literal["low", "medium", "high", "xhigh"]
-    execution_mode: Literal["structured_text_no_repo_checkout"]
+    execution_mode: Literal["structured_text_no_repo_checkout", "isolated_linux"]
+    isolation: LinuxIsolation | None = None
     timeout_seconds: int = Field(ge=1, le=2700)
     max_input_bytes: int = Field(ge=1024, le=2 * 1024 * 1024)
     max_output_bytes: int = Field(ge=1024, le=16 * 1024 * 1024)
+
+    @model_validator(mode="after")
+    def validate_isolation_mode(self):
+        if (self.execution_mode == "isolated_linux") != (self.isolation is not None):
+            raise ValueError("isolated_linux requires a pinned Runner and model destinations")
+        return self
 
 
 class CodexError(Exception):
@@ -85,6 +106,7 @@ class CodexResponse:
     value: dict
     usage: ModelCallUsage
     thread_id: str
+    startup_diagnostics: int = 0
 
 
 def file_hash(path):
@@ -111,7 +133,7 @@ def strict_schema(value):
 def parse_events(raw):
     """Reject missing usage, unknown events and executable tool activity; never infer success."""
     thread_id, usage, message = None, None, None
-    started = completed = 0
+    started = completed = startup_diagnostics = 0
     try:
         for line in raw.decode("utf-8").splitlines():
             item = json.loads(line)
@@ -138,9 +160,22 @@ def parse_events(raw):
                 )
                 completed += 1
             elif kind in {"item.started", "item.updated", "item.completed"}:
+                detail = item["item"]
+                if (
+                    kind == "item.completed"
+                    and thread_id is not None
+                    and not started
+                    and detail["type"] == "error"
+                    and isinstance(detail["id"], str)
+                    and isinstance(detail["message"], str)
+                    and startup_diagnostics < 4
+                ):
+                    # Linux emits startup diagnostics before the turn. The text
+                    # never becomes output, and a completed measured turn is still required.
+                    startup_diagnostics += 1
+                    continue
                 if started != 1 or completed:
                     raise ValueError
-                detail = item["item"]
                 if detail["type"] not in {"agent_message", "reasoning"}:
                     raise CodexError("CODEX_TOOL_ACTIVITY_DENIED", "POLICY")
                 if kind == "item.completed" and detail["type"] == "agent_message":
@@ -154,7 +189,7 @@ def parse_events(raw):
         parsed = json.loads(message)
         if not isinstance(parsed, dict):
             raise ValueError
-        return CodexResponse(parsed, usage, thread_id)
+        return CodexResponse(parsed, usage, thread_id, startup_diagnostics)
     except CodexError as error:
         error.usage, error.thread_id = usage, thread_id
         raise
@@ -163,17 +198,26 @@ def parse_events(raw):
 
 
 class CodexCLI:
+    isolated = False
+
     def __init__(self, binary, manifest):
         self.binary = str(Path(binary).resolve(strict=True))
         self.manifest = EngineManifest.model_validate(manifest)
-        self.manifest_hash = digest(self.manifest.model_dump())
+        if (self.manifest.isolation is not None) != self.isolated:
+            raise CodexError("ISOLATED_CODEX_RUNNER_REQUIRED", "POLICY", before_launch=True)
+        self.manifest_hash = digest(self.manifest.model_dump(exclude_none=True))
         self._lock = Lock()
         self._process = None
         self.verify_binary()
 
     @classmethod
     def from_file(cls, binary, manifest_path):
-        return cls(binary, json.loads(Path(manifest_path).read_text()))
+        manifest = json.loads(Path(manifest_path).read_text())
+        if cls is CodexCLI and manifest.get("execution_mode") == "isolated_linux":
+            from .codex_container import DockerCodexCLI
+
+            return DockerCodexCLI(binary, manifest, os.environ.get("FACTORY_CODEX_AUTH_FILE"))
+        return cls(binary, manifest)
 
     def environment(self):
         # Authentication belongs only to this trusted client. No CP/GitHub/API-key env forwarding.
@@ -293,8 +337,11 @@ class CodexCLI:
                             raise CodexError("CODEX_ALREADY_RUNNING", "POLICY")
                         if cancelled.is_set():
                             raise CodexError("CODEX_CANCELLED", "POLICY")
+                        command = self.argv(schema)
+                        if cancelled.is_set():
+                            raise CodexError("CODEX_CANCELLED", "POLICY", before_launch=True)
                         self._process = subprocess.Popen(
-                            self.argv(schema),
+                            command,
                             cwd=root,
                             env=self.environment(),
                             stdin=subprocess.PIPE,

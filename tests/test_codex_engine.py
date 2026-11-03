@@ -6,11 +6,12 @@ from pathlib import Path
 from threading import Event
 
 import pytest
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, ValidationError
 
 from software_factory.codex_engine import (
     CodexCLI,
     CodexError,
+    EngineManifest,
     file_hash,
     parse_events,
     strict_schema,
@@ -100,6 +101,7 @@ if mode=='metered-exit':
     return make
 
 
+@pytest.mark.ac("SF-20-AC01")
 def test_cli_runs_in_empty_directory_with_pinned_safe_flags(cli):
     engine = cli()
     result = engine.run({"task": "Return ok"}, Reply, Event())
@@ -112,6 +114,7 @@ def test_cli_runs_in_empty_directory_with_pinned_safe_flags(cli):
     assert engine._process is None
 
 
+@pytest.mark.ac("SF-20-AC05")
 def test_control_plane_github_and_api_credentials_are_not_in_cli_environment(cli, monkeypatch):
     for key in [
         "FACTORY_DATABASE_URL",
@@ -136,6 +139,7 @@ def test_control_plane_github_and_api_credentials_are_not_in_cli_environment(cli
         ("large", "CODEX_OUTPUT_TOO_LARGE"),
     ],
 )
+@pytest.mark.ac("SF-20-AC03")
 def test_process_failures_never_become_success_or_echo_stderr(cli, mode, code):
     engine = cli(mode)
     with pytest.raises(CodexError) as caught:
@@ -144,12 +148,14 @@ def test_process_failures_never_become_success_or_echo_stderr(cli, mode, code):
     assert "secret-canary" not in str(caught.value) and engine._process is None
 
 
+@pytest.mark.ac("SF-20-AC03")
 def test_exited_cli_does_not_leave_running_child(cli, tmp_path):
     assert cli("child").run({"task": "safe"}, Reply, Event()).value == {"value": "ok"}
     time.sleep(0.75)
     assert not (tmp_path / "child-survived").exists()
 
 
+@pytest.mark.ac("SF-20-AC03")
 def test_timeout_stops_term_ignoring_cli(cli):
     engine = cli("hang")
     started = time.monotonic()
@@ -158,6 +164,7 @@ def test_timeout_stops_term_ignoring_cli(cli):
     assert time.monotonic() - started < 8 and engine._process is None
 
 
+@pytest.mark.ac("SF-20-AC03")
 def test_cancel_stops_running_cli_and_next_call_is_not_cancelled(cli):
     engine, stopped = cli("hang"), Event()
     with ThreadPoolExecutor(1) as pool:
@@ -205,6 +212,7 @@ def test_binary_replacement_is_rejected_before_execution(cli):
         "non_json_message",
     ],
 )
+@pytest.mark.ac("SF-20-AC03")
 def test_event_stream_rejects_missing_or_forged_success(attack):
     items = events()
     if attack == "usage_missing":
@@ -231,6 +239,7 @@ def test_invalid_final_json_keeps_real_usage_for_failure_settlement():
     assert caught.value.usage.output_tokens == 3
 
 
+@pytest.mark.ac("SF-20-AC05")
 def test_sensitive_context_and_pre_cancel_never_start_provider(cli):
     engine = cli()
     with pytest.raises(CodexError, match="SENSITIVE_MODEL_INPUT"):
@@ -264,6 +273,7 @@ def test_json_schema_requires_nullable_and_defaulted_properties():
         "access_token = 'quoted-secret-canary'",
     ],
 )
+@pytest.mark.ac("SF-20-AC05")
 def test_quoted_source_credentials_are_rejected_before_serializing_context(cli, secret):
     engine = cli()
     with pytest.raises(CodexError, match="SENSITIVE_MODEL_INPUT"):
@@ -280,6 +290,7 @@ def test_nonzero_exit_preserves_validated_usage(cli):
     assert caught.value.thread_id == "test-thread"
 
 
+@pytest.mark.ac("SF-20-AC03")
 def test_cancel_during_manifest_check_does_not_launch_provider(cli, monkeypatch):
     engine = cli()
     cancelled = Event()
@@ -298,6 +309,7 @@ def test_cancel_during_manifest_check_does_not_launch_provider(cli, monkeypatch)
     assert engine._process is None
 
 
+@pytest.mark.ac("SF-20-AC03")
 def test_cli_signal_failure_is_classified_as_unconfirmed(cli, monkeypatch):
     from types import SimpleNamespace
 
@@ -310,3 +322,60 @@ def test_cli_signal_failure_is_classified_as_unconfirmed(cli, monkeypatch):
     monkeypatch.setattr("software_factory.codex_engine.os.killpg", deny_signal)
     with pytest.raises(CodexError, match="^STOP_UNCONFIRMED$"):
         engine.cancel()
+
+
+def test_legacy_manifest_hash_remains_compatible(cli):
+    from software_factory.contracts import digest
+
+    engine = cli()
+    assert engine.manifest.isolation is None
+    payload = engine.manifest.model_dump(exclude={"isolation"})
+    assert engine.manifest_hash == digest(payload)
+
+
+@pytest.mark.parametrize("hosts", [[], ["*.example.com"], ["169.254.169.254"], ["chatgpt.com"] * 2])
+def test_isolated_manifest_requires_exact_distinct_destinations(cli, hosts):
+    engine = cli()
+    with pytest.raises(ValidationError):
+        EngineManifest.model_validate(
+            engine.manifest.model_dump()
+            | {
+                "execution_mode": "isolated_linux",
+                "isolation": {"image_digest": "sha256:" + "a" * 64, "allowed_hosts": hosts},
+            }
+        )
+
+
+def test_isolated_manifest_cannot_fall_back_to_host_execution(cli, monkeypatch):
+    engine = cli()
+    payload = engine.manifest.model_dump() | {
+        "execution_mode": "isolated_linux",
+        "isolation": {
+            "image_digest": "sha256:" + "a" * 64,
+            "allowed_hosts": ["chatgpt.com", "auth.openai.com"],
+        },
+    }
+    assert EngineManifest.model_validate(payload).isolation.allowed_hosts[0] == "chatgpt.com"
+
+    def reject_launch(*args, **kwargs):
+        pytest.fail("host CLI must not be called for an isolated manifest")
+
+    monkeypatch.setattr("software_factory.codex_engine.subprocess.run", reject_launch)
+    with pytest.raises(CodexError, match="^ISOLATED_CODEX_RUNNER_REQUIRED$"):
+        CodexCLI(engine.binary, payload)
+
+
+def test_linux_startup_diagnostic_does_not_replace_valid_turn():
+    items = events()
+    warning = {
+        "type": "item.completed",
+        "item": {"type": "error", "id": "diagnostic", "message": "private diagnostic text"},
+    }
+    result = parse_events(encoded([items[0], warning, *items[1:]]))
+    assert result.value == {"value": "ok"}
+    assert result.startup_diagnostics == 1
+    assert "private diagnostic text" not in repr(result)
+    with pytest.raises(CodexError, match="CODEX_EVENT_SCHEMA_INVALID"):
+        parse_events(encoded([items[0], warning]))
+    with pytest.raises(CodexError, match="CODEX_TOOL_ACTIVITY_DENIED"):
+        parse_events(encoded([*items[:2], warning, *items[2:]]))
