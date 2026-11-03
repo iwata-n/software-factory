@@ -15,3 +15,5 @@ def normalize_spaces(value):
 
 def stable_label(value):
     return "item:" + str(value)
+
+# Expected CI failure fixture.
