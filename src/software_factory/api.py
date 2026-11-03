@@ -63,7 +63,6 @@ from .models import (
     SpecVersion,
     Task,
     VerifiedRunResult,
-    Worker,
 )
 from .operations import event_view, operations_router
 from .resolver import SourceResolver
@@ -804,21 +803,6 @@ def create_app(
             lambda s, a: service.set_execution_control(s, a, workspace_id, data),
             user_access="ADMIN",
         )
-
-    @app.get("/v1/workspaces/{workspace_id}/workers", tags=["Operations"])
-    def workers_get(workspace_id: str, token: Token):
-        def query(session, actor):
-            if workspace_id != actor.workspace_id:
-                raise DomainError(404, "NOT_FOUND")
-            workers = session.scalars(select(Worker).where(Worker.workspace_id == workspace_id))
-            return {
-                "workers": [
-                    {"worker_id": w.id, "name": w.name, "capabilities": w.capabilities}
-                    for w in workers
-                ]
-            }
-
-        return service.read(token, query)
 
     @app.post(
         "/v1/workspaces/{workspace_id}/worker-enrollments", status_code=201, tags=["Operations"]

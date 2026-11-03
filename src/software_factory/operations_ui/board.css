@@ -95,3 +95,4 @@ summary { cursor: pointer; padding: 10px 0; }
 }
 .execution[data-stopped="true"] { border-color: #c68070; background: #fff5f2; }
 #execution-form { margin-top: 10px; }
+#worker-list { overflow-wrap: anywhere; }

@@ -11,10 +11,12 @@ from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from sqlalchemy import select, tuple_
 from starlette.concurrency import run_in_threadpool
 
-from .models import Run, RunEvent, Task
+from .db import db_now
+from .models import Attempt, Principal, Run, RunEvent, Task, Worker
 from .service import DomainError, owned
 
 UI_DIR = Path(__file__).with_name("operations_ui")
+HEARTBEAT_STALE_SECONDS = 30
 
 
 def event_view(event):
@@ -54,6 +56,40 @@ def event_batch(session, run, revision):
     return [event_view(event) for event in events]
 
 
+def worker_view(worker, credential, attempt, now):
+    if not credential.active:
+        credential_status = "REVOKED"
+    elif credential.token_expires_at is not None and credential.token_expires_at <= now:
+        credential_status = "EXPIRED"
+    else:
+        credential_status = "ACTIVE"
+    lease_status = "NO_LEASE"
+    if attempt is not None:
+        if attempt.state == "EXPIRED" or (attempt.state == "LEASED" and now >= attempt.expires_at):
+            lease_status = "EXECUTION_RIGHT_EXPIRED"
+        elif attempt.state == "LEASED":
+            lease_status = (
+                "HEARTBEAT_OVERDUE"
+                if now - attempt.heartbeat_at >= HEARTBEAT_STALE_SECONDS
+                else "LEASED"
+            )
+        elif attempt.stop_confirmation == "WORKER_REPORTED_STOP":
+            lease_status = "WORKER_REPORTED_STOP"
+        else:
+            lease_status = "LEASE_ENDED"
+    return {
+        "worker_id": worker.id,
+        "name": worker.name,
+        "capabilities": worker.capabilities,
+        "credential_status": credential_status,
+        "lease_status": lease_status,
+        "last_heartbeat_at": attempt.heartbeat_at if attempt else None,
+        "lease_expires_at": attempt.expires_at if attempt else None,
+        "attempt_state": attempt.state if attempt else None,
+        "stop_confirmation": attempt.stop_confirmation if attempt else None,
+    }
+
+
 def operations_router(service, token_type):
     router = APIRouter()
 
@@ -88,6 +124,40 @@ def operations_router(service, token_type):
                 "execution": service.execution_control(session, actor, actor.workspace_id),
             }
 
+        return service.read(token, query)
+
+    @router.get("/v1/workspaces/{workspace_id}/workers", tags=["Operations"])
+    def workers_get(workspace_id: str, token: token_type, response: Response):
+        def query(session, actor):
+            if workspace_id != actor.workspace_id:
+                raise DomainError(404, "NOT_FOUND")
+            latest_attempt = (
+                select(Attempt.id)
+                .where(Attempt.workspace_id == Worker.workspace_id, Attempt.worker_id == Worker.id)
+                .order_by(Attempt.started_at.desc(), Attempt.id.desc())
+                .limit(1)
+                .correlate(Worker)
+                .scalar_subquery()
+            )
+            workers = session.execute(
+                select(Worker, Principal, Attempt)
+                .join(
+                    Principal,
+                    (Principal.workspace_id == Worker.workspace_id) & (Principal.id == Worker.id),
+                )
+                .outerjoin(Attempt, Attempt.id == latest_attempt)
+                .where(Worker.workspace_id == workspace_id)
+                .order_by(Worker.name, Worker.id)
+            )
+            now = db_now(session)
+            return {
+                "workers": [
+                    worker_view(worker, credential, attempt, now)
+                    for worker, credential, attempt in workers
+                ]
+            }
+
+        response.headers["Cache-Control"] = "no-store"
         return service.read(token, query)
 
     @router.get("/v1/runs", tags=["Runs"])

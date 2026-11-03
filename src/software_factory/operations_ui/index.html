@@ -36,6 +36,11 @@
       </form>
       <p id="execution-message" role="status" hidden></p>
     </section>
+    <details id="worker-panel" class="execution" hidden>
+      <summary>Worker の状態</summary>
+      <p id="worker-status" role="status"></p>
+      <div id="worker-list"></div>
+    </details>
     <p id="status" role="status">User トークンで接続すると Run を表示します。</p>
     <div id="board" class="board" aria-label="Run の状態別一覧" hidden></div>
     <button id="older" hidden>過去の Run を追加表示</button>

@@ -405,6 +405,8 @@ Gateは必須Jobが処理中なら待機を続ける。全必須Jobが終端ま�
 
 `GET /v1/runs/{id}/events` は永続Run revisionを `<run-id>:<revision>` のSSE IDとして配信する。Run詳細は切断後に最後に表示したIDを送信し、再送を排除する。別RunのIDは404、保持済み履歴との間に欠落がある場合は410と再取得先を返す。PostgreSQLの試験では別アプリ起動後の再開と削除境界を、Chromeの1440px/375pxではfixture応答による再接続・重複排除・履歴再取得を確認した。実運用での履歴回収はSF-24で追跡する。
 
+Worker一覧は最後の試行のHeartbeatとLease期限を表示する。標準15秒のHeartbeat間隔を2回超えた時点（30秒）で遅延、期限到達で実行権失効、停止報告を受けたときは報告済みと区別する。同一Workerの状態遷移と越境拒否をPostgreSQL、表示切替をChrome幅1440px/375pxのfixtureで確認した。
+
 0016でWorkerトークンに24時間の期限を設定し、更新後の旧トークンに60秒の猶予を設けた。明示失効は現・旧双方に適用される。更新はWorker IDとLeaseを維持し、同一キーの再送で追加発行しない。更新・失効は追記専用の監査に残す。0017でUserをVIEWER・OPERATOR・ADMINに分け、Workspace内のWorker登録と失効をADMIN限定にした。既存UserはADMINに移行する。APIの操作権限と越境拒否をPostgreSQLで検証した。Worker実行プロセスの自動更新と運用画面を含む権限別の通し検証は引き続き追跡する。
 
 | AC ID | 前提と操作 | 合格となる期待結果 | 検証方法と証拠 |

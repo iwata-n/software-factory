@@ -14,7 +14,7 @@ from sqlalchemy.exc import IntegrityError
 from software_factory import cli
 from software_factory.api import create_app
 from software_factory.models import AuditEvent, Principal, Project, Run, RunEvent
-from software_factory.service import issue_token, token_hash
+from software_factory.service import Service, issue_token, token_hash
 from tests.conftest import example_spec
 
 
@@ -394,3 +394,47 @@ def test_claim_racing_workspace_stop_is_either_denied_or_cancelled(world):
     else:
         assert result.status_code == 204
         assert world.run()["status"] == "QUEUED"
+
+
+def test_worker_health_separates_overdue_expired_and_reported_stop(world, clock):
+    path = f"/v1/workspaces/{world.workspace_id}/workers"
+    assert world.get(path, token=world.other_user_token).status_code == 404
+    assert world.get(path, token=world.worker_token).status_code == 403
+
+    def worker():
+        response = world.get(path)
+        assert response.headers["cache-control"] == "no-store"
+        assert world.worker_token not in response.text
+        (row,) = response.json()["workers"]
+        assert row["worker_id"] == world.worker_id
+        return row
+
+    assert worker()["lease_status"] == "NO_LEASE"
+    assert world.claim().status_code == 200
+    initial = worker()
+    assert initial["lease_status"] == "LEASED"
+    assert initial["last_heartbeat_at"] == clock.value
+    clock.advance(30)
+    overdue = worker()
+    assert overdue["lease_status"] == "HEARTBEAT_OVERDUE"
+    assert overdue["stop_confirmation"] is None
+    assert overdue["last_heartbeat_at"] == initial["last_heartbeat_at"]
+    clock.advance(initial["lease_expires_at"] - clock.value)
+    expired = worker()
+    assert expired["lease_status"] == "EXECUTION_RIGHT_EXPIRED"
+    assert expired["stop_confirmation"] is None
+    Service(world.database).reconcile()
+    assert worker()["stop_confirmation"] == "EXECUTION_RIGHT_EXPIRED"
+    clock.advance(3)
+    claimed = world.claim()
+    assert claimed.status_code == 200
+    lease = claimed.json()["lease"]
+    stopped = world.post(
+        f"/v1/worker/leases/{lease['id']}/fail",
+        {"fence": lease["fence"], "category": "INFRASTRUCTURE", "reason": "stopped"},
+        token=world.worker_token,
+    )
+    assert stopped.status_code == 200
+    current = worker()
+    assert current["lease_status"] == current["stop_confirmation"] == "WORKER_REPORTED_STOP"
+    assert current["last_heartbeat_at"] > initial["last_heartbeat_at"]

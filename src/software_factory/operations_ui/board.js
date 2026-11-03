@@ -61,6 +61,9 @@ function disconnect(text = "接続を終了しました。", error = false) {
   executionContext = undefined;
   closeExecutionForm();
   get("execution").hidden = true;
+  get("worker-panel").hidden = true;
+  get("worker-panel").open = false;
+  get("worker-list").replaceChildren();
   executionMessage("");
   token = "";
   runs = [];
@@ -212,6 +215,37 @@ async function submitExecution(event) {
   }
 }
 
+const leaseLabels = {
+  NO_LEASE: "Lease 履歴なし",
+  LEASED: "実行権あり",
+  HEARTBEAT_OVERDUE: "Heartbeat 遅延・停止未確認",
+  EXECUTION_RIGHT_EXPIRED: "実行権失効・停止未確認",
+  WORKER_REPORTED_STOP: "Worker が停止を報告済み",
+  LEASE_ENDED: "Lease 終了・停止未確認",
+};
+const credentialLabels = { ACTIVE: "有効", EXPIRED: "期限切れ", REVOKED: "失効済み" };
+
+async function loadWorkers(workspaceId, signal) {
+  get("worker-panel").hidden = false;
+  get("worker-list").replaceChildren();
+  message("worker-status", "Worker の状態を取得中…");
+  try {
+    const { workers } = await read(`/v1/workspaces/${encodeURIComponent(workspaceId)}/workers`, signal);
+    if (signal.aborted) return;
+    const entries = workers.map((worker) => section(worker.name, fields([
+      ["Worker ID", worker.worker_id],
+      ["実行状態", leaseLabels[worker.lease_status] ?? worker.lease_status],
+      ["最終 Heartbeat", date(worker.last_heartbeat_at)],
+      ["Lease 期限", date(worker.lease_expires_at)],
+      ["資格情報", credentialLabels[worker.credential_status] ?? worker.credential_status],
+    ])));
+    get("worker-list").replaceChildren(...entries);
+    message("worker-status", workers.length ? "" : "登録済みの Worker はありません。");
+  } catch {
+    if (!signal.aborted) message("worker-status", "Worker の状態を取得できませんでした。", true);
+  }
+}
+
 async function loadBoard(older = false) {
   boardRequest?.abort();
   boardRequest = new AbortController();
@@ -226,6 +260,7 @@ async function loadBoard(older = false) {
     ]);
     if (signal.aborted) return;
     renderExecution(context);
+    void loadWorkers(context.execution.workspace_id, signal);
     runs = older ? [...runs, ...page.runs] : page.runs;
     nextBefore = page.next_before;
     renderBoard();
