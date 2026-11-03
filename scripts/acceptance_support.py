@@ -101,6 +101,7 @@ def required_criteria() -> list[str]:
         "SF-19-AC06",
         "SF-20-AC02",
         "SF-20-AC03",
+        "SF-20-AC05",
         "SF-21-AC02",
         "SF-21-AC05",
     }
