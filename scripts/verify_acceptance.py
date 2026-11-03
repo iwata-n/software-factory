@@ -18,17 +18,42 @@ from acceptance_support import (
 
 from software_factory.contracts import digest
 
+SCENARIO_CRITERION = "SF-24-AC03"
 
-def completion_status(verified):
-    pending = sorted(set(task_criteria()) - verified)
+
+def audited_scenarios(records):
     scenarios = acceptance_scenarios()
     if set(scenarios) != {f"AT-{number:02d}" for number in range(1, 13)} or not all(
-        scenarios.values()
+        references and SCENARIO_CRITERION not in references for references in scenarios.values()
     ):
-        raise ValueError("overall acceptance scenarios are incomplete")
-    missing_scenarios = [
-        name for name, references in scenarios.items() if set(references) - verified
-    ]
+        raise ValueError("overall acceptance scenarios are incomplete or circular")
+    matrix = {}
+    for name, references in scenarios.items():
+        criteria = {}
+        for ac in references:
+            if ac not in records:
+                criteria[ac] = {"result": "未検証", "test_case_ids": [], "evidence_paths": []}
+                continue
+            path, record = records[ac]
+            criteria[ac] = {
+                "result": record["result"],
+                "test_case_ids": record["test_case_ids"],
+                "record": f"{path.parent.name}/{path.name}",
+                "evidence_paths": record["evidence_paths"],
+                "external_urls": record["external_urls"],
+            }
+        matrix[name] = {
+            "result": "PASS"
+            if all(row["result"] == "PASS" for row in criteria.values())
+            else "未検証",
+            "criteria": criteria,
+        }
+    return matrix
+
+
+def completion_status(verified, scenarios):
+    pending = sorted(set(task_criteria()) - verified)
+    missing_scenarios = [name for name, record in scenarios.items() if record["result"] != "PASS"]
     return {
         "pending_criteria": pending,
         "pending_scenarios": missing_scenarios,
@@ -305,9 +330,7 @@ def verify_model_egress(report, manifest, record):
         or sum("test_mixed_dns_answers_fail_closed" in case["test_case_id"] for case in cases) != 5
         or any(case["result"] != "PASS" for case in cases)
     ):
-        raise ValueError(
-            "Live model egress evidence is incomplete or inconsistent"
-        )
+        raise ValueError("Live model egress evidence is incomplete or inconsistent")
 
 
 def audit(directory: Path, *, allow_ci_pending: bool = False) -> dict:
@@ -517,14 +540,32 @@ def audit(directory: Path, *, allow_ci_pending: bool = False) -> dict:
                 pending.append(ac)
             else:
                 raise ValueError(f"{ac}: {record['result']}")
+    scenarios = audited_scenarios(records)
+    scenario_result = (
+        "PASS" if all(row["result"] == "PASS" for row in scenarios.values()) else "未検証"
+    )
+    (directory / "audited-scenarios.json").write_text(
+        json.dumps(
+            {
+                "ac_id": SCENARIO_CRITERION,
+                "revision": manifest["revision"],
+                "code_digest": manifest["code_digest"],
+                "result": scenario_result,
+                "scenarios": scenarios,
+            },
+            indent=2,
+            ensure_ascii=False,
+        )
+    )
+    criteria = [
+        {"ac_id": ac, "result": record["result"]} for ac, (_, record) in records.items()
+    ] + [{"ac_id": SCENARIO_CRITERION, "result": scenario_result}]
     result = {
-        "criteria": [
-            {"ac_id": ac, "result": record["result"]} for ac, (_, record) in records.items()
-        ],
+        "criteria": criteria,
         "code_digest": manifest["code_digest"],
         "external_pending": pending,
         **completion_status(
-            {ac for ac, (_, record) in records.items() if record["result"] == "PASS"}
+            {row["ac_id"] for row in criteria if row["result"] == "PASS"}, scenarios
         ),
     }
     (directory / "summary.json").write_text(json.dumps(result, indent=2, ensure_ascii=False))
