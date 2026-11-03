@@ -38,6 +38,9 @@ uv run factory-worker
 
 Workerの接続先は `FACTORY_API_URL` または `--api-url` で指定できます。HTTPを許可するのはループバックだけです。`--once` は1 Job、`--drain` は取得可能なJobがなくなるまで実行します。`--scenario infra-fail` と `--scenario inconclusive` で制御分岐を再現できます。
 
+Workerトークンは発行から24時間で失効します。期限前に現在のBearerトークンと新しい `Idempotency-Key` を使って `POST /v1/worker/credentials/rotate` を呼び、応答の `worker_token` に差し替えます。Worker IDと実行枠は引き継がれ、旧トークンも更新後60秒間使えます。応答が失われた場合は、その猶予内に旧トークンと同じキーで再送できます。ローカル管理者が `python -m software_factory.cli revoke --principal-id <worker_id> --reason '<理由>'` を実行すると、両方のトークンが即時失効します。
+
+
 ## デモTaskの作成
 
 User資格情報を設定し、別ターミナルでデモを登録します。APIだけを使い、実Repositoryへの接続やコード変更は行いません。

@@ -1,13 +1,15 @@
 """Transactional application commands; external execution never occurs under DB locks."""
 
+import base64
 import hashlib
+import hmac
 import os
 import secrets
 from collections.abc import Callable
 from contextvars import ContextVar
 from typing import TypeVar
 
-from sqlalchemy import select
+from sqlalchemy import or_, select
 from sqlalchemy.orm import Session
 
 from .contracts import (
@@ -58,6 +60,8 @@ from .security import redact
 from .slack_delivery import enqueue_result
 
 LEASE_SECONDS = 90
+WORKER_TOKEN_SECONDS = 24 * 60 * 60
+WORKER_ROTATION_GRACE_SECONDS = 60
 T = TypeVar("T")
 request_secrets: ContextVar[tuple[str, ...]] = ContextVar("request_secrets", default=())
 
@@ -257,8 +261,20 @@ class Service:
         self.publications = PublicationCommands(self)
 
     def principal(self, session: Session, token: str, role: str) -> Principal:
-        actor = session.scalar(select(Principal).where(Principal.token_hash == token_hash(token)))
+        hashed = token_hash(token)
+        actor = session.scalar(
+            select(Principal)
+            .where(or_(Principal.token_hash == hashed, Principal.previous_token_hash == hashed))
+            .execution_options(populate_existing=True)
+        )
         if actor is None or not actor.active:
+            raise DomainError(401, "UNAUTHENTICATED")
+        expiry = (
+            actor.token_expires_at
+            if actor.token_hash == hashed
+            else actor.previous_token_expires_at
+        )
+        if expiry is not None and db_now(session) >= expiry:
             raise DomainError(401, "UNAUTHENTICATED")
         if actor.role != role:
             raise DomainError(403, "PRINCIPAL_ROLE_DENIED")
@@ -269,6 +285,12 @@ class Service:
         # This mutex covers idempotency, worker slots, run slots and reservations.
         # Replace it with finer locks only together with equivalent concurrency tests.
         session.scalar(select(Workspace).where(Workspace.id == workspace_id).with_for_update())
+
+    def locked_principal(self, session: Session, token: str, role: str) -> Principal:
+        actor = self.principal(session, token, role)
+        self.lock_workspace(session, actor.workspace_id)
+        # Recheck the credential itself after waiting for revocation or rotation.
+        return self.principal(session, token, role)
 
     def read(self, token: str, fn: Callable[[Session, Principal], dict], *, role="USER") -> dict:
         with self.db.transaction() as session:
@@ -289,9 +311,7 @@ class Service:
             if not key or len(key) > 200 or redact(key, (token,)) != key:
                 raise DomainError(422, "IDEMPOTENCY_KEY_REQUIRED")
             self.lock_workspace(session, actor.workspace_id)
-            session.refresh(actor)  # Revocation wins even if it raced the initial lookup.
-            if not actor.active:
-                raise DomainError(401, "UNAUTHENTICATED")
+            actor = self.principal(session, token, role)
             if role in {"USER", "PUBLISHER"}:
                 cleaned = (
                     scrub_project_body(body, (token,))
@@ -671,6 +691,7 @@ class Service:
                     workspace_id=enrollment.workspace_id,
                     role="WORKER",
                     token_hash=token_hash(secret),
+                    token_expires_at=now + WORKER_TOKEN_SECONDS,
                 )
             )
             session.flush()
@@ -684,15 +705,61 @@ class Service:
                 )
             )
             enrollment.consumed_at = now
-            return {"worker_id": worker_id, "worker_token": secret, "protocol_version": 1}
+            return {
+                "worker_id": worker_id,
+                "worker_token": secret,
+                "token_expires_at": now + WORKER_TOKEN_SECONDS,
+                "protocol_version": 1,
+            }
+
+    def rotate_worker_token(self, token: str, key: str | None) -> dict:
+        with self.db.transaction() as session:
+            actor = self.locked_principal(session, token, "WORKER")
+            if not key or len(key) > 200 or redact(key, (token,)) != key:
+                raise DomainError(422, "IDEMPOTENCY_KEY_REQUIRED")
+            # A lost response can be replayed during grace without storing either secret.
+            derived = hmac.digest(
+                token.encode(), b"software-factory/worker-rotation/v1\0" + key.encode(), "sha256"
+            )
+            secret = base64.urlsafe_b64encode(derived).decode().rstrip("=")
+            if actor.token_hash != token_hash(token):
+                if actor.token_hash != token_hash(secret):
+                    raise DomainError(409, "WORKER_ROTATION_REQUIRES_CURRENT_TOKEN")
+                return self.worker_credential(actor, secret)
+            now = db_now(session)
+            if (actor.previous_token_expires_at or 0) > now:
+                raise DomainError(409, "WORKER_ROTATION_GRACE_ACTIVE")
+            actor.previous_token_hash = actor.token_hash
+            actor.previous_token_expires_at = now + WORKER_ROTATION_GRACE_SECONDS
+            actor.token_hash = token_hash(secret)
+            actor.token_expires_at = now + WORKER_TOKEN_SECONDS
+            session.add(
+                AuditEvent(
+                    workspace_id=actor.workspace_id,
+                    actor_id=actor.id,
+                    operation="worker.credential.rotate",
+                    body={
+                        "worker_id": actor.id,
+                        "previous_token_expires_at": actor.previous_token_expires_at,
+                        "token_expires_at": actor.token_expires_at,
+                    },
+                    created_at=now,
+                )
+            )
+            return self.worker_credential(actor, secret)
+
+    @staticmethod
+    def worker_credential(actor: Principal, secret: str) -> dict:
+        return {
+            "worker_id": actor.id,
+            "worker_token": secret,
+            "token_expires_at": actor.token_expires_at,
+            "previous_token_expires_at": actor.previous_token_expires_at,
+        }
 
     def claim(self, token: str) -> dict | None:
         with self.db.transaction() as session:
-            actor = self.principal(session, token, "WORKER")
-            self.lock_workspace(session, actor.workspace_id)
-            session.refresh(actor)
-            if not actor.active:
-                raise DomainError(401, "UNAUTHENTICATED")
+            actor = self.locked_principal(session, token, "WORKER")
             worker = owned(session, Worker, actor.id, actor.workspace_id)
             self.reconcile_workspace(session, actor.workspace_id)
             self.refresh_dependencies(session, actor.workspace_id)
@@ -873,11 +940,7 @@ class Service:
 
     def heartbeat(self, token: str, lease_id: str, fence: int) -> dict:
         with self.db.transaction() as session:
-            actor = self.principal(session, token, "WORKER")
-            self.lock_workspace(session, actor.workspace_id)
-            session.refresh(actor)
-            if not actor.active:
-                raise DomainError(401, "UNAUTHENTICATED")
+            actor = self.locked_principal(session, token, "WORKER")
             attempt, _, run = self.lease(session, actor, lease_id, fence)
             now = db_now(session)
             attempt.heartbeat_at = now
@@ -1211,11 +1274,7 @@ class Service:
 
     def worker_events(self, token: str, lease_id: str, data: WorkerEventBatch) -> dict:
         with self.db.transaction() as session:
-            actor = self.principal(session, token, "WORKER")
-            self.lock_workspace(session, actor.workspace_id)
-            session.refresh(actor)
-            if not actor.active:
-                raise DomainError(401, "UNAUTHENTICATED")
+            actor = self.locked_principal(session, token, "WORKER")
             attempt, _, run = self.lease(session, actor, lease_id, data.fence)
             receipts = []
             for item in data.events:

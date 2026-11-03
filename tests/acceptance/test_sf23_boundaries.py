@@ -1,13 +1,20 @@
 """Run console foundation. Full SF-23 AC01 also needs SF-19 live evidence."""
 
 import json
+import sys
+from concurrent.futures import ThreadPoolExecutor
+from threading import Barrier
 from uuid import uuid4
 
+import pytest
 from fastapi.testclient import TestClient
-from sqlalchemy import delete
+from sqlalchemy import delete, select, update
+from sqlalchemy.exc import IntegrityError
 
+from software_factory import cli
 from software_factory.api import create_app
-from software_factory.models import Run, RunEvent
+from software_factory.models import AuditEvent, Principal, Run, RunEvent
+from software_factory.service import token_hash
 from tests.conftest import example_spec
 
 
@@ -128,3 +135,82 @@ def sse_revisions(response):
             assert json.loads(data.removeprefix("data: "))["revision"] == int(revision)
             records.append((run_id, int(revision)))
     return records
+
+
+def test_rotation_preserves_worker_slot_and_fences_old_token_at_grace(world, clock, monkeypatch):
+    claimed = world.claim().json()
+    lease = claimed["lease"]
+    path = f"/v1/worker/leases/{lease['id']}/heartbeat"
+    rotate = "/v1/worker/credentials/rotate"
+    assert world.post(rotate, {}).status_code == 403
+    first = world.post(rotate, {}, token=world.worker_token, key="first-rotation")
+    assert first.status_code == 200
+    assert first.headers["cache-control"] == "no-store"
+    payload = first.json()
+    assert payload["worker_id"] == world.worker_id
+    assert payload["token_expires_at"] == clock.value + 86400
+    assert payload["previous_token_expires_at"] == clock.value + 60
+    new_token = payload["worker_token"]
+    assert new_token != world.worker_token
+    replay = world.post(rotate, {}, token=world.worker_token, key="first-rotation")
+    assert replay.status_code == 200 and replay.json() == payload
+    assert world.claim(token=new_token).status_code == 204
+    assert world.post(rotate, {}, token=world.worker_token).status_code == 409
+    assert world.post(rotate, {}, token=new_token).status_code == 409
+    clock.advance(59)
+    assert world.post(path, {"fence": lease["fence"]}, token=world.worker_token).status_code == 200
+    clock.advance(1)
+    assert world.post(path, {"fence": lease["fence"]}, token=world.worker_token).status_code == 401
+    assert world.post(path, {"fence": lease["fence"]}, token=new_token).status_code == 200
+    latest = world.post(rotate, {}, token=new_token).json()["worker_token"]
+
+    monkeypatch.setattr(cli, "Database", lambda: world.database)
+    monkeypatch.setattr(
+        sys, "argv", ["factory", "revoke", "--principal-id", world.worker_id, "--reason", "test"]
+    )
+    cli.main()
+    for token in (new_token, latest):
+        assert world.post(path, {"fence": lease["fence"]}, token=token).status_code == 401
+    with world.database.transaction() as session:
+        worker = session.get(Principal, world.worker_id)
+        assert worker.token_hash == token_hash(latest)
+        assert worker.previous_token_hash == token_hash(new_token)
+        events = list(
+            session.scalars(
+                select(AuditEvent)
+                .where(AuditEvent.operation.in_(["worker.credential.rotate", "principal.revoke"]))
+                .order_by(AuditEvent.created_at, AuditEvent.operation.desc())
+            )
+        )
+        assert [item.operation for item in events].count("worker.credential.rotate") == 2
+        revoke = next(item for item in events if item.operation == "principal.revoke")
+        assert revoke.body["reason"] == "test"
+        assert all(
+            token not in json.dumps([item.body for item in events]) for token in (new_token, latest)
+        )
+    with pytest.raises(IntegrityError, match="EVIDENCE_IMMUTABLE"):
+        with world.database.transaction() as session:
+            session.execute(update(AuditEvent).values(operation="overwrite"))
+
+
+def test_unrotated_worker_token_expires_after_twenty_four_hours(world, clock):
+    worker = world.make_worker()
+    token = worker["worker_token"]
+    assert worker["token_expires_at"] == clock.value + 86400
+    clock.advance(86399)
+    assert world.claim(token=token).status_code == 200
+    clock.advance(1)
+    assert world.claim(token=token).status_code == 401
+    assert world.post("/v1/worker/credentials/rotate", {}, token=token).status_code == 401
+
+
+def test_concurrent_rotation_issues_only_one_new_token(world):
+    barrier = Barrier(2)
+
+    def rotate(_):
+        barrier.wait(timeout=5)
+        return world.post("/v1/worker/credentials/rotate", {}, token=world.worker_token)
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        responses = list(pool.map(rotate, range(2)))
+    assert sorted(response.status_code for response in responses) == [200, 409]

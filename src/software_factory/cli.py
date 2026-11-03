@@ -16,6 +16,7 @@ from .models import (
     Workspace,
     new_id,
 )
+from .security import redact
 from .service import Service, issue_token, token_hash
 
 
@@ -49,6 +50,7 @@ def main():
     )
     revoke = sub.add_parser("revoke", help="Revoke a local user/worker credential")
     revoke.add_argument("--principal-id", required=True)
+    revoke.add_argument("--reason", default="Local administrator revoked credential")
     revoke_repository = sub.add_parser(
         "revoke-repository", help="Revoke repository execution access"
     )
@@ -168,13 +170,20 @@ def main():
             if principal is None:
                 parser.error("principal not found")
             service.lock_workspace(session, principal.workspace_id)
+            session.refresh(principal)
+            previous_active = principal.active
             principal.active = False
             session.add(
                 AuditEvent(
                     workspace_id=principal.workspace_id,
                     actor_id="local-admin",
                     operation="principal.revoke",
-                    body={"principal_id": principal.id},
+                    body={
+                        "principal_id": principal.id,
+                        "before_active": previous_active,
+                        "after_active": False,
+                        "reason": redact(args.reason),
+                    },
                     created_at=db_now(session),
                 )
             )

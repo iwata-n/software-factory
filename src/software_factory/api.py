@@ -793,8 +793,14 @@ def create_app(
         return service.read(token, query)
 
     @app.post("/v1/worker/enroll", status_code=201, tags=["Worker"])
-    def enroll(data: Enroll):
+    def enroll(data: Enroll, response: Response):
+        response.headers["Cache-Control"] = "no-store"
         return service.enroll(data.token, data.name)
+
+    @app.post("/v1/worker/credentials/rotate", tags=["Worker"])
+    def rotate_worker_credential(token: Token, response: Response, key: Key = None):
+        response.headers["Cache-Control"] = "no-store"
+        return service.rotate_worker_token(token, key)
 
     @app.post("/v1/worker/claims", tags=["Worker"])
     def claim(data: Claim, token: Token):

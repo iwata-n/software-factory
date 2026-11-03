@@ -42,10 +42,14 @@ class Principal(Tenant, Base):
     __table_args__ = (
         UniqueConstraint("workspace_id", "id"),
         CheckConstraint("role IN ('USER', 'WORKER', 'PUBLISHER')", name="ck_principals_role"),
+        UniqueConstraint("previous_token_hash", name="uq_principals_previous_token"),
     )
     role: Mapped[str] = mapped_column(String(20))
     token_hash: Mapped[str] = mapped_column(String(64), unique=True)
     active: Mapped[bool] = mapped_column(Boolean, default=True)
+    token_expires_at: Mapped[float | None] = mapped_column(Float, nullable=True)
+    previous_token_hash: Mapped[str | None] = mapped_column(String(64))
+    previous_token_expires_at: Mapped[float | None] = mapped_column(Float, nullable=True)
 
 
 class Enrollment(Tenant, Base):
