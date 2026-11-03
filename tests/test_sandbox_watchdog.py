@@ -222,8 +222,10 @@ for p in ['/var/run/docker.sock', '/root/.ssh', HOST_CANARY]:
         pass
     else:
         raise AssertionError(p)
-Path('/work/escape').symlink_to(HOST_CANARY)
-assert not Path('/work/escape').exists()
+escape = Path('/work/escape')
+escape.symlink_to(HOST_CANARY)
+assert not escape.exists()
+escape.unlink()
 try:
     Path('/etc/sf21').touch()
 except OSError as exc:
