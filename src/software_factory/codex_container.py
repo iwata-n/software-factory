@@ -2,8 +2,10 @@
 
 import os
 import re
+import select
 import stat
 import subprocess
+import sys
 import time
 from contextlib import contextmanager
 from pathlib import Path
@@ -13,20 +15,45 @@ from uuid import uuid4
 
 from . import model_egress
 from .codex_engine import CodexCLI, CodexError, file_hash
+from .codex_watchdog import AUTH_PREFIX, names
 from .sandbox import STOP_UNCONFIRMED, DockerRunner, RunnerError
+from .sandbox_watchdog import docker_environment
 
 
 @contextmanager
-def model_network(image_digest, allowed_hosts):
+def owner_guard(invocation, scratch):
+    environment = docker_environment() | {"PYTHONPATH": str(Path(__file__).resolve().parents[1])}
+    with subprocess.Popen(
+        [sys.executable, "-m", "software_factory.codex_watchdog", invocation, scratch],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        env=environment,
+        start_new_session=True,
+    ) as guard:
+        try:
+            ready, _, _ = select.select([guard.stdout], [], [], 5)
+            if not ready or guard.stdout.read(1) != b"1":
+                raise CodexError("CODEX_WATCHDOG_UNAVAILABLE", "INFRASTRUCTURE", before_launch=True)
+            yield
+        finally:
+            try:
+                guard.stdin.write(b"1")
+                guard.stdin.close()
+                guard.wait(timeout=2)
+            except (BrokenPipeError, subprocess.TimeoutExpired):
+                guard.kill()
+                guard.wait(timeout=2)
+
+
+@contextmanager
+def model_network(image_digest, allowed_hosts, invocation=None):
     if not re.fullmatch(r"sha256:[0-9a-f]{64}", image_digest):
         raise ValueError("a pinned local image content digest is required")
     allowed_hosts = tuple(sorted(set(allowed_hosts)))
     model_egress.validate_hosts(allowed_hosts)
 
-    suffix = uuid4().hex
-    internal = "factory-model-internal-" + suffix
-    external = "factory-model-external-" + suffix
-    proxy = "factory-model-gateway-" + suffix
+    _, proxy, external, internal = names(invocation or uuid4().hex)
     alias = "model-gateway"
     proxy_url = f"http://{alias}:8080"
     resources = []
@@ -199,7 +226,7 @@ class DockerCodexCLI(CodexCLI):
 
     def argv(self, schema_path):
         schema_path.chmod(0o444)
-        name = "factory-isolated-codex-" + uuid4().hex
+        name = self._container_name
         self._container = name
         created = DockerRunner.docker(
             "create",
@@ -262,12 +289,17 @@ class DockerCodexCLI(CodexCLI):
         if not self._run_lock.acquire(blocking=False):
             raise CodexError("CODEX_ALREADY_RUNNING", "POLICY", before_launch=True)
         try:
-            with TemporaryDirectory(prefix="factory-codex-auth-") as root:
+            invocation = uuid4().hex
+            self._container_name = names(invocation)[0]
+            scratch = TemporaryDirectory(prefix=AUTH_PREFIX + invocation + "-")
+            with owner_guard(invocation, scratch.name), scratch as root:
                 self._auth_copy = Path(root) / "auth.json"
                 self.copy_auth(self._auth_copy)
                 isolation = self.manifest.isolation
                 try:
-                    with model_network(isolation.image_digest, isolation.allowed_hosts) as network:
+                    with model_network(
+                        isolation.image_digest, isolation.allowed_hosts, invocation
+                    ) as network:
                         self._network, self._proxy_url = network
                         try:
                             return super().run(context, output_model, cancelled, timeout=timeout)
