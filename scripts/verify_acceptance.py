@@ -16,6 +16,8 @@ from acceptance_support import (
     task_criteria,
 )
 
+from software_factory.contracts import digest
+
 
 def completion_status(verified):
     pending = sorted(set(task_criteria()) - verified)
@@ -209,6 +211,66 @@ def verify_control_plane_restart(report, publisher, manifest):
     return [draft["url"], check["url"]]
 
 
+def verify_current_pr_drift(report, manifest):
+    result = report["original_result"]
+    draft = result["draft_pr"]
+    current = report["current_pr"]
+    rerun = report["current_ci"]
+    if (
+        report["revision"] != manifest["revision"]
+        or report["run_id"] != draft["run_id"]
+        or report["pr_url"] != draft["url"]
+        or result["kind"] != "VERIFIED_DRAFT_PR"
+        or report["historical_head"] != draft["head_sha"]
+        or report["current_head"] == draft["head_sha"]
+        or report["merged"] is not False
+        or report["result_digests"] != [digest(result)] * 3
+        or current
+        != {
+            "status": "OBSERVED",
+            "state": "CLOSED",
+            "draft": True,
+            "head_sha": report["current_head"],
+            "base_sha": draft["base_sha"],
+            "target_matches": False,
+        }
+    ):
+        raise ValueError("Current PR drift differs from the immutable successful result")
+
+    def github(path):
+        return json.loads(
+            subprocess.check_output(
+                ["gh", "api", f"repos/iwata-n/software-factory/{path}"], timeout=15
+            )
+        )
+
+    pull = github(f"pulls/{int(draft['number'])}")
+    commit = github(f"git/commits/{current['head_sha']}")
+    workflow = github(f"actions/runs/{int(rerun['id'])}")
+    (check,) = result["checks"]
+    original_job = github(f"actions/jobs/{int(check['provider_run_id'])}")
+    if (
+        pull["html_url"] != draft["url"]
+        or pull["state"] != "closed"
+        or pull["merged"]
+        or not pull["draft"]
+        or pull["base"]["sha"] != draft["base_sha"]
+        or pull["head"]["sha"] != current["head_sha"]
+        or [parent["sha"] for parent in commit["parents"]] != [draft["head_sha"]]
+        or original_job["head_sha"] != draft["head_sha"]
+        or original_job["conclusion"] != "success"
+        or original_job["html_url"] != check["url"]
+        or workflow["head_sha"] != current["head_sha"]
+        or workflow["event"] != "pull_request"
+        or workflow["status"] != "completed"
+        or workflow["path"] != ".github/workflows/factory-evaluation.yml"
+        or workflow["html_url"] != rerun["url"]
+        or workflow["conclusion"] != rerun["conclusion"]
+    ):
+        raise ValueError("GitHub does not confirm PR head drift, closure and the CI rerun")
+    return [draft["url"], check["url"], rerun["url"]]
+
+
 def audit(directory: Path, *, allow_ci_pending: bool = False) -> dict:
     manifest = json.loads((directory / "manifest.json").read_text())
     current = source_manifest()
@@ -375,17 +437,29 @@ def audit(directory: Path, *, allow_ci_pending: bool = False) -> dict:
         urls = verify_control_plane_restart(
             json.loads(control_restart.read_text()), report, manifest
         )
-        path, record = records["SF-19-AC06"]
+        for criterion in ("SF-19-AC03", "SF-19-AC06"):
+            path, record = records[criterion]
+            record.update(
+                result="PASS",
+                external_urls=urls,
+                external_verification={
+                    "filename": control_restart.name,
+                    "sha256": sha(control_restart.read_bytes()),
+                },
+                evidence_paths=list(
+                    dict.fromkeys([*record["evidence_paths"], restart.name, control_restart.name])
+                ),
+            )
+            path.write_text(json.dumps(record, indent=2, ensure_ascii=False))
+    drift = directory / EXTERNAL_CRITERIA["SF-19-AC05"]
+    if drift.exists():
+        urls = verify_current_pr_drift(json.loads(drift.read_text()), manifest)
+        path, record = records["SF-19-AC05"]
         record.update(
             result="PASS",
             external_urls=urls,
-            external_verification={
-                "filename": control_restart.name,
-                "sha256": sha(control_restart.read_bytes()),
-            },
-            evidence_paths=list(
-                dict.fromkeys([*record["evidence_paths"], restart.name, control_restart.name])
-            ),
+            external_verification={"filename": drift.name, "sha256": sha(drift.read_bytes())},
+            evidence_paths=list(dict.fromkeys([*record["evidence_paths"], drift.name])),
         )
         path.write_text(json.dumps(record, indent=2, ensure_ascii=False))
     for ac, (_, record) in records.items():

@@ -283,21 +283,29 @@ def verify_live_pr_drift(user, run_id, output, identity, restart_control_plane):
     else:
         raise RuntimeError("GitHub did not expose the changed head and completed CI")
     assert not moved["target_matches"] and current_ci["head_sha"] == new_head
-    assert user.get(path).raise_for_status().json() == original
+    after_ci = user.get(path).raise_for_status().json()
+    assert after_ci == original
     closed = mutate("PATCH", f"pulls/{draft['number']}", {"state": "closed"})
     assert closed["state"] == "closed" and not closed["merged"]
     restart_control_plane()
     current = user.get(path + "/current-pr").raise_for_status().json()
     assert current["state"] == "CLOSED" and not current["target_matches"]
     assert current["head_sha"] == new_head
-    assert user.get(path).raise_for_status().json() == original
+    after_close = user.get(path).raise_for_status().json()
+    assert after_close == original
     report = {
         "revision": identity["revision"],
         "run_id": run_id,
         "pr_url": draft["url"],
         "historical_head": draft["head_sha"],
         "current_head": new_head,
-        "current_ci": {"url": current_ci["html_url"], "conclusion": current_ci["conclusion"]},
+        "current_ci": {
+            "id": current_ci["id"],
+            "url": current_ci["html_url"],
+            "conclusion": current_ci["conclusion"],
+        },
+        "original_result": original,
+        "result_digests": [digest(snapshot) for snapshot in (original, after_ci, after_close)],
         "current_pr": current,
         "historical_result_unchanged": True,
         "merged": closed["merged"],
