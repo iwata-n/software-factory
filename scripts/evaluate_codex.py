@@ -59,8 +59,8 @@ PROFILES = {
         "criteria": [
             "parse_count accepts only one to nine ASCII digits and returns an integer including 0",
             (
-                "Invalid lengths, non-ASCII digits, spaces and other invalid strings raise ValueError; "
-                "stable_label is unchanged"
+                "Invalid lengths, non-ASCII digits, spaces and other invalid strings "
+                "raise ValueError; stable_label is unchanged"
             ),
         ],
         "tests": (

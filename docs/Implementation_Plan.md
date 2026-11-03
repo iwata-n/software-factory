@@ -760,6 +760,18 @@ GitHubの既定ブランチが `codex/sf01-07-acceptance` であることを確�
 
 対象 `962b9d3`、固定base `2e914e63c4042b81459209e2310688f0fb45d443` のEVAL-01で、実CodexのPlan・変更・独立レビュー、実Docker Verifier、実Publisher、[Draft PR #12](https://github.com/iwata-n/software-factory/pull/12)、[必須CI PASS](https://github.com/iwata-n/software-factory/actions/runs/41611793809/job/125835242794)を通した。Run `4f4e95a1-ce77-4f99-8126-2774d694c27e` は `VERIFIED_DRAFT_PR`、PR headとCI検証SHAが一致、人のコード修正0、usage受領3件、予算用推計74,456 microUSD。結果とSlack通知予約は再起動後も維持された。証拠は `.local/evaluation/codex-live-publication-01/evaluation.json`。Codex CLIは既存のホスト接続を使用した。この実行は隔離された実Agent、Slackへの配送、同一revisionでのEVAL-01〜03一括受け入れを含まない。
 
+### 固定3評価の同一revisionでの実CodexとGitHub CI
+
+`8e9efacfd8da6e567ab0cad56b01db5b8e106d55+inputs-9e7800e1a75f9ea0`、固定base `2e914e63c4042b81459209e2310688f0fb45d443` でEVAL-01〜03を実行した。独立Linux Runnerでbaseの想定失敗1/5/4件と互換性テストの成功を確認し、実CodexのPlan・実装・レビュー後は全3 Runが `VERIFIED_DRAFT_PR`。各PR headは必須CIの検証SHAと一致し、人によるコード修正・修正ラウンド・merge/deployはいずれも0件だった。
+
+| 評価 | 実Draft PR | 実CI | 予算用推計（microUSD） | 所要時間（秒） |
+|---|---|---|---:|---:|
+| EVAL-01 空状態 | [#14](https://github.com/iwata-n/software-factory/pull/14) | [PASS](https://github.com/iwata-n/software-factory/actions/runs/41612219553/job/125836679340) | 73,580 | 131.910 |
+| EVAL-02 入力検証 | [#15](https://github.com/iwata-n/software-factory/pull/15) | [PASS](https://github.com/iwata-n/software-factory/actions/runs/41612223673/job/125836692939) | 75,528 | 133.831 |
+| EVAL-03 空白整形 | [#13](https://github.com/iwata-n/software-factory/pull/13) | [PASS](https://github.com/iwata-n/software-factory/actions/runs/41612218754/job/125836676511) | 74,130 | 131.595 |
+
+証拠は `.local/evaluation/codex-three-profile-batch-01/summary.json` と各RunのTaskSpec/Policy・JUnit・利用量・Artifact・PR/CI記録。Codex CLIはホスト接続を使用し、Slackは全件通知予約までを確認した。隔離下での実Agent、実Slack配送、障害注入を含むATの全件照合は引き続き追跡する。
+
 ### SF-18〜24の並行実装の統合
 
 7タスクの着手分を統合ブランチに集約した。DB移行はWebhook Inbox 0012、公開復旧 0013、Jira／Slack 0014の順。着手分の試験は `test_sf*_boundaries.py` と各機能の回帰試験としてCIで実行する。全条件を備えた受け入れ試験モジュールと実サービス証拠は各タスクの確定時に追加する。
