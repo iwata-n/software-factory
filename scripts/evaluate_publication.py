@@ -859,7 +859,7 @@ def main():
                     }
                     (output / "webhook.json").write_text(json.dumps(proof, indent=2) + "\n")
                     assert any(row.event != "ping" for row in deliveries)
-                    assert any(row.body.get("trigger") == "WEBHOOK" for row in triggers)
+                    assert triggers and triggers[-1].body.get("trigger") == "WEBHOOK"
                 return
             first_publication = publication
             database = Database()
