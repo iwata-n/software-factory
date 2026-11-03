@@ -310,7 +310,8 @@ def test_repaired_candidate_still_stops_with_ci_timeout(pipeline, clock, evidenc
     evidence("A repaired Candidate has the same CI timeout semantics", run)
 
 
-def test_restart_confirms_result_and_notification_once(waiting):
+@pytest.mark.ac("SF-19-AC03", "SF-19-AC06")
+def test_restart_confirms_result_and_notification_once(waiting, evidence):
     world, _, poll, _, pull, _, _, _ = waiting
     path = f"/v1/runs/{world.run_id}/result"
     poll()
@@ -338,10 +339,15 @@ def test_restart_confirms_result_and_notification_once(waiting):
     with pytest.raises(IntegrityError, match="EVIDENCE_IMMUTABLE"):
         with world.database.transaction() as session:
             session.execute(text("DELETE FROM verified_run_results"))
+    evidence(
+        "one immutable result and one notification after concurrent reconciliation",
+        {"results": 1, "notifications": 1, "head_sha": snapshot["draft_pr"]["head_sha"]},
+    )
 
 
+@pytest.mark.ac("SF-19-AC04")
 @pytest.mark.parametrize("fault", ["head", "missing", "failure", "cancel"])
-def test_final_gate_cannot_finalize_after_target_or_ci_changes(waiting, fault):
+def test_final_gate_cannot_finalize_after_target_or_ci_changes(waiting, fault, evidence):
     world, _, poll, _, pull, _, check, stub = waiting
     poll()
     ready = world.run()
@@ -372,9 +378,14 @@ def test_final_gate_cannot_finalize_after_target_or_ci_changes(waiting, fault):
         assert world.run()["stop_reason"] == "GITHUB_CI_TARGET_CHANGED"
     if fault == "cancel":
         assert world.run()["status"] == "CANCELLED"
+    evidence(
+        "invalidated candidate CI evidence cannot produce a verified result",
+        {"fault": fault, "status": world.run()["status"], "verified_results": 0},
+    )
 
 
-def test_result_outbox_and_terminal_status_roll_back_together(waiting):
+@pytest.mark.ac("SF-19-AC03")
+def test_result_outbox_and_terminal_status_roll_back_together(waiting, evidence):
     world, clock, poll, _, _, _, _, _ = waiting
     poll()
 
@@ -394,14 +405,21 @@ def test_result_outbox_and_terminal_status_roll_back_together(waiting):
     clock.value += 60
     poll()
     assert world.run()["status"] == "SUCCEEDED"
+    evidence(
+        "verified result and notification share the terminal transaction", {"retry": "SUCCEEDED"}
+    )
 
 
-def test_current_pr_changes_do_not_modify_verified_result(waiting, monkeypatch):
-    world, _, poll, _, pull, _, _, stub = waiting
+@pytest.mark.ac("SF-19-AC05")
+def test_current_pr_changes_do_not_modify_verified_result(waiting, monkeypatch, evidence):
+    world, _, poll, _, pull, _, check, stub = waiting
     poll()
     poll()
     path = f"/v1/runs/{world.run_id}/result"
     snapshot = world.get(path).json()
+    stub["checks"] = [check | {"id": 101, "conclusion": "failure"}]
+    poll()
+    assert world.get(path).json() == snapshot
 
     monkeypatch.setattr(api, "configured_webhooks", lambda: stub["integrations"])
     monkeypatch.setattr(api, "configured_read_tokens", lambda: stub["tokens"])
@@ -442,6 +460,10 @@ def test_current_pr_changes_do_not_modify_verified_result(waiting, monkeypatch):
     }
     assert client.get(path, headers=headers).json() == snapshot
     assert world.run()["status"] == "SUCCEEDED"
+    evidence(
+        "current PR drift and new CI outcomes leave prior verified evidence unchanged",
+        {"historical_status": world.run()["status"], "current_target_matches": False},
+    )
 
 
 @pytest.mark.parametrize("waiting", [None, MERGE], indirect=True)

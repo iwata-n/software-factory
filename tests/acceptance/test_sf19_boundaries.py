@@ -179,7 +179,7 @@ def test_unresolved_reads_wait_one_two_four_seconds(backend, tmp_path, clock, ev
     evidence("three due read-only attempts", {"delays": delays, "creates": 0, "failure": failure})
 
 
-# Covers cancellation during recovery. Final Gate races depend on the SF-18 contract.
+@pytest.mark.ac("SF-19-AC04")
 @pytest.mark.parametrize("trial", range(10))
 def test_cancel_and_recovered_pr_report_keep_external_history(backend, clock, evidence, trial):
     pub, provider, inputs, _, _ = backend
