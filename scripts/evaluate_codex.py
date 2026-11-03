@@ -286,6 +286,8 @@ def main():
             "DOCKER_CONFIG",
         }
     }
+    # Child services must use the same checkout as the measured implementation.
+    base_env["PYTHONPATH"] = str(ROOT / "src")
     source_port, cp_port = available_port(), available_port()
     while cp_port == source_port:
         cp_port = available_port()
