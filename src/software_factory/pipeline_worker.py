@@ -2,6 +2,7 @@
 
 import base64
 import json
+import subprocess
 import time
 from threading import Event, Lock, Thread
 
@@ -163,7 +164,9 @@ class PipelineAdapter:
                     usage_deliveries=result_value.usage_deliveries,
                 )
             with self._lock:
-                if generation == self._generation:
+                if generation == self._generation and (
+                    self._result is None or self._result.reason != STOP_UNCONFIRMED
+                ):
                     self._events.extend(events)
                     self._result = result_value
 
@@ -315,22 +318,29 @@ class PipelineAdapter:
             return self._result
 
     def cancel(self):
+        deadline = time.monotonic() + 7
         with self._lock:
             cancelled, generation, thread = self._cancel, self._generation, self._thread
         cancelled.set()
-        self.runner.cancel()
+        stop_unconfirmed = False
         if self.reviewer and hasattr(self.reviewer, "cancel"):
-            self.reviewer.cancel()
+            try:
+                self.reviewer.cancel()
+            except (OSError, subprocess.SubprocessError):
+                stop_unconfirmed = True
         if thread:
-            thread.join(timeout=2)
+            thread.join(timeout=max(0, deadline - time.monotonic()))
+            stop_unconfirmed |= thread.is_alive()
         with self._lock:
             if generation == self._generation:
                 result = self._result
                 if result and result.reason == STOP_UNCONFIRMED:
                     return
                 self._result = AgentResult(
-                    "CANCELLED",
+                    "FAILED" if stop_unconfirmed else "CANCELLED",
                     {},
+                    category="INFRASTRUCTURE" if stop_unconfirmed else None,
+                    reason=STOP_UNCONFIRMED if stop_unconfirmed else None,
                     usage_microusd=result.usage_microusd if result else None,
                     usage_deliveries=result.usage_deliveries if result else (),
                 )

@@ -386,6 +386,8 @@ Gateは必須Jobが処理中なら待機を続ける。全必須Jobが終端ま�
 | SF-21-AC06 | 正常完了/失敗/kill/アップロード失敗後にcleanupを実行 | 停止済みcontainer、作業領域、一時資格情報を60秒以内に破棄。永続証拠だけ保持し、再実行で誤削除0 | IT：全終了経路のcontainer/volume/秘密canary一覧、cleanup監査 |
 | SF-21-AC07 | image tagの中身変更、Agentから制約変更、外部ユーザーWorker由来の証拠を提出 | 実image digest不一致は実行前ERROR。制約変更を無視せず拒否。未管理Workerをmanaged証拠に昇格しない | CT/IT：digest不一致fixture、inspect、evidence_originと採用Gate |
 
+管理対象Workerは、確認済みLeaseの期限10秒前に停止処理を開始する。コンテナの停止または実行スレッドの終了を確認できなければ `STOP_UNCONFIRMED` を報告し、以後のClaimを停止する。Control Planeが報告を受理するとWorker資格情報を失効させ、運用表示にも停止未確認を残す。同じRunner状態ディレクトリで再起動する場合、以前のコンテナの停止・回収を確認できない間は起動を拒否する。実DockerとPostgreSQLによる境界試験を追加した。実Codexの隔離実行・通信制限・通信断を含むSF-20/21の受け入れは継続する。
+
 ### SF-22 Jira入力とSlack通知
 
 依存SF-07/19。試験追加先は `tests/acceptance/test_sf22.py`。Jira入力はMVPでは専用欄の構造化TaskSpecを使う。実接続は評価専用Project/通知先を設定した環境で検証し、一般の業務データへ試験送信しない。

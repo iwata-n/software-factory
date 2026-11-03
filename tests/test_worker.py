@@ -334,3 +334,24 @@ def test_managed_execution_reserves_ten_seconds_for_stop(allowance, expected_cal
     with httpx.Client(base_url="http://localhost", transport=httpx.MockTransport(handle)) as client:
         assert Supervisor(client, ManagedAgent()).run_once()["accepted"]
     assert actions == expected_calls
+
+
+def test_pipeline_never_reports_stop_while_execution_thread_is_live():
+    from software_factory.pipeline_worker import PipelineAdapter
+
+    class RunningStage:
+        def join(self, timeout):
+            assert 0 < timeout <= 7
+            assert adapter._cancel.is_set()
+
+        def is_alive(self):
+            return True
+
+    adapter = PipelineAdapter(object())
+    adapter._thread = RunningStage()
+    adapter.cancel()
+    assert adapter.result().outcome == "FAILED"
+    assert adapter.result().reason == "STOP_UNCONFIRMED"
+    # A late result from the same generation cannot clear the quarantine.
+    adapter.execute({"snapshot": {}}, adapter._cancel, adapter._generation, None)
+    assert adapter.result().reason == "STOP_UNCONFIRMED"
