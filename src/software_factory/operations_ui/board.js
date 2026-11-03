@@ -314,7 +314,10 @@ function graphView(graph) {
   const nodes = graph.jobs.map((job) => {
     const node = element("details", undefined, "record");
     node.append(element("summary", `${job.kind} · ${job.state} · 試行 ${job.attempt_no}`));
-    node.append(fields([["Job ID", job.job_id], ["Step", job.step_key]]));
+    node.append(fields([
+      ["Job ID", job.job_id], ["Step", job.step_key],
+      ...(job.kind === "REPAIR" ? [["修正ラウンド", job.repair_round]] : []),
+    ]));
     node.append(records("試行", job.attempts, (attempt) => [
       ["Attempt ID", attempt.attempt_id], ["状態", attempt.state],
       ["Worker", attempt.worker_id], ["Heartbeat", date(attempt.heartbeat_at)],
@@ -336,6 +339,7 @@ function publicationView(publication) {
     records("公開処理", publication.operations, (op) => [
       ["種別", op.kind], ["状態", op.state], ["理由", op.reason],
       ["照合試行", op.reconcile_attempts], ["次回照合", date(op.next_reconcile_at)],
+      ...(op.required_action ? [["必要な判断", op.required_action]] : []),
     ]),
   );
 }
