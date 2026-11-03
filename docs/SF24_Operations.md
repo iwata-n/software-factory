@@ -48,3 +48,13 @@ PYTHONPATH=src python scripts/factory_maintenance.py \
 ## 検証範囲
 
 `tests/test_factory_maintenance.py` は小規模な一時 PostgreSQL を対象に、暗号化・世代回転・誤った鍵の拒否・復元照合・旧 Worker 認証拒否・保持期限を検証する。別担当者による運用演習、指定規模での RPO/RTO、外部照合、90日保持と冪等性台帳の削除後再送は、残りの受け入れ項目として記録する。
+
+## 実Codex評価の集計
+
+同一バッチの3件について、成功・失敗を問わず評価出力のディレクトリを指定します。
+
+```sh
+uv run python scripts/summarize_codex_batch.py "$EVAL_01" "$EVAL_02" "$EVAL_03"
+```
+
+集計は同一リビジョン・入力digest・エンジンmanifestの3件を照合し、実CI確認済みのDraft PR数と、通知の配送記録までそろった件数を分けて出力します。再評価時は別ディレクトリを使用し、旧バッチの出力と集計を保持します。故障注入試験は条件別の受け入れ台帳で管理します。
