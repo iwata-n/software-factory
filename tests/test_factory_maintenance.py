@@ -182,7 +182,7 @@ def test_retention_prunes_only_old_history_prefix_and_keeps_terminal_anchor(worl
         database.engine.dispose()
 
 
-@pytest.mark.ac("SF-24-AC05")
+@pytest.mark.ac("SF-24-AC05", "SF-24-AC06")
 def test_encrypted_backup_restore(world, artifacts, tmp_path, monkeypatch, capsys):
     root = world.client.app.state.service.artifacts.storage.root
     evidence = artifacts.ready()
@@ -208,9 +208,12 @@ def test_encrypted_backup_restore(world, artifacts, tmp_path, monkeypatch, capsy
         check=True,
     )
     destination = tmp_path / "generations"
+    generations = []
     for _ in range(8):
         result = backup(world.database, root, destination, certificate)
-    assert len(list(destination.glob("*.cms"))) == 7
+        generations.append(Path(result["backup"]))
+    assert not generations[0].exists()
+    assert set(destination.glob("*.cms")) == set(generations[1:])
     bundle = Path(result["backup"])
     assert bundle.stat().st_mode & 0o077 == 0
     assert result["artifact_bytes"] == 5
