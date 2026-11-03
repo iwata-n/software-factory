@@ -63,21 +63,25 @@ def postgres(database, command, *args):
     )
 
 
+def inventory_rows(connection):
+    return [
+        [identifier(workspace), identifier(artifact), size, sha]
+        for workspace, artifact, size, sha in connection.execute(
+            select(
+                Artifact.workspace_id,
+                Artifact.id,
+                Artifact.stored_size_bytes,
+                Artifact.stored_sha256,
+            )
+            .where(Artifact.status.in_(["AVAILABLE", "UPLOADED"]))
+            .order_by(Artifact.workspace_id, Artifact.id)
+        )
+    ]
+
+
 def inventory(database):
     with database.transaction() as session:
-        return [
-            [identifier(workspace), identifier(artifact), size, sha]
-            for workspace, artifact, size, sha in session.execute(
-                select(
-                    Artifact.workspace_id,
-                    Artifact.id,
-                    Artifact.stored_size_bytes,
-                    Artifact.stored_sha256,
-                )
-                .where(Artifact.status.in_(["AVAILABLE", "UPLOADED"]))
-                .order_by(Artifact.workspace_id, Artifact.id)
-            )
-        ]
+        return inventory_rows(session)
 
 
 def checked_body(storage, row):
@@ -100,25 +104,43 @@ def backup(database, root, destination, certificate):
         fcntl.flock(lock, fcntl.LOCK_EX)
         with TemporaryDirectory() as work, TemporaryDirectory(dir=destination) as sealed:
             stage = Path(work)
-            started = time.time_ns()
             dump = stage / "database.dump"
-            postgres(database, "pg_dump", "--format=custom", "--file", str(dump))
-            rows = inventory(database)
             source = LocalArtifactStorage(root)
             manifest = stage / "manifest.json"
-            manifest.write_text(
-                json.dumps({"version": 1, "captured_at_ns": started, "artifacts": rows})
-            )
             bundle = stage / "bundle.tar"
-            with tarfile.open(bundle, "w") as archive:
-                archive.add(manifest, arcname=manifest.name)
-                archive.add(dump, arcname=dump.name)
-                for row in rows:
-                    body = checked_body(source, row)
-                    workspace, artifact = row[:2]
-                    entry = tarfile.TarInfo(f"artifacts/{workspace}/{artifact}")
-                    entry.size = len(body)
-                    archive.addfile(entry, BytesIO(body))
+            with database.engine.connect().execution_options(
+                isolation_level="REPEATABLE READ"
+            ) as connection:
+                with connection.begin():
+                    # Artifact changes use the same workspace mutex as database changes.
+                    connection.execute(
+                        select(Workspace.id).order_by(Workspace.id).with_for_update()
+                    ).all()
+                    started = time.time_ns()
+                    snapshot = connection.scalar(text("SELECT pg_export_snapshot()"))
+                    postgres(
+                        database,
+                        "pg_dump",
+                        "--snapshot",
+                        snapshot,
+                        "--format=custom",
+                        "--file",
+                        str(dump),
+                    )
+                    rows = inventory_rows(connection)
+                    manifest.write_text(
+                        json.dumps({"version": 1, "captured_at_ns": started, "artifacts": rows})
+                    )
+                    with tarfile.open(bundle, "w") as archive:
+                        archive.add(manifest, arcname=manifest.name)
+                        archive.add(dump, arcname=dump.name)
+                        for row in rows:
+                            body = checked_body(source, row)
+                            workspace, artifact = row[:2]
+                            entry = tarfile.TarInfo(f"artifacts/{workspace}/{artifact}")
+                            entry.size = len(body)
+                            archive.addfile(entry, BytesIO(body))
+            dump_size = dump.stat().st_size
             encrypted = Path(sealed) / "bundle.cms"
             subprocess.run(
                 [
@@ -139,13 +161,25 @@ def backup(database, root, destination, certificate):
                 check=True,
             )
             target = destination / f"factory-{started:020d}-{uuid4().hex}.cms"
+            encrypted.chmod(0o600)
             with encrypted.open("rb") as stream:
                 os.fsync(stream.fileno())
             encrypted.rename(target)
         generations = sorted(p for p in destination.iterdir() if GENERATION.fullmatch(p.name))
         for expired in generations[:-7]:
             expired.unlink()
-    return {"backup": str(target), "captured_at_ns": started, "artifacts": len(rows)}
+        directory = os.open(destination, os.O_RDONLY)
+        try:
+            os.fsync(directory)
+        finally:
+            os.close(directory)
+    return {
+        "backup": str(target),
+        "captured_at_ns": started,
+        "artifacts": len(rows),
+        "artifact_bytes": sum(row[2] for row in rows),
+        "database_dump_bytes": dump_size,
+    }
 
 
 def member(archive, name, limit=None):
@@ -221,6 +255,25 @@ def restore(database, root, bundle, certificate, key):
             raise ValueError("Restored database and Artifact inventory disagree")
         with database.transaction() as session:
             now = db_now(session)
+            for workspace in session.scalars(select(Workspace)):
+                if not workspace.execution_stopped:
+                    before = workspace.execution_stop_revision
+                    workspace.execution_stopped = True
+                    workspace.execution_stop_revision += 1
+                    session.add(
+                        AuditEvent(
+                            workspace_id=workspace.id,
+                            actor_id="local-admin",
+                            operation="workspace.execution.stop",
+                            body={
+                                "workspace_id": workspace.id,
+                                "reason": "RESTORE_RECONCILIATION_REQUIRED",
+                                "before_revision": before,
+                                "after_revision": workspace.execution_stop_revision,
+                            },
+                            created_at=now,
+                        )
+                    )
             session.execute(
                 update(Principal)
                 .where(Principal.role.in_(["WORKER", "PUBLISHER"]))

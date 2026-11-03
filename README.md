@@ -316,3 +316,21 @@ GitHub Actions（App ID `15368`）の必須チェックには、Policy の `requ
     EXPECTED_HEAD: ${{ github.event.pull_request.head.sha }}
   run: test "$(git rev-parse HEAD)" = "$EXPECTED_HEAD"
 ```
+
+## バックアップと復元
+
+バックアップではPostgreSQLの同一スナップショットをDBダンプとArtifact台帳に使用し、Artifact本体のサイズとSHA-256を照合します。暗号化先はArtifactルートとは別の、所有者専用のディレクトリを指定します。日次運用では、停止時間帯に以下のバックアップを24時間ごとに実行し、結果の時刻・サイズ・失敗を記録します。7世代を保持します。
+
+```sh
+uv run python scripts/factory_maintenance.py --offline --artifact-root "$SOURCE_ARTIFACT_ROOT" \
+  backup "$BACKUP_DIR" --certificate "$BACKUP_CERTIFICATE"
+```
+
+復元する際は、稼働サービスから分離した空DBを `FACTORY_DATABASE_URL` に設定し、存在しない新しいArtifactルートを指定します。秘密鍵は復元担当者だけが参照できる場所から渡します。
+
+```sh
+uv run python scripts/factory_maintenance.py --offline --artifact-root "$RESTORE_ARTIFACT_ROOT" \
+  restore "$BACKUP_BUNDLE" --certificate "$BACKUP_CERTIFICATE" --key "$BACKUP_PRIVATE_KEY"
+```
+
+`STAGED_RECONCILIATION_REQUIRED` を確認してから、復元先のControl Planeを隔離状態で起動します。復元は全Workspaceを停止状態にし、旧Worker・Publisher資格情報と旧Leaseの実行権を失効させます。Workerを同じIDで復旧する場合は、ローカル管理者が復元先を指定して `python -m software_factory.cli reissue-worker --worker-id <id> --reason '<理由>'` を実行します。新しい資格情報で旧Leaseが拒否されることを確認し、未確定の公開を照合してから停止解除を判断します。

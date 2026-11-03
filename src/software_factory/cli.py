@@ -17,7 +17,7 @@ from .models import (
     new_id,
 )
 from .security import redact
-from .service import Service, issue_token, token_hash
+from .service import WORKER_TOKEN_SECONDS, Service, issue_token, token_hash
 
 
 def main():
@@ -54,6 +54,11 @@ def main():
     revoke = sub.add_parser("revoke", help="Revoke a local user/worker credential")
     revoke.add_argument("--principal-id", required=True)
     revoke.add_argument("--reason", default="Local administrator revoked credential")
+    reissue = sub.add_parser(
+        "reissue-worker", help="Reissue an inactive Worker in a stopped Workspace"
+    )
+    reissue.add_argument("--worker-id", required=True)
+    reissue.add_argument("--reason", required=True)
     revoke_repository = sub.add_parser(
         "revoke-repository", help="Revoke repository execution access"
     )
@@ -176,6 +181,36 @@ def main():
                 )
             )
             result = {"enrollment_token": secret}
+        elif args.command == "reissue-worker":
+            worker = session.get(Principal, args.worker_id)
+            if worker is None or worker.role != "WORKER":
+                parser.error("Worker not found")
+            service.lock_workspace(session, worker.workspace_id)
+            session.refresh(worker)
+            workspace = session.get(Workspace, worker.workspace_id)
+            if worker.active or not workspace.execution_stopped:
+                parser.error("Worker reissue requires an inactive Worker and a stopped Workspace")
+            secret, now = issue_token(), db_now(session)
+            worker.token_hash = token_hash(secret)
+            worker.token_expires_at = now + WORKER_TOKEN_SECONDS
+            worker.previous_token_hash = None
+            worker.previous_token_expires_at = None
+            worker.active = True
+            session.add(
+                AuditEvent(
+                    workspace_id=worker.workspace_id,
+                    actor_id="local-admin",
+                    operation="worker.credential.reissue",
+                    body={"worker_id": worker.id, "reason": redact(args.reason)},
+                    created_at=now,
+                )
+            )
+            result = {
+                "worker_id": worker.id,
+                "worker_token": secret,
+                "token_expires_at": worker.token_expires_at,
+                "protocol_version": 1,
+            }
         elif args.command == "revoke-repository":
             repository = session.get(Repository, args.repository_id)
             if repository is None:

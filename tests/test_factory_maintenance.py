@@ -1,5 +1,7 @@
+import json
 import os
 import subprocess
+import sys
 from pathlib import Path
 from uuid import uuid4
 
@@ -8,6 +10,7 @@ from sqlalchemy import func, select, text, update
 from sqlalchemy.engine import make_url
 
 from scripts.factory_maintenance import DAY, backup, collect, inventory, restore
+from software_factory import cli
 from software_factory.api import create_app
 from software_factory.db import Database, db_now
 from software_factory.models import (
@@ -19,6 +22,7 @@ from software_factory.models import (
     Run,
     RunEvent,
     WorkerEvent,
+    Workspace,
 )
 from software_factory.service import event
 from software_factory.storage import LocalArtifactStorage
@@ -171,7 +175,7 @@ def test_retention_prunes_only_old_history_prefix_and_keeps_terminal_anchor(worl
         database.engine.dispose()
 
 
-def test_encrypted_backup_restore(world, artifacts, tmp_path):
+def test_encrypted_backup_restore(world, artifacts, tmp_path, monkeypatch, capsys):
     root = world.client.app.state.service.artifacts.storage.root
     evidence = artifacts.ready()
     certificate, key = tmp_path / "backup.crt", tmp_path / "backup.key"
@@ -200,6 +204,8 @@ def test_encrypted_backup_restore(world, artifacts, tmp_path):
         result = backup(world.database, root, destination, certificate)
     assert len(list(destination.glob("*.cms"))) == 7
     bundle = Path(result["backup"])
+    assert bundle.stat().st_mode & 0o077 == 0
+    assert result["artifact_bytes"] == 5
     source_url = make_url(os.environ["TEST_DATABASE_URL"])
     admin = Database(source_url.render_as_string(hide_password=False))
     name = f"sf24_restore_{uuid4().hex}"
@@ -246,6 +252,7 @@ def test_encrypted_backup_restore(world, artifacts, tmp_path):
             attempt = session.scalar(select(Attempt))
             assert attempt.expires_at <= db_now(session)
             assert session.get(Run, world.run_id).reserved_microusd == 100_000
+            assert session.get(Workspace, world.workspace_id).execution_stopped is True
         client = TestClient(app)
         try:
             reply = client.post(
@@ -257,6 +264,37 @@ def test_encrypted_backup_restore(world, artifacts, tmp_path):
                 },
             )
             assert reply.status_code == 401
+            monkeypatch.setattr(cli, "Database", lambda: target)
+            monkeypatch.setattr(
+                sys,
+                "argv",
+                [
+                    "factory",
+                    "reissue-worker",
+                    "--worker-id",
+                    world.worker_id,
+                    "--reason",
+                    "restore",
+                ],
+            )
+            cli.main()
+            issued = json.loads(capsys.readouterr().out)
+            assert issued["worker_id"] == world.worker_id
+            headers = {"Authorization": "Bearer " + issued["worker_token"]}
+            lease = artifacts.lease
+            stale = client.post(
+                f"/v1/worker/leases/{lease['id']}/heartbeat",
+                json={"fence": lease["fence"]},
+                headers=headers,
+            )
+            assert stale.status_code == 409
+            assert stale.json()["code"] == "LEASE_EXPIRED"
+            assert (
+                client.post(
+                    "/v1/worker/claims", json={"protocol_version": 1}, headers=headers
+                ).status_code
+                == 204
+            )
         finally:
             client.close()
         with pytest.raises(ValueError, match="empty database"):
