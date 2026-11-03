@@ -77,14 +77,19 @@ class DockerRunner:
         for container in listing.stdout.decode().split():
             inspected = self.docker("inspect", container, timeout=5)
             if inspected.returncode:
+                self.require_orphan_absent(container)
                 continue
             labels = json.loads(inspected.stdout)[0]["Config"].get("Labels") or {}
             owner = labels.get("factory.owner", "")
-            if owner == self.owner or not re.fullmatch(r"[0-9a-f]{32}", owner):
+            if owner == self.owner:
+                continue
+            if not re.fullmatch(r"[0-9a-f]{32}", owner):
+                self.require_orphan_absent(container)
                 continue
             try:
                 fd = os.open(self.state_root / (owner + ".lock"), os.O_RDWR | os.O_NOFOLLOW)
             except OSError:
+                self.require_orphan_absent(container)
                 continue
             try:
                 try:
@@ -93,7 +98,7 @@ class DockerRunner:
                     continue
                 result = self.docker("rm", "--force", container, timeout=7)
                 if result.returncode:
-                    raise RunnerError("ORPHAN_STOP_UNCONFIRMED")
+                    self.require_orphan_absent(container)
                 removed.append(container)
             finally:
                 os.close(fd)
@@ -131,6 +136,14 @@ class DockerRunner:
             finally:
                 os.close(fd)
         return removed
+
+    def require_orphan_absent(self, container):
+        # A concurrent owner may have removed it since listing. Confirm absence
+        # from the daemon rather than inferring it from a failed inspect/remove.
+        listing = self.docker("ps", "-aq", "--filter", f"id={container}", timeout=5)
+        if listing.returncode or listing.stdout.strip():
+            self._quarantined.set()
+            raise RunnerError("ORPHAN_STOP_UNCONFIRMED")
 
     def execute_candidate(self, request, archive, *, timeout=120, cancelled=None):
         from .candidate_mount import readonly_tar

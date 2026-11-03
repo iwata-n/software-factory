@@ -140,3 +140,43 @@ def test_unconfirmed_cleanup_quarantines_real_managed_runner(source_bundle, runn
     finally:
         for name in pending:
             assert docker("rm", "--force", name, timeout=7).returncode == 0
+
+
+def test_restart_refuses_uninspectable_managed_container(runner, tmp_path, monkeypatch):
+    monkeypatch.setenv("FACTORY_RUNNER_STATE_ROOT", str(tmp_path / "state"))
+    previous = DockerRunner(runner.image_digest)
+    docker = DockerRunner.docker
+    started = docker(
+        "run",
+        "--detach",
+        "--network",
+        "none",
+        "--label",
+        f"factory.namespace={previous.namespace}",
+        "--label",
+        f"factory.owner={previous.owner}",
+        "--entrypoint",
+        "sleep",
+        runner.image_digest,
+        "60",
+        timeout=10,
+    )
+    assert started.returncode == 0, started.stderr.decode()
+    container = started.stdout.decode().strip()
+    del previous
+
+    def lose_inspect(*args, **kwargs):
+        if args[0] == "inspect" and container.startswith(args[1]):
+            return subprocess.CompletedProcess(args, 1, b"", b"injected inspect failure")
+        return docker(*args, **kwargs)
+
+    try:
+        with monkeypatch.context() as fault:
+            fault.setattr(DockerRunner, "docker", staticmethod(lose_inspect))
+            with pytest.raises(RunnerError, match="^ORPHAN_STOP_UNCONFIRMED$"):
+                DockerRunner(runner.image_digest)
+        DockerRunner(runner.image_digest)
+        listing = docker("ps", "-aq", "--filter", f"id={container}", timeout=5)
+        assert listing.returncode == 0 and not listing.stdout.strip()
+    finally:
+        docker("rm", "--force", container, timeout=7)
