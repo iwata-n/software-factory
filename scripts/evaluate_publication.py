@@ -24,12 +24,13 @@ from acceptance_support import source_manifest
 from alembic import command
 from alembic.config import Config
 from factory_maintenance import backup, restore
+from live_github_webhook import github_webhook_ingress
 from sqlalchemy import MetaData, select, text
 from sqlalchemy.engine import make_url
 
 from software_factory.adapters import AgentResult, Capabilities, FakeAgent, ProducedArtifact
 from software_factory.db import Database
-from software_factory.models import PublicationOperation, Run
+from software_factory.models import CIWebhookDelivery, PublicationOperation, Run, RunEvent
 from software_factory.pipeline_worker import PipelineAdapter
 from software_factory.publisher import PublicationJournal, PublisherSupervisor
 from software_factory.publisher_backend import GitHubDraftPublisher
@@ -452,11 +453,12 @@ def main():
     parser.add_argument("--fixture-base-sha")
     parser.add_argument("--restore-publication", action="store_true")
     parser.add_argument("--expect-ci-failure", action="store_true")
+    parser.add_argument("--live-webhook", action="store_true")
     args = parser.parse_args()
     live_ci = args.actions_workflow_id is not None
-    if (args.restore_publication or args.expect_ci_failure) and not live_ci:
+    if (args.restore_publication or args.expect_ci_failure or args.live_webhook) and not live_ci:
         parser.error("restore and failure rehearsals require the fixed Actions evaluation profile")
-    if args.restore_publication and args.expect_ci_failure:
+    if args.restore_publication and (args.expect_ci_failure or args.live_webhook):
         parser.error("select one rehearsal at a time")
     if live_ci != bool(args.fixture_base_sha):
         parser.error("--actions-workflow-id and --fixture-base-sha must be specified together")
@@ -766,8 +768,9 @@ def main():
                     output, identity, account, publisher, run_id, cp_url, cp_environment
                 )
                 return
-            result, publication = publish()
-            assert result["state"] == "SUCCEEDED" and state()["phase"] == "WAIT_CI"
+            if not args.live_webhook:
+                result, publication = publish()
+                assert result["state"] == "SUCCEEDED" and state()["phase"] == "WAIT_CI"
             if live_ci:
                 integration_id = str(uuid4())
                 webhook_secret = uuid4().hex + uuid4().hex
@@ -807,6 +810,13 @@ def main():
                     wait_ready(cp_url + "/healthz", processes[-1])
 
                 restart_control_plane()
+                if args.live_webhook:
+                    hook_path = f"/v1/webhooks/github/{integration_id}"
+                    files.enter_context(
+                        github_webhook_ingress(REPOSITORY, cp_url, hook_path, webhook_secret)
+                    )
+                    result, publication = publish()
+                    assert result["state"] == "SUCCEEDED"
                 verify_live_ci(
                     user,
                     run_id,
@@ -817,6 +827,39 @@ def main():
                     restart_control_plane,
                     expect_failure=args.expect_ci_failure,
                 )
+                if args.live_webhook:
+                    with Database().transaction() as session:
+                        deliveries = list(
+                            session.scalars(
+                                select(CIWebhookDelivery)
+                                .where(CIWebhookDelivery.integration_id == integration_id)
+                                .order_by(CIWebhookDelivery.received_at)
+                            )
+                        )
+                        triggers = list(
+                            session.scalars(
+                                select(RunEvent)
+                                .where(
+                                    RunEvent.run_id == run_id,
+                                    RunEvent.kind == "GITHUB_CI_RECONCILED",
+                                )
+                                .order_by(RunEvent.revision)
+                            )
+                        )
+                    proof = {
+                        "deliveries": [
+                            {
+                                "id": row.delivery_id,
+                                "event": row.event,
+                                "received_at": row.received_at,
+                            }
+                            for row in deliveries
+                        ],
+                        "reconciliations": [row.body for row in triggers],
+                    }
+                    (output / "webhook.json").write_text(json.dumps(proof, indent=2) + "\n")
+                    assert any(row.event != "ping" for row in deliveries)
+                    assert any(row.body.get("trigger") == "WEBHOOK" for row in triggers)
                 return
             first_publication = publication
             database = Database()
