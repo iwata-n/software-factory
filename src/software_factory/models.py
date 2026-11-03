@@ -783,6 +783,7 @@ class DraftPullRequest(Tenant, Base):
 class CIWebhookDelivery(Tenant, Base):
     __tablename__ = "ci_webhook_deliveries"
     __table_args__ = (
+        UniqueConstraint("workspace_id", "id", name="uq_ci_webhook_workspace_id"),
         UniqueConstraint("workspace_id", "repository_id", "integration_id", "delivery_id"),
         ForeignKeyConstraint(
             ["workspace_id", "repository_id"], ["repositories.workspace_id", "repositories.id"]
@@ -793,6 +794,26 @@ class CIWebhookDelivery(Tenant, Base):
     delivery_id: Mapped[str] = mapped_column(String(36))
     event: Mapped[str] = mapped_column(String(20))
     fingerprint: Mapped[str] = mapped_column(String(64))
+    received_at: Mapped[float] = mapped_column(Float)
+
+
+class HistoricalCIObservation(Tenant, Base):
+    __tablename__ = "historical_ci_observations"
+    __table_args__ = (
+        UniqueConstraint("workspace_id", "candidate_id", "inbox_id"),
+        ForeignKeyConstraint(
+            ["workspace_id", "inbox_id"],
+            ["ci_webhook_deliveries.workspace_id", "ci_webhook_deliveries.id"],
+        ),
+        ForeignKeyConstraint(
+            ["workspace_id", "run_id", "candidate_id"],
+            ["candidates.workspace_id", "candidates.run_id", "candidates.id"],
+        ),
+    )
+    run_id: Mapped[str] = mapped_column(String(36))
+    candidate_id: Mapped[str] = mapped_column(String(36))
+    inbox_id: Mapped[str] = mapped_column(String(36))
+    body: Mapped[dict] = mapped_column(JSON)
     received_at: Mapped[float] = mapped_column(Float)
 
 

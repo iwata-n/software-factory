@@ -51,25 +51,30 @@ class GitHubCIReader:
         except (httpx.HTTPError, ValueError):
             raise CIReadError("GITHUB_CI_UNAVAILABLE") from None
 
-    def matches_side(self, side, draft, name):
+    @staticmethod
+    def matches_side(side, draft, name, repository_id):
         repo = side["repo"]
         return (
-            repo["id"] == self.repository_id
+            repo["id"] == repository_id
             and side["ref"] == draft[f"{name}_ref"]
             and side["sha"] == draft[f"{name}_sha"]
         )
 
-    def matches_pr(self, value, draft):
+    @classmethod
+    def matches_pr(cls, value, draft, repository_id):
         return (
             str(value["id"]) == draft["external_id"]
             and value["number"] == draft["number"]
-            and all(self.matches_side(value[side], draft, side) for side in ("base", "head"))
+            and all(
+                cls.matches_side(value[side], draft, side, repository_id)
+                for side in ("base", "head")
+            )
         )
 
     def verify_pr(self, draft):
         value, _ = self.get(f"/pulls/{draft['number']}")
         if (
-            not self.matches_pr(value, draft)
+            not self.matches_pr(value, draft, self.repository_id)
             or value["draft"] is not True
             or value["state"] != "open"
             or (draft["merge_sha"] and value["merge_commit_sha"] != draft["merge_sha"])
@@ -95,8 +100,9 @@ class GitHubCIReader:
                 or not all(SHA.fullmatch(side["sha"]) for side in (head, base))
             ):
                 raise CIReadError("GITHUB_CI_INVALID_RESPONSE")
-            matches = self.matches_side(base, draft, "base") and (
-                head["repo"] is not None and self.matches_side(head, draft, "head")
+            matches = self.matches_side(base, draft, "base", self.repository_id) and (
+                head["repo"] is not None
+                and self.matches_side(head, draft, "head", self.repository_id)
             )
             return {
                 "status": "OBSERVED",
@@ -185,7 +191,7 @@ class GitHubCIReader:
                 if check["head_sha"] != tested:
                     continue
                 if tested == target["head_sha"] and not any(
-                    self.matches_pr(pr, draft) for pr in check["pull_requests"]
+                    self.matches_pr(pr, draft, self.repository_id) for pr in check["pull_requests"]
                 ):
                     continue
                 result = self.evidence(check, target, tested, parents)
@@ -224,7 +230,9 @@ class GitHubCIReader:
             or run["head_repository"]["id"] != self.repository_id
             or run["check_suite_id"] != check["check_suite"]["id"]
             or run["head_sha"] != draft["head_sha"]
-            or not any(self.matches_pr(pr, draft) for pr in run["pull_requests"])
+            or not any(
+                self.matches_pr(pr, draft, self.repository_id) for pr in run["pull_requests"]
+            )
             or job["id"] != check_id
             or job["run_attempt"] != run["run_attempt"]
             or job["name"] != check["name"]

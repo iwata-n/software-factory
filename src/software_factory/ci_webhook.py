@@ -13,7 +13,16 @@ from sqlalchemy import select
 from starlette.concurrency import run_in_threadpool
 
 from .db import db_now
-from .models import CIWebhookDelivery, Repository
+from .github_ci import SHA, GitHubCIReader, check_status
+from .models import (
+    Candidate,
+    CIWebhookDelivery,
+    Gate,
+    HistoricalCIObservation,
+    Repository,
+    Run,
+    new_id,
+)
 from .service import DomainError, owned
 
 MAX_BODY = 2 * 1024 * 1024
@@ -36,6 +45,99 @@ def configured_webhooks():
         )
     except ValidationError:
         raise ValueError("Invalid FACTORY_GITHUB_WEBHOOKS configuration") from None
+
+
+def remember_historical_check(session, config, inbox, payload):
+    # This is an authenticated provider report. Current Gate decisions only read the GitHub API.
+    check = payload.get("check_run")
+    if inbox.event != "check_run" or not isinstance(check, dict):
+        return
+    app = check.get("app")
+    pulls = check.get("pull_requests")
+    check_id, tested = check.get("id"), check.get("head_sha")
+    if (
+        type(check_id) is not int
+        or check_id <= 0
+        or not isinstance(tested, str)
+        or not SHA.fullmatch(tested)
+        or not isinstance(app, dict)
+        or type(app.get("id")) is not int
+        or not isinstance(check.get("name"), str)
+        or not isinstance(check.get("status"), str)
+        or (check.get("conclusion") is not None and not isinstance(check["conclusion"], str))
+        or not isinstance(pulls, list)
+        or not pulls
+    ):
+        return
+    # A prior Final Gate pins the PR tuple even after the same Draft PR advances.
+    rows = session.execute(
+        select(Gate, Run)
+        .join(Run, (Run.workspace_id == Gate.workspace_id) & (Run.id == Gate.run_id))
+        .join(
+            Candidate,
+            (Candidate.workspace_id == Gate.workspace_id) & (Candidate.id == Gate.candidate_id),
+        )
+        .where(
+            Run.workspace_id == inbox.workspace_id,
+            Run.repository_id == inbox.repository_id,
+            Run.evidence_expired_at.is_(None),
+            Run.current_candidate_id.is_distinct_from(Gate.candidate_id),
+            Gate.stage == "FINAL",
+            (Candidate.head_sha == tested)
+            | (Gate.metadata_body["draft"]["merge_sha"].as_string() == tested),
+        )
+    )
+    seen = set()
+    for gate, run in rows:
+        draft = gate.metadata_body.get("draft")
+        required = run.snapshot["verification_profile"].get("required_ci_checks", [])
+        if (
+            gate.candidate_id in seen
+            or not draft
+            or draft["origin_verified"] is not True
+            or not any(
+                item["provider"] == "github"
+                and item["app_id"] == app["id"]
+                and item["check_name"] == check["name"]
+                for item in required
+            )
+            or not any(
+                matches_historical_pull(pr, draft, config.github_repository_id) for pr in pulls
+            )
+        ):
+            continue
+        seen.add(gate.candidate_id)
+        session.add(
+            HistoricalCIObservation(
+                workspace_id=inbox.workspace_id,
+                run_id=gate.run_id,
+                candidate_id=gate.candidate_id,
+                inbox_id=inbox.id,
+                received_at=inbox.received_at,
+                body={
+                    "delivery_id": inbox.delivery_id,
+                    "source": "SIGNED_GITHUB_WEBHOOK",
+                    "gate_eligible": False,
+                    "provider_check_id": check_id,
+                    "check_name": check["name"],
+                    "app_id": app["id"],
+                    "reported_status": check_status(
+                        {"status": check["status"], "conclusion": check.get("conclusion")}
+                    ),
+                    "provider_reported_sha": tested,
+                    "head_sha": draft["head_sha"],
+                    "base_sha": draft["base_sha"],
+                    "pull_request_number": draft["number"],
+                },
+            )
+        )
+
+
+def matches_historical_pull(pull, draft, repository_id):
+    try:
+        return GitHubCIReader.matches_pr(pull, draft, repository_id)
+    except (KeyError, TypeError):
+        return False
 
 
 def save_delivery(service, config, integration_id, delivery_id, event, body):
@@ -76,17 +178,19 @@ def save_delivery(service, config, integration_id, delivery_id, event, body):
             if previous.fingerprint != fingerprint:
                 raise DomainError(409, "WEBHOOK_DELIVERY_CONFLICT")
         else:
-            session.add(
-                CIWebhookDelivery(
-                    workspace_id=workspace_id,
-                    repository_id=repository_id,
-                    integration_id=str(integration_id),
-                    delivery_id=str(delivery_id),
-                    event=event,
-                    fingerprint=fingerprint,
-                    received_at=db_now(session),
-                )
+            inbox = CIWebhookDelivery(
+                id=new_id(),
+                workspace_id=workspace_id,
+                repository_id=repository_id,
+                integration_id=str(integration_id),
+                delivery_id=str(delivery_id),
+                event=event,
+                fingerprint=fingerprint,
+                received_at=db_now(session),
             )
+            session.add(inbox)
+            session.flush()
+            remember_historical_check(session, config, inbox, payload)
     return {"accepted": True}
 
 

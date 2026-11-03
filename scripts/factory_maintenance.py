@@ -28,6 +28,7 @@ from software_factory.models import (
     AuditEvent,
     Base,
     Enrollment,
+    HistoricalCIObservation,
     IdempotencyRecord,
     JiraIssueRevision,
     Job,
@@ -408,6 +409,7 @@ def purge_run(session, run, now):
     run.current_candidate_id = None
     session.flush()
     for name in (
+        "historical_ci_observations",
         "publication_observations",
         "publication_operations",
         "draft_pull_requests",
@@ -543,6 +545,13 @@ def collect(database, root):
                 )
             )
             marked += 1
+        session.execute(text("SET LOCAL factory.retention = 'on'"))
+        session.execute(
+            delete(HistoricalCIObservation).where(
+                HistoricalCIObservation.run_id.in_(select(Run.id).where(*eligible)),
+                HistoricalCIObservation.received_at <= cutoff,
+            )
+        )
         removed_events = 0
         for run in session.scalars(select(Run).where(*eligible)):
             stream = (

@@ -52,6 +52,7 @@ from .models import (
     Check,
     Finding,
     Gate,
+    HistoricalCIObservation,
     IdempotencyRecord,
     Job,
     JobDependency,
@@ -626,6 +627,22 @@ def create_app(
                     .order_by(Finding.finding_key, Finding.id)
                 )
             ]
+
+        return service.read(token, query)
+
+    @app.get("/v1/candidates/{candidate_id}/ci-history", tags=["Candidates"])
+    def candidate_ci_history(candidate_id: str, token: Token):
+        def query(session, actor):
+            owned(session, Candidate, candidate_id, actor.workspace_id)
+            rows = session.scalars(
+                select(HistoricalCIObservation)
+                .where(
+                    HistoricalCIObservation.workspace_id == actor.workspace_id,
+                    HistoricalCIObservation.candidate_id == candidate_id,
+                )
+                .order_by(HistoricalCIObservation.received_at, HistoricalCIObservation.id)
+            )
+            return {"observations": [row.body | {"received_at": row.received_at} for row in rows]}
 
         return service.read(token, query)
 

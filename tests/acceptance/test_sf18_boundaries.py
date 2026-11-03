@@ -1,3 +1,5 @@
+import hmac
+import json
 from concurrent.futures import ThreadPoolExecutor
 from uuid import uuid4
 
@@ -440,3 +442,70 @@ def test_current_pr_changes_do_not_modify_verified_result(waiting, monkeypatch):
     }
     assert client.get(path, headers=headers).json() == snapshot
     assert world.run()["status"] == "SUCCEEDED"
+
+
+@pytest.mark.parametrize("waiting", [None, MERGE], indirect=True)
+def test_late_signed_check_is_preserved_for_previous_candidate_only(
+    waiting, publication, monkeypatch
+):
+    world, _, poll, _, pull, _, check, stub = waiting
+    candidate_a = world.run()["current_candidate_id"]
+    stub["checks"] = [check | {"conclusion": "failure"}]
+    poll()
+    assert world.run()["phase"] == "REPAIR"
+    pipeline = publication.pipeline
+    repair(pipeline, value_patch("2", "2 # new candidate"))
+    assemble_repair(pipeline)
+    assert stage(pipeline, "VERIFY")[0]["accepted"]
+    assert review(pipeline, Reviewer())[0]["accepted"]
+    candidate_b = world.run()["current_candidate_id"]
+    assert candidate_a != candidate_b
+    with world.database.transaction() as session:
+        local_b = session.scalar(
+            select(Gate).where(Gate.candidate_id == candidate_b, Gate.stage == "LOCAL")
+        )
+    begin_ci(pipeline, local_b)
+    before = world.run()
+
+    integrations = stub["integrations"]
+    integration_id, config = next(iter(integrations.items()))
+    monkeypatch.setattr(api, "configured_webhooks", lambda: integrations)
+    client = TestClient(api.create_app(world.database))
+    path = f"/v1/webhooks/github/{integration_id}"
+    secret = config.secret.get_secret_value().encode()
+
+    def deliver(body_check, delivery_id=None):
+        body = json.dumps(
+            {
+                "repository": {"id": REPOSITORY_ID, "full_name": config.github_repository},
+                "check_run": body_check,
+            }
+        ).encode()
+        return client.post(
+            path,
+            content=body,
+            headers={
+                "X-GitHub-Event": "check_run",
+                "X-GitHub-Delivery": str(delivery_id or uuid4()),
+                "X-Hub-Signature-256": "sha256=" + hmac.digest(secret, body, "sha256").hex(),
+            },
+        )
+
+    delayed = check | {"id": 101}
+    mismatched_pull = pull | {"base": pull["base"] | {"sha": "f" * 40}}
+    assert deliver(delayed | {"pull_requests": [mismatched_pull]}).status_code == 202
+    assert deliver(delayed | {"app": {"id": 999}}).status_code == 202
+    assert deliver(delayed | {"head_sha": "f" * 40}).status_code == 202
+    assert deliver(delayed | {"conclusion": {}}).status_code == 202
+    key = uuid4()
+    assert deliver(delayed, key).status_code == deliver(delayed, key).status_code == 202
+    old_path = f"/v1/candidates/{candidate_a}/ci-history"
+    (observation,) = world.get(old_path).json()["observations"]
+    assert observation["delivery_id"] == str(key)
+    assert observation["reported_status"] == "PASS"
+    assert observation["gate_eligible"] is False
+    assert observation["provider_reported_sha"] == check["head_sha"]
+    assert world.get(old_path, token=world.other_user_token).status_code == 404
+    assert world.get(f"/v1/candidates/{candidate_b}/ci-history").json() == {"observations": []}
+    assert world.run() == before
+    assert world.run()["wait_context"]["checks"] == []
