@@ -6,6 +6,8 @@ def describe_items(items):
 
 
 def parse_count(value):
+    if not 1 <= len(value) <= 9 or any(char < "0" or char > "9" for char in value):
+        raise ValueError("count must contain one to nine ASCII digits")
     return int(value)
 
 
