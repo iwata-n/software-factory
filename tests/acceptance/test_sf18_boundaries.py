@@ -178,6 +178,7 @@ def test_changed_tuple_or_untrusted_check_cannot_pass(waiting, fault, evidence):
 def test_missing_webhook_poll_recovers_429_and_503_on_durable_cadence(waiting, evidence):
     world, clock, poll, _, _, _, _, stub = waiting
     deadline = world.run()["wait_context"]["deadline_at"]
+    assert deadline - clock.value == 1800
     stub["status"] = 429
     poll()
     clock.value += 59
@@ -195,7 +196,16 @@ def test_missing_webhook_poll_recovers_429_and_503_on_durable_cadence(waiting, e
     run = world.run()
     assert run["phase"] == "FINAL_GATE_READY"
     assert run["wait_context"]["deadline_at"] == deadline
-    evidence("Missing delivery and API failures recover without extending the deadline", run)
+    evidence(
+        "fresh pollers recover missing delivery and API failures without extending the deadline",
+        {
+            "phase": run["phase"],
+            "deadline_seconds": 1800,
+            "poll_interval_seconds": 60,
+            "claim_status": 204,
+            "reserved_microusd_while_waiting": 0,
+        },
+    )
 
 
 @pytest.mark.ac("SF-18-AC05")
@@ -286,10 +296,39 @@ def test_inbox_signal_advances_poll_without_waiting_sixty_seconds(waiting, evide
         ("completed", "neutral", "INCONCLUSIVE"),
     ],
 )
-def test_provider_status_mapping(source_bundle, state, conclusion, expected, evidence):
-    status = check_status({"status": state, "conclusion": conclusion})
-    assert status == expected
-    evidence("GitHub state mapping", {"state": state, "conclusion": conclusion, "status": status})
+def test_provider_status_mapping(waiting, state, conclusion, expected, evidence):
+    world, _, poll, _, _, _, check, stub = waiting
+    stub["checks"] = [
+        check
+        | {
+            "status": state,
+            "conclusion": conclusion,
+            "completed_at": check["completed_at"] if state == "completed" else None,
+        }
+    ]
+    assert check_status(stub["checks"][0]) == expected
+    poll()
+    with world.database.transaction() as session:
+        gate = session.scalar(select(Gate).where(Gate.stage == "FINAL"))
+        if expected == "PENDING":
+            assert gate is None and world.run()["phase"] == "WAIT_CI"
+            (adopted,) = world.run()["wait_context"]["checks"]
+            assert adopted["status"] == expected
+        else:
+            assert gate is not None
+            assert gate.status == expected
+            (adopted,) = gate.metadata_body["checks"]
+            assert adopted["status"] == expected
+    assert world.get(f"/v1/runs/{world.run_id}/result").status_code == 404
+    evidence(
+        "GitHub status is retained in the required check and only PASS can confirm",
+        {
+            "state": state,
+            "conclusion": conclusion,
+            "status": expected,
+            "gate": gate.status if gate is not None else None,
+        },
+    )
 
 
 @pytest.mark.ac("SF-18-AC05")
