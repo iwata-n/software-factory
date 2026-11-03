@@ -16,11 +16,7 @@ def model_network(image_digest, allowed_hosts):
     if not re.fullmatch(r"sha256:[0-9a-f]{64}", image_digest):
         raise ValueError("a pinned local image content digest is required")
     allowed_hosts = tuple(sorted(set(allowed_hosts)))
-    if not allowed_hosts or any(
-        not model_egress.HOST.fullmatch(host) or host.rsplit(".", 1)[-1].isdigit()
-        for host in allowed_hosts
-    ):
-        raise ValueError("exact model destinations are required")
+    model_egress.validate_hosts(allowed_hosts)
 
     suffix = uuid4().hex
     internal = "factory-model-internal-" + suffix

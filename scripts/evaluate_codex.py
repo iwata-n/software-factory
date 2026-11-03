@@ -239,7 +239,7 @@ def main():
         "evaluation_task": profile["id"],
         "started_at": datetime.now(UTC).isoformat(),
         "implementation": identity,
-        "engine_manifest": engine.manifest.model_dump(),
+        "engine_manifest": engine.manifest.model_dump(exclude_none=True),
         "engine_manifest_hash": engine.manifest_hash,
         "runner_image_digest": image,
         "scope": "real Codex CLI, live HTTP Workers, isolated Linux assembly and verification",

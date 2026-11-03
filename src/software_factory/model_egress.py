@@ -81,12 +81,16 @@ def forward(client, upstream):
             destination.sendall(data)
 
 
-def gateway(address, allowed_hosts):
-    allowed_hosts = frozenset(allowed_hosts)
-    if not allowed_hosts or any(
-        not HOST.fullmatch(host) or host.rsplit(".", 1)[-1].isdigit() for host in allowed_hosts
+def validate_hosts(hosts):
+    if not hosts or any(
+        not HOST.fullmatch(host) or host.rsplit(".", 1)[-1].isdigit() for host in hosts
     ):
         raise ValueError("exact DNS hostnames are required")
+
+
+def gateway(address, allowed_hosts):
+    allowed_hosts = frozenset(allowed_hosts)
+    validate_hosts(allowed_hosts)
 
     class Handler(BaseHTTPRequestHandler):
         rbufsize = 0

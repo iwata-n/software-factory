@@ -6,11 +6,12 @@ from pathlib import Path
 from threading import Event
 
 import pytest
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, ValidationError
 
 from software_factory.codex_engine import (
     CodexCLI,
     CodexError,
+    EngineManifest,
     file_hash,
     parse_events,
     strict_schema,
@@ -321,3 +322,44 @@ def test_cli_signal_failure_is_classified_as_unconfirmed(cli, monkeypatch):
     monkeypatch.setattr("software_factory.codex_engine.os.killpg", deny_signal)
     with pytest.raises(CodexError, match="^STOP_UNCONFIRMED$"):
         engine.cancel()
+
+
+def test_legacy_manifest_hash_remains_compatible(cli):
+    from software_factory.contracts import digest
+
+    engine = cli()
+    assert engine.manifest.isolation is None
+    payload = engine.manifest.model_dump(exclude={"isolation"})
+    assert engine.manifest_hash == digest(payload)
+
+
+@pytest.mark.parametrize("hosts", [[], ["*.example.com"], ["169.254.169.254"], ["chatgpt.com"] * 2])
+def test_isolated_manifest_requires_exact_distinct_destinations(cli, hosts):
+    engine = cli()
+    with pytest.raises(ValidationError):
+        EngineManifest.model_validate(
+            engine.manifest.model_dump()
+            | {
+                "execution_mode": "isolated_linux",
+                "isolation": {"image_digest": "sha256:" + "a" * 64, "allowed_hosts": hosts},
+            }
+        )
+
+
+def test_isolated_manifest_cannot_fall_back_to_host_execution(cli, monkeypatch):
+    engine = cli()
+    payload = engine.manifest.model_dump() | {
+        "execution_mode": "isolated_linux",
+        "isolation": {
+            "image_digest": "sha256:" + "a" * 64,
+            "allowed_hosts": ["chatgpt.com", "auth.openai.com"],
+        },
+    }
+    assert EngineManifest.model_validate(payload).isolation.allowed_hosts[0] == "chatgpt.com"
+
+    def reject_launch(*args, **kwargs):
+        pytest.fail("host CLI must not be called for an isolated manifest")
+
+    monkeypatch.setattr("software_factory.codex_engine.subprocess.run", reject_launch)
+    with pytest.raises(CodexError, match="^ISOLATED_CODEX_RUNNER_REQUIRED$"):
+        CodexCLI(engine.binary, payload)
