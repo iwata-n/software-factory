@@ -72,7 +72,7 @@ def test_candidate_never_accepts_expired_attempt(pipeline, clock, offset, eviden
     )
 
 
-@pytest.mark.ac("SF-10-AC07")
+@pytest.mark.ac("SF-10-AC07", "SF-21-AC07")
 def test_nonexistent_real_image_cannot_start_container(tmp_path, monkeypatch, evidence):
     monkeypatch.setenv("FACTORY_RUNNER_STATE_ROOT", str(tmp_path / "runner-state"))
     runner = DockerRunner("sha256:" + "0" * 64)
@@ -84,6 +84,40 @@ def test_nonexistent_real_image_cannot_start_container(tmp_path, monkeypatch, ev
         "actual Docker inspection fails before start when the pinned image does not exist",
         {"reason": denied.value.code, "containers_started": 0},
     )
+
+
+@pytest.mark.ac("SF-21-AC07")
+def test_pinned_image_stays_fixed_when_local_tag_moves(source_bundle, runner, evidence):
+    tag = f"factory-ac07:{uuid4().hex}"
+
+    def docker(*args):
+        result = runner.docker(*args, timeout=15)
+        assert result.returncode == 0, result.stderr.decode()
+        return result.stdout.decode().strip()
+
+    container = docker("create", "--network", "none", runner.image_digest)
+    try:
+        docker("image", "tag", runner.image_digest, tag)
+        before = docker("image", "inspect", tag, "--format", "{{.Id}}")
+        assert before == runner.image_digest
+        alternate = docker("commit", "--change", f"LABEL factory.ac07={tag}", container)
+        docker("image", "tag", alternate, tag)
+        after = docker("image", "inspect", tag, "--format", "{{.Id}}")
+        assert after == alternate and after != before
+        with pytest.raises(ValueError, match="pinned local image content digest"):
+            DockerRunner(tag)
+        result = runner.execute(request(source_bundle, PATCH))
+        assert result.body["ok"] and result.isolation["image"] == before
+        evidence(
+            "Mutable tag changed content but the accepted runtime used the pinned digest",
+            {"tag_before": before, "tag_after": after, "runtime_image": result.isolation["image"]},
+        )
+    finally:
+        docker("rm", "--force", container)
+        if "alternate" in locals():
+            docker("image", "rm", "--force", alternate)
+        else:
+            docker("image", "rm", tag)
 
 
 @pytest.mark.ac("SF-10-AC03")

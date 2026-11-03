@@ -9,7 +9,7 @@ import pytest
 from sqlalchemy import func, select, text
 from sqlalchemy.exc import IntegrityError
 
-from software_factory.models import Check, Principal, Run, Worker
+from software_factory.models import Check, Gate, Principal, Run, Worker
 from software_factory.pipeline_worker import PipelineAdapter
 from software_factory.worker import Supervisor
 from tests.test_assembler import runner as runner
@@ -158,7 +158,7 @@ def test_invalid_finding_references_reject_entire_completion(pipeline, fault, ex
     )
 
 
-@pytest.mark.ac("SF-11-AC05", "SF-11-AC06", "C-02")
+@pytest.mark.ac("SF-11-AC05", "SF-11-AC06", "SF-21-AC07", "C-02")
 def test_unmanaged_or_claimed_origin_cannot_promote_results(pipeline, evidence):
     pipeline.prepare()
     pipeline.assemble()
@@ -171,14 +171,26 @@ def test_unmanaged_or_claimed_origin_cannot_promote_results(pipeline, evidence):
     body = copy.deepcopy(report["body"])
     body["result"]["checks"][0]["status"] = "PASS"
     assert deliver(pipeline, report, body=body, key=str(uuid4())).status_code == 422
+    body = copy.deepcopy(report["body"])
+    body["result"]["runner_options"] = {"privileged": True, "network": "host"}
+    assert deliver(pipeline, report, body=body, key=str(uuid4())).status_code == 422
     assert dump(pipeline.world.database) == before
     with pipeline.world.database.transaction() as s:
         s.get(Worker, pipeline.managed.worker_id).managed = False
     assert deliver(pipeline, report, key=str(uuid4())).status_code == 403
     assert checks(pipeline) == []
+    with pipeline.world.database.transaction() as session:
+        assert session.scalar(select(Gate).where(Gate.run_id == pipeline.world.run_id)) is None
     evidence(
-        "implementer cannot claim verification; origin and PASS cannot be asserted in a report",
-        {"unmanaged_claim": 204, "origin_spoof": 422, "verdict_spoof": 422, "revoked_managed": 403},
+        "Unmanaged and forged verifier reports cannot create Check or Gate evidence",
+        {
+            "unmanaged_claim": 204,
+            "origin_spoof": 422,
+            "verdict_spoof": 422,
+            "runner_option_spoof": 422,
+            "revoked_managed": 403,
+            "gate_created": False,
+        },
     )
 
 
