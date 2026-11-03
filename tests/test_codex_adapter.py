@@ -338,3 +338,21 @@ def test_repair_rejects_ungrounded_or_duplicate_claims(job, claimed):
     assert adapter.result().reason == "MODEL_REPAIR_FAILURE_IDS_INVALID"
     assert adapter.result().usage_deliveries
     assert not adapter.result().artifacts
+
+
+def test_cancellation_before_codex_start_yields_result():
+    adapter = CodexAdapter(Engine())
+    adapter.cancel()
+    assert adapter.result().outcome == "CANCELLED"
+    assert adapter.engine.calls == []
+
+
+def test_codex_signal_failure_is_not_reported_as_cancelled():
+    class UnstoppableEngine(Engine):
+        def cancel(self):
+            raise CodexError("STOP_UNCONFIRMED", "INFRASTRUCTURE")
+
+    adapter = CodexAdapter(UnstoppableEngine())
+    adapter.cancel()
+    assert adapter.result().outcome == "FAILED"
+    assert adapter.result().reason == "STOP_UNCONFIRMED"

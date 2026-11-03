@@ -18,7 +18,7 @@ from .candidate_mount import readonly_tar
 from .codex_engine import CodexError, sensitive_input
 from .contracts import FindingLocation, Name, Plan, digest, path_within, safe_path
 from .metering import price_call
-from .sandbox import RunnerError
+from .sandbox import STOP_UNCONFIRMED, RunnerError
 from .security import redact
 
 
@@ -259,6 +259,7 @@ def audit(engine, response, role):
 
 
 class CodexAdapter:
+    stop_margin_seconds = 10
     capabilities = Capabilities(kinds=("PLAN", "IMPLEMENT", "REPAIR"), adapters=("codex_cli",))
 
     def __init__(self, engine):
@@ -396,7 +397,9 @@ class CodexAdapter:
                 usage_deliveries=receipts,
             )
         with self._lock:
-            if cancelled.is_set():
+            if self._result and self._result.reason == STOP_UNCONFIRMED:
+                return
+            if cancelled.is_set() and result.reason != STOP_UNCONFIRMED:
                 result = AgentResult(
                     "CANCELLED", {}, usage_microusd=None, usage_deliveries=receipts
                 )
@@ -424,9 +427,28 @@ class CodexAdapter:
 
     def cancel(self):
         self._cancel.set()
-        self.engine.cancel()
+        stop_unconfirmed = False
+        try:
+            self.engine.cancel()
+        except CodexError as error:
+            if error.code != STOP_UNCONFIRMED:
+                raise
+            stop_unconfirmed = True
         if self._thread:
             self._thread.join(timeout=2)
+            stop_unconfirmed |= self._thread.is_alive()
+        with self._lock:
+            if self._result and self._result.reason == STOP_UNCONFIRMED:
+                return
+            if stop_unconfirmed or self._result is None:
+                self._result = AgentResult(
+                    "FAILED" if stop_unconfirmed else "CANCELLED",
+                    {},
+                    category="INFRASTRUCTURE" if stop_unconfirmed else None,
+                    reason=STOP_UNCONFIRMED if stop_unconfirmed else None,
+                    usage_microusd=None,
+                    usage_deliveries=self._result.usage_deliveries if self._result else (),
+                )
 
 
 class CodexReviewer:
@@ -512,4 +534,7 @@ class CodexReviewer:
             ) from None
 
     def cancel(self):
-        self.engine.cancel()
+        try:
+            self.engine.cancel()
+        except CodexError as error:
+            raise AgentExecutionError(error.code, error.category) from None

@@ -16,6 +16,7 @@ from typing import Annotated, Literal
 from pydantic import BaseModel, ConfigDict, Field
 
 from .contracts import ModelCallUsage, Name, digest
+from .sandbox import STOP_UNCONFIRMED
 from .security import redact
 
 DISABLED_FEATURES = (
@@ -240,21 +241,24 @@ class CodexCLI:
             if process is None:
                 return
             try:
-                os.killpg(process.pid, signal.SIGTERM)
-            except ProcessLookupError:
+                try:
+                    os.killpg(process.pid, signal.SIGTERM)
+                except ProcessLookupError:
+                    process.wait(timeout=2)
+                    return
+                try:
+                    process.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    pass
+                # The CLI can exit while a descendant in its group is still running.
+                # Always signal the remaining group, even after the leader was reaped.
+                try:
+                    os.killpg(process.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
                 process.wait(timeout=2)
-                return
-            try:
-                process.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                pass
-            # The CLI can exit while a descendant in its group is still running.
-            # Always signal the remaining group, even after the leader was reaped.
-            try:
-                os.killpg(process.pid, signal.SIGKILL)
-            except ProcessLookupError:
-                pass
-            process.wait(timeout=2)
+            except (OSError, subprocess.SubprocessError):
+                raise CodexError(STOP_UNCONFIRMED, "INFRASTRUCTURE") from None
 
     def run(self, context, output_model, cancelled, *, timeout=None):
         instructions = (

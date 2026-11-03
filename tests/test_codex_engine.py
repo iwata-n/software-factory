@@ -296,3 +296,17 @@ def test_cancel_during_manifest_check_does_not_launch_provider(cli, monkeypatch)
         engine.run({"task": "safe"}, Reply, cancelled)
     assert caught.value.before_launch and caught.value.usage is None
     assert engine._process is None
+
+
+def test_cli_signal_failure_is_classified_as_unconfirmed(cli, monkeypatch):
+    from types import SimpleNamespace
+
+    engine = cli()
+    engine._process = SimpleNamespace(pid=123)
+
+    def deny_signal(*args):
+        raise PermissionError("injected stop rejection")
+
+    monkeypatch.setattr("software_factory.codex_engine.os.killpg", deny_signal)
+    with pytest.raises(CodexError, match="^STOP_UNCONFIRMED$"):
+        engine.cancel()

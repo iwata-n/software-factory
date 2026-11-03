@@ -326,7 +326,7 @@ class PipelineAdapter:
         if self.reviewer and hasattr(self.reviewer, "cancel"):
             try:
                 self.reviewer.cancel()
-            except (OSError, subprocess.SubprocessError):
+            except (AgentExecutionError, OSError, subprocess.SubprocessError):
                 stop_unconfirmed = True
         if thread:
             thread.join(timeout=max(0, deadline - time.monotonic()))
