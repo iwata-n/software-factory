@@ -223,7 +223,10 @@ def main():
     parser.add_argument("--actions-workflow-id", type=int)
     parser.add_argument("--deliver-slack", action="store_true")
     parser.add_argument("--fixture-base-sha")
-    parser.add_argument("--codex-manifest", default="config/codex_cli.json")
+    parser.add_argument(
+        "--codex-manifest",
+        default=os.environ.get("FACTORY_CODEX_MANIFEST", "config/codex_cli.json"),
+    )
     parser.add_argument(
         "--codex-binary",
         default=os.environ.get("FACTORY_CODEX_BINARY")
