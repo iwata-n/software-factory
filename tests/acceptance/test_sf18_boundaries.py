@@ -229,14 +229,23 @@ def test_delayed_signal_cannot_restore_old_pass_or_duplicate_final_gate(waiting,
     with ThreadPoolExecutor(max_workers=2) as pool:
         list(pool.map(lambda _: poll(), range(2)))
     assert world.run()["phase"] in {"FINAL_GATE_READY", "COMPLETE"}
+    poll()
+    assert world.run()["phase"] == "COMPLETE"
     with world.database.transaction() as session:
+        (notification,) = list(
+            session.scalars(select(OutboxEvent).where(OutboxEvent.kind == "SLACK_RUN_RESULT"))
+        )
+        assert notification.body["status"] == "SUCCEEDED"
         (final,) = list(session.scalars(select(Gate).where(Gate.stage == "FINAL")))
         (event,) = list(
             session.scalars(select(RunEvent).where(RunEvent.kind == "FINAL_GATE_DECIDED"))
         )
         assert "github-check-101" in final.evidence_ids
         assert "github-check-100" not in final.evidence_ids
-        evidence("Only the newer execution finalized the Gate", event.body)
+        evidence(
+            "Only the newer execution finalized the Gate and queued one notification",
+            event.body | {"notifications": 1},
+        )
 
 
 @pytest.mark.ac("SF-18-AC02")

@@ -47,7 +47,7 @@ def webhook(world, monkeypatch):
 
 
 @pytest.mark.ac("SF-18-AC01", "SF-18-AC02")
-def test_signed_delivery_is_durable_and_conflicting_reuse_is_rejected(world, webhook):
+def test_signed_delivery_is_durable_and_conflicting_reuse_is_rejected(world, webhook, evidence):
     delivery = str(uuid4())
     body = {"repository": {"id": 9001, "full_name": NAME}, "untrusted": "discard this text"}
     first = webhook(body, delivery=delivery)
@@ -62,6 +62,17 @@ def test_signed_delivery_is_durable_and_conflicting_reuse_is_rejected(world, web
         assert saved.repository_id == world.repository_id
         assert SECRET not in repr(vars(saved))
         assert "discard this text" not in repr(vars(saved))
+    evidence(
+        "one durable signed delivery, exact replay and conflicting reuse rejected",
+        {
+            "delivery_id": delivery,
+            "rows": 1,
+            "initial": 202,
+            "replay": 202,
+            "conflict": 409,
+            "payload_and_secret_retained": False,
+        },
+    )
 
 
 @pytest.mark.ac("SF-18-AC01")
@@ -73,17 +84,20 @@ def test_signed_delivery_is_durable_and_conflicting_reuse_is_rejected(world, web
         ({"id": 9001, "full_name": "other/ci"}, SECRET, 404),
     ],
 )
-def test_invalid_delivery_does_not_enter_inbox(world, webhook, repository, secret, status):
+def test_invalid_delivery_does_not_enter_inbox(
+    world, webhook, repository, secret, status, evidence
+):
     before = world.run()
     response = webhook({"repository": repository}, secret=secret)
     assert world.run() == before
     assert response.status_code == status
     with world.database.transaction() as session:
         assert session.scalar(select(CIWebhookDelivery)) is None
+    evidence("rejected delivery has no Inbox or Run changes", {"status": status, "inbox_rows": 0})
 
 
 @pytest.mark.ac("SF-18-AC02")
-def test_concurrent_replays_commit_one_inbox_row(world, webhook):
+def test_concurrent_replays_commit_one_inbox_row(world, webhook, evidence):
     delivery = str(uuid4())
     body = {"repository": {"id": 9001, "full_name": NAME}}
     with ThreadPoolExecutor(max_workers=2) as pool:
@@ -91,25 +105,30 @@ def test_concurrent_replays_commit_one_inbox_row(world, webhook):
         assert [request.result().status_code for request in requests] == [202, 202]
     with world.database.transaction() as session:
         assert len(list(session.scalars(select(CIWebhookDelivery)))) == 1
+    evidence("concurrent identical delivery inserts once", {"delivery_id": delivery, "rows": 1})
 
 
 @pytest.mark.ac("SF-18-AC01")
-def test_integration_cannot_cross_workspace(world, webhook, monkeypatch):
+def test_integration_cannot_cross_workspace(world, webhook, monkeypatch, evidence):
     import os
 
     integrations = json.loads(os.environ["FACTORY_GITHUB_WEBHOOKS"])
     next(iter(integrations.values()))["workspace_id"] = world.other_workspace_id
     monkeypatch.setenv("FACTORY_GITHUB_WEBHOOKS", json.dumps(integrations))
+    before = world.run()
     assert webhook({"repository": {"id": 9001, "full_name": NAME}}).status_code == 404
     with world.database.transaction() as session:
         assert session.scalar(select(CIWebhookDelivery)) is None
+    assert world.run() == before
+    evidence("foreign Workspace integration is rejected", {"status": 404, "inbox_rows": 0})
 
 
 @pytest.mark.ac("SF-18-AC01")
-def test_signed_delivery_for_unknown_integration_has_no_side_effects(world, webhook):
+def test_signed_delivery_for_unknown_integration_has_no_side_effects(world, webhook, evidence):
     before = world.run()
     response = webhook({"repository": {"id": 9001, "full_name": NAME}}, integration=uuid4())
     assert response.status_code == 404
     assert world.run() == before
     with world.database.transaction() as session:
         assert session.scalar(select(CIWebhookDelivery)) is None
+    evidence("unknown Integration is rejected", {"status": 404, "inbox_rows": 0})

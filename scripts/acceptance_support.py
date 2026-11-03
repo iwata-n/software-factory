@@ -84,6 +84,8 @@ def acceptance_scenarios() -> dict[str, list[str]]:
 def required_criteria() -> list[str]:
     # A boundary criterion can be audited once its complete acceptance matrix is collected.
     complete_boundary_criteria = {
+        "SF-18-AC01",
+        "SF-18-AC02",
         "SF-18-AC03",
         "SF-19-AC01",
         "SF-19-AC02",
