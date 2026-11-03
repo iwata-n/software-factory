@@ -2,7 +2,7 @@
 
 
 def describe_items(items):
-    return ", ".join(items)
+    return ", ".join(items) if items else "データがありません"
 
 
 def parse_count(value):
@@ -15,3 +15,5 @@ def normalize_spaces(value):
 
 def stable_label(value):
     return "item:" + str(value)
+
+# Publication transport update fixture.
