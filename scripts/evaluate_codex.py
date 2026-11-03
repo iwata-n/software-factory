@@ -751,6 +751,22 @@ def main():
                 ]
                 report["github_writes"] = len(report["github_write_requests"])
                 current = state()
+                final_result = report["publication"]["result"]
+                terminal = {"run": current}
+                for name, suffix in [("graph", "graph"), ("events", "event-history")]:
+                    reply = user.get(f"/v1/runs/{run_id}/{suffix}")
+                    reply.raise_for_status()
+                    terminal[name] = reply.json()
+                if not any(
+                    event["kind"] == "VERIFIED_DRAFT_PR"
+                    and event["body"]["result_id"] == final_result["result_id"]
+                    for event in terminal["events"]["events"]
+                ):
+                    raise RuntimeError("verified result was missing from the terminal Run history")
+                for name, body in terminal.items():
+                    (output / f"terminal-{name}.json").write_text(
+                        json.dumps(body, ensure_ascii=False, indent=2)
+                    )
             report.update(
                 result="PASS",
                 candidate_id=candidate_id,
