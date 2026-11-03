@@ -238,8 +238,14 @@ class CostCommands:
         payload = data.model_dump()
         # The typed numeric token counters are metering data; identifiers are still scrubbed.
         without_calls = {key: value for key, value in payload.items() if key != "calls"}
-        if redact(without_calls, request_secrets.get()) != without_calls or any(
-            redact(call.call_id, request_secrets.get()) != call.call_id for call in data.calls
+        secrets = request_secrets.get()
+        identities = [
+            {"call_id": call.call_id, "tool_calls": [tool.model_dump() for tool in call.tool_calls]}
+            for call in data.calls
+        ]
+        if (
+            redact(without_calls, secrets) != without_calls
+            or redact(identities, secrets) != identities
         ):
             raise DomainError(422, "SENSITIVE_INPUT")
         manifest = run.snapshot["policy"].get("pricing_manifest")

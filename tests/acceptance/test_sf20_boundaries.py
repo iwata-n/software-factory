@@ -3,6 +3,7 @@
 import base64
 import os
 import time
+from dataclasses import replace
 
 import pytest
 
@@ -58,7 +59,8 @@ def test_fixture_usage_replays_once_after_execution_right_ends(world, evidence):
 
 
 @pytest.mark.ac("SF-20-AC04")
-def test_codex_turn_counts_and_budget_estimate_are_recorded_separately(world, evidence):
+@pytest.mark.parametrize("tool_calls", [[], [{"call_id": "tool-one", "name": "lookup_fixture"}]])
+def test_codex_turn_counts_and_budget_estimate_are_recorded_separately(world, evidence, tool_calls):
     assignment = world.claim().json()
     attempt_id = assignment["job"]["attempt_id"]
     rates = MANIFEST | {
@@ -82,7 +84,11 @@ def test_codex_turn_counts_and_budget_estimate_are_recorded_separately(world, ev
         worker.capabilities = [*worker.capabilities, "usage:trusted"]
 
     response = parse_events(encoded(events()))
-    (body,) = delivery(snapshot, response, attempt_id)
+    measured = ModelCallUsage.model_validate(
+        response.usage.model_dump() | {"tool_calls": tool_calls}
+    )
+    (body,) = delivery(snapshot, replace(response, usage=measured), attempt_id)
+    assert ("tool_calls" in body["calls"][0]) == bool(tool_calls)
     assert body["total_microusd"] == 1450
     path = f"/v1/worker/attempts/{attempt_id}/usage"
     for change, error in (
@@ -97,6 +103,11 @@ def test_codex_turn_counts_and_budget_estimate_are_recorded_separately(world, ev
     replayed = world.post(path, body, token=world.worker_token, key="usage-replay")
     assert accepted.status_code == replayed.status_code == 200
     assert accepted.json()["receipt"] == replayed.json()["receipt"]
+    if tool_calls:
+        changed = body | {"calls": [body["calls"][0] | {"tool_calls": []}]}
+        conflict = world.post(path, changed, token=world.worker_token, key="changed-tools")
+        assert conflict.status_code == 409
+        assert conflict.json()["code"] == "USAGE_DELIVERY_CONFLICT"
     ledger = costs(world)
     (receipt,) = ledger["receipts"]
     assert receipt["attempt_id"] == attempt_id
@@ -108,6 +119,7 @@ def test_codex_turn_counts_and_budget_estimate_are_recorded_separately(world, ev
                 "input_tokens": 10,
                 "cached_input_tokens": 2,
                 "output_tokens": 3,
+                **({"tool_calls": tool_calls} if tool_calls else {}),
             }
         ],
         "pricing_manifest_hash": digest(rates),

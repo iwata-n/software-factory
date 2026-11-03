@@ -222,11 +222,20 @@ class PricingManifest(Contract):
     output_usd_per_million: Rate
 
 
+class AgentToolCall(Contract):
+    call_id: Name
+    name: Annotated[str, Field(pattern=r"^[A-Za-z_][A-Za-z0-9_.-]{0,127}$")]
+
+
 class ModelCallUsage(Contract):
     call_id: Name
     input_tokens: Annotated[int, Field(strict=True, ge=0, le=10**9)]
     cached_input_tokens: Annotated[int, Field(strict=True, ge=0, le=10**9)] = 0
     output_tokens: Annotated[int, Field(strict=True, ge=0, le=10**9)]
+    # Keep the serialized payload of existing deliveries stable for idempotent replay.
+    tool_calls: list[AgentToolCall] = Field(
+        default_factory=list, max_length=128, exclude_if=lambda calls: not calls
+    )
 
     @model_validator(mode="after")
     def cached_is_subset(self):
@@ -249,6 +258,9 @@ class UsageDelivery(Contract):
     def unique_calls(self):
         if len({c.call_id for c in self.calls}) != len(self.calls):
             raise ValueError("model call IDs must be unique")
+        tool_ids = [tool.call_id for call in self.calls for tool in call.tool_calls]
+        if len(set(tool_ids)) != len(tool_ids):
+            raise ValueError("tool call IDs must be unique")
         return self
 
 
