@@ -6,7 +6,31 @@ import re
 import xml.etree.ElementTree as ET
 from pathlib import Path
 
-from acceptance_support import EXTERNAL_CRITERIA, required_criteria, sha, source_manifest
+from acceptance_support import (
+    EXTERNAL_CRITERIA,
+    acceptance_scenarios,
+    required_criteria,
+    sha,
+    source_manifest,
+    task_criteria,
+)
+
+
+def completion_status(verified):
+    pending = sorted(set(task_criteria()) - verified)
+    scenarios = acceptance_scenarios()
+    if set(scenarios) != {f"AT-{number:02d}" for number in range(1, 13)} or not all(
+        scenarios.values()
+    ):
+        raise ValueError("overall acceptance scenarios are incomplete")
+    missing_scenarios = [
+        name for name, references in scenarios.items() if set(references) - verified
+    ]
+    return {
+        "pending_criteria": pending,
+        "pending_scenarios": missing_scenarios,
+        "mvp_accepted": not (pending or missing_scenarios),
+    }
 
 
 def audit(directory: Path, *, allow_ci_pending: bool = False) -> dict:
@@ -27,7 +51,11 @@ def audit(directory: Path, *, allow_ci_pending: bool = False) -> dict:
     for ac in required_criteria() + [f"C-{i:02d}" for i in range(1, 7)]:
         path = directory / (ac[:5] if ac.startswith("SF-") else "common") / (ac + ".json")
         record = json.loads(path.read_text())
-        if record["ac_id"] != ac or record["code_digest"] != manifest["code_digest"]:
+        if (
+            record["ac_id"] != ac
+            or record["code_digest"] != manifest["code_digest"]
+            or record["revision"] != manifest["revision"]
+        ):
             raise ValueError(f"{ac}: record identity or code digest mismatch")
         for field in (
             "revision",
@@ -153,6 +181,9 @@ def audit(directory: Path, *, allow_ci_pending: bool = False) -> dict:
         ],
         "code_digest": manifest["code_digest"],
         "external_pending": pending,
+        **completion_status(
+            {ac for ac, (_, record) in records.items() if record["result"] == "PASS"}
+        ),
     }
     (directory / "summary.json").write_text(json.dumps(result, indent=2, ensure_ascii=False))
     return result
@@ -162,6 +193,9 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("directory", type=Path)
     parser.add_argument("--allow-ci-pending", action="store_true")
+    parser.add_argument(
+        "--require-mvp", action="store_true", help="require every criterion and overall scenario"
+    )
     args = parser.parse_args()
     result = audit(args.directory, allow_ci_pending=args.allow_ci_pending)
     print(
@@ -169,6 +203,11 @@ if __name__ == "__main__":
             {
                 "verified_records": len(result["criteria"]),
                 "external_pending": result["external_pending"],
+                "pending_criteria": result["pending_criteria"],
+                "pending_scenarios": result["pending_scenarios"],
+                "mvp_accepted": result["mvp_accepted"],
             }
         )
     )
+    if args.require_mvp and (not result["mvp_accepted"] or result["external_pending"]):
+        raise SystemExit(1)

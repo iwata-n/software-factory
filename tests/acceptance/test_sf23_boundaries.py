@@ -14,6 +14,7 @@ from sqlalchemy.exc import IntegrityError
 
 from software_factory import cli
 from software_factory.api import create_app
+from software_factory.db import db_now
 from software_factory.models import AuditEvent, Principal, Project, Run, RunEvent
 from software_factory.service import Service, issue_token, token_hash
 from software_factory.worker_credentials import WorkerCredentials
@@ -311,12 +312,13 @@ def test_workspace_user_access_separates_read_run_operations_and_worker_administ
 
 
 @pytest.mark.ac("SF-23-AC06")
-def test_emergency_stop_survives_restart_and_requires_current_workspace_revision(world):
+def test_emergency_stop_survives_restart_and_requires_current_workspace_revision(world, evidence):
     path = f"/v1/workspaces/{world.workspace_id}/execution-control"
     stop = {"stopped": True, "expected_revision": 0, "reason": "exercise stop"}
     assert world.post(path, stop, token=world.other_user_token).status_code == 404
     operator = issue_token()
     with world.database.transaction() as session:
+        started = db_now(session)
         session.add(
             Principal(
                 workspace_id=world.workspace_id,
@@ -337,18 +339,48 @@ def test_emergency_stop_survives_restart_and_requires_current_workspace_revision
     assert world.post(path, release | {"expected_revision": 1}).json()["revision"] == 2
     assert world.claim().status_code == 200
     with world.database.transaction() as session:
+        admin_id = session.scalar(
+            select(Principal.id).where(Principal.token_hash == token_hash(world.user_token))
+        )
+        assert admin_id
         events = list(
             session.scalars(
-                select(AuditEvent).where(AuditEvent.operation.like("workspace.execution.%"))
+                select(AuditEvent)
+                .where(
+                    AuditEvent.workspace_id == world.workspace_id,
+                    AuditEvent.operation.like("workspace.execution.%"),
+                )
+                .order_by(AuditEvent.created_at)
             )
         )
-        assert {item.operation for item in events} == {
+        assert [item.operation for item in events] == [
             "workspace.execution.stop",
             "workspace.execution.release",
-        }
-        assert sorted(
-            (item.body["before_revision"], item.body["after_revision"]) for item in events
-        ) == [(0, 1), (1, 2)]
+        ]
+        assert all(item.actor_id == admin_id for item in events)
+        finished = db_now(session)
+        assert all(started <= item.created_at <= finished for item in events)
+        assert [item.body for item in events] == [
+            {
+                "workspace_id": world.workspace_id,
+                "reason": reason,
+                "before_revision": before,
+                "after_revision": before + 1,
+            }
+            for before, reason in enumerate((stop["reason"], release["reason"]))
+        ]
+        audit_id = events[0].id
+    with pytest.raises(IntegrityError, match="EVIDENCE_IMMUTABLE"):
+        with world.database.transaction() as session:
+            session.execute(
+                update(AuditEvent)
+                .where(AuditEvent.id == audit_id)
+                .values(body={"reason": "changed"})
+            )
+    evidence(
+        "emergency stop and release are audited once with the original actor, reason and revision",
+        {"audit_rows": 2, "revisions": [1, 2], "mutation_rejected": True},
+    )
 
 
 @pytest.mark.ac("SF-23-AC06")

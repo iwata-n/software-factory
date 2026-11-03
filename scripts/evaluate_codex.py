@@ -29,8 +29,10 @@ from sqlalchemy.engine import make_url
 
 from software_factory.codex_adapter import CodexAdapter, archive_files
 from software_factory.codex_engine import CodexCLI
+from software_factory.db import Database
 from software_factory.evidence import classify_junit
 from software_factory.sandbox import DockerRunner
+from software_factory.slack_delivery import SlackClient, SlackDispatcher
 from software_factory.worker import Supervisor
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -219,6 +221,7 @@ def main():
     parser.add_argument("--task", choices=PROFILES, default="empty")
     parser.add_argument("--probe-disconnect", action="store_true")
     parser.add_argument("--actions-workflow-id", type=int)
+    parser.add_argument("--deliver-slack", action="store_true")
     parser.add_argument("--fixture-base-sha")
     parser.add_argument("--codex-manifest", default="config/codex_cli.json")
     parser.add_argument(
@@ -243,6 +246,12 @@ def main():
         )
     if args.fixture_base_sha and not publish_live:
         parser.error("--fixture-base-sha requires --actions-workflow-id")
+    slack_channel = slack_token = None
+    if args.deliver_slack:
+        slack_channel = os.environ.get("FACTORY_SLACK_CHANNEL_ID")
+        slack_token = os.environ.get("FACTORY_SLACK_BOT_TOKEN")
+        if not publish_live or not slack_channel or not slack_token:
+            parser.error("Slack delivery requires live CI, an evaluation channel and a Bot token")
     url = make_url(os.environ["FACTORY_DATABASE_URL"])
     if not str(url.query.get("host", "")).startswith("/private/tmp/factory-pg-"):
         raise SystemExit("use scripts/with_postgres.py; existing databases are not supported")
@@ -268,7 +277,7 @@ def main():
         "github_writes": 0,
         "notifications_sent": 0,
     }
-    processes, known_secrets = [], []
+    processes, known_secrets = [], [slack_token] if slack_token else []
     command.upgrade(Config(str(ROOT / "alembic.ini")), "head")
     base_env = {
         key: value
@@ -750,6 +759,27 @@ def main():
                     if request["method"] != "GET"
                 ]
                 report["github_writes"] = len(report["github_write_requests"])
+                if args.deliver_slack:
+                    with httpx.Client(
+                        timeout=10, follow_redirects=False, trust_env=False
+                    ) as client:
+                        slack = SlackClient(client, slack_token)
+                        dispatcher = SlackDispatcher(
+                            Database(), slack, account["workspace_id"], slack_channel
+                        )
+                        delivery_state = dispatcher.deliver_one()
+                        response = user.get(f"/v1/runs/{run_id}/notifications")
+                        response.raise_for_status()
+                        (notification,) = response.json()["notifications"]
+                        report["publication"]["notification"] = notification
+                        if delivery_state != "SENT" or notification["state"] != "SENT":
+                            raise RuntimeError("evaluation Slack delivery was not confirmed")
+                        report["notifications_sent"] = 1
+                        observed = slack.find(slack_channel, notification["delivery_key"])
+                        if not observed or observed != notification["message_id"]:
+                            raise RuntimeError("evaluation Slack history did not match delivery")
+                        report["slack_history_confirmed"] = True
+
                 current = state()
                 final_result = report["publication"]["result"]
                 terminal = {"run": current}

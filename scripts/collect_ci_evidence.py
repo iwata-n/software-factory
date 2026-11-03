@@ -32,6 +32,9 @@ def main():
     archive = args.output / "github-artifact.zip"
     with archive.open("wb") as output:
         subprocess.run(["gh", "api", artifact["archive_download_url"]], stdout=output, check=True)
+    archive_digest = sha(archive.read_bytes())
+    if artifact.get("digest") != f"sha256:{archive_digest}":
+        raise SystemExit("downloaded artifact differs from the GitHub SHA-256 digest")
     with ZipFile(archive) as bundle:
         for info in bundle.infolist():
             target = (args.output / info.filename).resolve()
@@ -42,9 +45,12 @@ def main():
                 raise SystemExit("unsafe path or symlink in artifact")
         bundle.extractall(args.output)
     manifest = json.loads((args.output / "manifest.json").read_text())
+    current = source_manifest()
     if (
         manifest["github_sha"] != run["head_sha"]
-        or manifest["code_digest"] != source_manifest()["code_digest"]
+        or manifest["base_sha"] != run["head_sha"]
+        or current["base_sha"] != run["head_sha"]
+        or manifest["code_digest"] != current["code_digest"]
     ):
         raise SystemExit("artifact target does not match run SHA/current inputs")
     certificate = {
@@ -54,7 +60,8 @@ def main():
         "run_url": run["html_url"],
         "artifact_url": f"{run['html_url']}/artifacts/{artifact['id']}",
         "artifact_zip_path": str(archive.resolve()),
-        "artifact_zip_sha256": sha(archive.read_bytes()),
+        "artifact_zip_sha256": archive_digest,
+        "github_artifact_digest": artifact["digest"],
     }
     (args.output / "github-verification.json").write_text(json.dumps(certificate, indent=2))
     result = audit(args.output)

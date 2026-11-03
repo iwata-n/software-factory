@@ -39,3 +39,10 @@ Slack アプリに付与する。設定済みの環境で `python -m software_fa
 SF-19 の公開成功処理では、成功を確定するトランザクション内で
 `slack_delivery.enqueue_result(session, run, pr_url=..., ci_urls=...)` を一度呼ぶ。
 失敗と BLOCKED への遷移は Control Plane が同じ Outbox 契約で記録する。
+
+## 実サービスの評価手順
+
+1. Jiraの評価用Issueの専用欄に評価対象のTaskSpec JSONを入れる。リレー実行環境に `FACTORY_JIRA_MAPPING`、`FACTORY_JIRA_RELAY_TOKEN`、`FACTORY_JIRA_EMAIL`、`FACTORY_JIRA_API_TOKEN` を読み込ませる。Jiraの認証は対象Projectを読み取れるアカウントで行う。
+2. `uv run python -m software_factory.jira_relay "$JIRA_ISSUE_KEY" --api-url "$FACTORY_API_URL"` を実行し、`IMPORTED`、Issue URL、Task ID、Spec版を記録する。同じIssue版を再送し、TaskとSpecの重複がないことを確認する。
+3. インポートしたTaskからRunを作成する。GitHub CIまで確定した後、上記の配送コマンドを評価Workspaceとチャンネルで実行し、Run APIで `SENT` とメッセージIDを確認する。Slack上のメッセージが対象Run・PR・CI・費用を示すことを照合する。
+4. 固定のCodex評価3件では、評価用チャンネルとBotトークンを設定して `scripts/evaluate_codex.py` に `--deliver-slack` を追加する。専用の一時DBに記録した通知を既存の配送処理で送り、Run APIのメッセージIDをSlack履歴と照合する。結果は各評価出力の `evaluation.json` に保存する。秘密は実行環境に読み込ませ、証拠ファイルや設定のコミットに含めない。
