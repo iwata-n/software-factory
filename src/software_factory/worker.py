@@ -159,6 +159,8 @@ class Supervisor:
             ):
                 now = time.monotonic()
                 if now >= deadline:
+                    if not started:
+                        self.adapter.cancel()
                     raise TimeoutError("confirmed lease deadline reached; Agent cancelled")
                 if pending_heartbeat is not None and pending_heartbeat.done():
                     deadline, cancelled = pending_heartbeat.result()
@@ -204,6 +206,8 @@ class Supervisor:
                 time.sleep(min(0.1, max(0, deadline - time.monotonic())))
             result = preparation_error or self.adapter.result()
             if time.monotonic() >= deadline:
+                if not started:
+                    self.adapter.cancel()
                 raise TimeoutError("confirmed lease deadline reached before submission")
             buffered_events.extend(self.adapter.events())
             # Metering precedes output upload so a later failure cannot erase usage.
