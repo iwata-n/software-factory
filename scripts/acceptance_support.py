@@ -53,6 +53,7 @@ def source_manifest() -> dict:
     ]
     settings = plan.split("### MVPの固定試験設定", 1)[1].split("\nSF-10は", 1)[0]
     criteria.append(settings)
+    criteria.extend(line for line in plan.splitlines() if re.match(r"^\| AT-\d{2} ", line))
     files["docs/Implementation_Plan.md#criteria"] = sha("\n".join(criteria).encode())
     fingerprint = sha(json.dumps(files, sort_keys=True).encode())
     base = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=ROOT, text=True).strip()
@@ -70,6 +71,14 @@ def task_criteria() -> list[str]:
         (ROOT / "docs/Implementation_Plan.md").read_text(),
         re.M,
     )
+
+
+def acceptance_scenarios() -> dict[str, list[str]]:
+    plan = (ROOT / "docs/Implementation_Plan.md").read_text()
+    return {
+        scenario: re.findall(r"SF-\d{2}-AC\d{2}|C-0[1-6]", references)
+        for scenario, references in re.findall(r"^\| (AT-\d{2}) [^|]+\| ([^|]+) \|", plan, re.M)
+    }
 
 
 def required_criteria() -> list[str]:
