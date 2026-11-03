@@ -205,6 +205,7 @@ def test_user_worker_other_tenant_and_ungranted_publisher_cannot_dispatch(public
     assert dump(world.database) == before
 
 
+@pytest.mark.ac("SF-23-AC06")
 @pytest.mark.parametrize("authorized", [False, True])
 def test_emergency_stop_blocks_unstarted_publication_but_preserves_external_report(
     publication, authorized

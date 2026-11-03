@@ -6,8 +6,9 @@ from sqlalchemy import select
 
 from software_factory.contracts import ModelCallUsage, digest
 from software_factory.costs import price_call
-from software_factory.models import Attempt, Project
-from software_factory.service import Service
+from software_factory.db import db_now
+from software_factory.models import Attempt, AuditEvent, Principal, Project
+from software_factory.service import Service, token_hash
 from tests.test_control_plane import completion, submit
 
 from .helpers import jobs
@@ -180,7 +181,7 @@ def test_overrun_or_unmetered_execution_stops_without_fake_zero(world, usage, re
     )
 
 
-@pytest.mark.ac("SF-15-AC06")
+@pytest.mark.ac("SF-15-AC06", "SF-23-AC06")
 def test_only_current_budget_approval_adds_a_version_and_resumes_reservation(world, evidence):
     snapshot = copy.deepcopy(world.run()["snapshot"])
     request_reply = budget_request(world, key="request-budget")
@@ -200,6 +201,17 @@ def test_only_current_budget_approval_adds_a_version_and_resumes_reservation(wor
         100000,
         1900000,
     )
+    with world.database.transaction() as session:
+        (audit,) = session.scalars(
+            select(AuditEvent).where(AuditEvent.operation == "budget.decide")
+        )
+        admin = session.scalar(
+            select(Principal.id).where(Principal.token_hash == token_hash(world.user_token))
+        )
+        assert audit.actor_id == admin and 0 < audit.created_at <= db_now(session)
+        assert audit.body["reason"] == "reviewed current budget, cost and target"
+        assert audit.body["before_revision"] == request["target"]["run_revision"]
+        assert audit.body["after_revision"] == approved.json()["run"]["state_revision"]
     evidence(
         "a reasoned approval adds budget version 2 while retaining the original snapshot",
         {"request": request, "approved": approved.json(), "costs": costs(world)},

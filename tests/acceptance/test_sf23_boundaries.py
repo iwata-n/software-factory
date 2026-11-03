@@ -326,7 +326,7 @@ def test_rotation_races_active_heartbeat_and_claim_without_changing_slot(world, 
     )
 
 
-@pytest.mark.ac("SF-23-AC05")
+@pytest.mark.ac("SF-23-AC05", "SF-23-AC06")
 def test_workspace_user_access_separates_read_run_operations_and_worker_administration(
     world, evidence
 ):
@@ -414,6 +414,21 @@ def test_workspace_user_access_separates_read_run_operations_and_worker_administ
     assert world.post(revoke_path, {"reason": "evaluation"}).status_code == 200
     assert world.claim().status_code == 401
     assert world.claim(token=new_worker.json()["worker_token"]).status_code == 204
+    with world.database.transaction() as session:
+        (revocation,) = session.scalars(
+            select(AuditEvent).where(AuditEvent.operation == "worker.credential.revoke")
+        )
+        admin_id = session.scalar(
+            select(Principal.id).where(Principal.token_hash == token_hash(world.user_token))
+        )
+        assert revocation.actor_id == admin_id
+        assert revocation.body == {
+            "worker_id": world.worker_id,
+            "before_active": True,
+            "after_active": False,
+            "reason": "evaluation",
+        }
+        assert 0 < revocation.created_at <= db_now(session)
     evidence(
         "Operation authority is enforced per role and Workspace without exposing credentials",
         {
@@ -446,15 +461,42 @@ def test_emergency_stop_survives_restart_and_requires_current_workspace_revision
             )
         )
     assert world.post(path, stop, token=operator).status_code == 403
-    assert world.post(path, stop, key="stop").json()["revision"] == 1
-    assert world.post(path, stop, key="stop").json()["revision"] == 1
-    client = TestClient(create_app(world.database))
-    headers = {"Authorization": f"Bearer {world.user_token}"}
-    assert client.get(path, headers=headers).json()["stopped"] is True
-    assert world.claim().status_code == 204
+    with socket.socket() as listener:
+        listener.bind(("127.0.0.1", 0))
+        port = listener.getsockname()[1]
+    process = start_control_plane(port)
+    original_pid = process.pid
     release = {"stopped": False, "expected_revision": 0, "reason": "release rehearsal"}
-    assert world.post(path, release).status_code == 409
-    assert world.post(path, release | {"expected_revision": 1}).json()["revision"] == 2
+    headers = {"Authorization": f"Bearer {world.user_token}"}
+    try:
+        with httpx.Client(base_url=f"http://127.0.0.1:{port}", headers=headers) as client:
+            stopped = client.post(path, json=stop, headers={"Idempotency-Key": "stop"})
+            assert stopped.raise_for_status().json()["revision"] == 1
+            process.kill()
+            process.communicate(timeout=5)
+            assert process.returncode == -signal.SIGKILL
+            process = start_control_plane(port)
+            assert process.pid != original_pid
+            assert client.get(path).raise_for_status().json() == stopped.json()
+            replay = client.post(path, json=stop, headers={"Idempotency-Key": "stop"})
+            assert replay.raise_for_status().json() == stopped.json()
+            assert world.claim().status_code == 204
+            assert (
+                client.post(
+                    path, json=release, headers={"Idempotency-Key": "stale-release"}
+                ).status_code
+                == 409
+            )
+            reply = client.post(
+                path,
+                json=release | {"expected_revision": 1},
+                headers={"Idempotency-Key": "release"},
+            )
+            assert reply.raise_for_status().json()["revision"] == 2
+    finally:
+        if process.poll() is None:
+            process.terminate()
+            process.communicate(timeout=10)
     assert world.claim().status_code == 200
     with world.database.transaction() as session:
         admin_id = session.scalar(
@@ -497,7 +539,13 @@ def test_emergency_stop_survives_restart_and_requires_current_workspace_revision
             )
     evidence(
         "emergency stop and release are audited once with the original actor, reason and revision",
-        {"audit_rows": 2, "revisions": [1, 2], "mutation_rejected": True},
+        {
+            "audit_rows": 2,
+            "revisions": [1, 2],
+            "mutation_rejected": True,
+            "stopped_pid": original_pid,
+            "restarted_pid": process.pid,
+        },
     )
 
 
