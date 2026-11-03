@@ -449,7 +449,7 @@ while True:
         assert removed(b)
 
 
-@pytest.mark.ac("SF-21-AC05")
+@pytest.mark.ac("SF-21-AC05", "SF-21-AC06")
 def test_codex_owner_death_reclaims_network_and_auth_copy(tmp_path, evidence):
     from uuid import uuid4
 

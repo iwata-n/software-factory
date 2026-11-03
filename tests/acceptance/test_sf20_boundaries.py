@@ -196,7 +196,7 @@ def test_adapter_classifies_cli_process_failure(
             engine.cancel()
 
 
-@pytest.mark.ac("SF-20-AC05", "SF-21-AC01")
+@pytest.mark.ac("SF-20-AC05", "SF-21-AC01", "SF-21-AC06")
 def test_project_model_policy_and_untrusted_repository_on_real_runner(
     job, cli, tmp_path, monkeypatch, evidence
 ):
@@ -288,6 +288,7 @@ sys.stdout.write({output!r})
         assert allowed.outcome == "EXECUTED" and allowed.result == PLAN, allowed
         assert commands.count("create") == 1
         assert engine._container is None
+        assert not engine._auth_copy.parent.exists()
     finally:
         if adapter._thread.is_alive():
             adapter.cancel()
@@ -305,6 +306,7 @@ sys.stdout.write({output!r})
             "read_only_root": True,
             "isolated_pid_namespace": True,
             "metadata_connect_status": 403,
+            "temporary_auth_directory_removed": True,
         },
         image_digest=image,
         engine_input_origin="synthetic_cli_fixture",
