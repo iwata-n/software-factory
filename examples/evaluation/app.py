@@ -10,7 +10,7 @@ def parse_count(value):
 
 
 def normalize_spaces(value):
-    return value.replace("  ", " ")
+    return " ".join(part for part in value.split(" ") if part)
 
 
 def stable_label(value):
