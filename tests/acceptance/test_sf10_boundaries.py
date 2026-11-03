@@ -189,8 +189,9 @@ def test_protected_token_filename_preserves_its_hash_without_allowing_credential
 
 
 @pytest.mark.ac("SF-21-AC05", "SF-23-AC02")
-def test_managed_lease_cancel_confirms_container_removed_before_reporting(
-    pipeline, tmp_path, monkeypatch, evidence
+@pytest.mark.parametrize("trigger", ["cancel", "disconnect"])
+def test_managed_worker_confirms_container_removed_on_stop(
+    pipeline, tmp_path, monkeypatch, evidence, trigger
 ):
     class PausedRunner(DockerRunner):
         def execute(self, request, **kwargs):
@@ -204,8 +205,11 @@ def test_managed_lease_cancel_confirms_container_removed_before_reporting(
     supervisor = Supervisor(pipeline.client, adapter, heartbeat_interval=0.1)
     container = None
     confirmed = []
+    disconnected = Event()
 
     def check_before_report(request):
+        if disconnected.is_set():
+            raise httpx.ReadError("injected loss of Control Plane connection", request=request)
         if not request.url.path.endswith("/complete"):
             return
         assert container is not None
@@ -228,22 +232,31 @@ def test_managed_lease_cancel_confirms_container_removed_before_reporting(
                         break
                 time.sleep(0.05)
             assert container is not None
-            response = world.post(
-                f"/v1/runs/{world.run_id}/cancel",
-                {"expected_run_revision": world.run()["state_revision"], "reason": "test stop"},
-            )
-            assert response.status_code == 202
-            assert pending.result(timeout=12)["run"]["status"] == "CANCELLED"
-            assert confirmed == [container]
+            if trigger == "cancel":
+                response = world.post(
+                    f"/v1/runs/{world.run_id}/cancel",
+                    {"expected_run_revision": world.run()["state_revision"], "reason": "test stop"},
+                )
+                assert response.status_code == 202
+                assert pending.result(timeout=12)["run"]["status"] == "CANCELLED"
+                assert confirmed == [container]
+            else:
+                disconnected.set()
+                with pytest.raises(httpx.ReadError, match="loss of Control Plane"):
+                    pending.result(timeout=12)
+                assert not confirmed
             assert adapter.result().outcome == "CANCELLED"
+            listing = runner.docker("ps", "-aq", "--filter", f"name=^/{container}$", timeout=5)
+            assert listing.returncode == 0 and not listing.stdout.strip()
             workers = world.get(f"/v1/workspaces/{world.workspace_id}/workers").json()["workers"]
             managed = next(
                 worker for worker in workers if worker["worker_id"] == pipeline.managed.worker_id
             )
-            assert managed["stop_confirmation"] == "WORKER_REPORTED_STOP"
+            expected = "WORKER_REPORTED_STOP" if trigger == "cancel" else None
+            assert managed["stop_confirmation"] == expected
             evidence(
-                "real managed assembler stops and removes container before confirming cancellation",
-                {"run": "CANCELLED", "container_removed": True, "worker": managed},
+                "managed assembler stops and removes its container after the stop trigger",
+                {"trigger": trigger, "container_removed": True, "worker": managed},
                 container_id=container,
             )
         finally:
