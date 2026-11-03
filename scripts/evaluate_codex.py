@@ -232,6 +232,7 @@ def main():
     parser.add_argument("--output", required=True, type=Path)
     parser.add_argument("--task", choices=PROFILES, default="empty")
     parser.add_argument("--probe-disconnect", action="store_true")
+    parser.add_argument("--probe-usage-replay", action="store_true")
     parser.add_argument("--actions-workflow-id", type=int)
     parser.add_argument("--deliver-slack", action="store_true")
     parser.add_argument("--fixture-base-sha")
@@ -706,6 +707,47 @@ def main():
                 raise RuntimeError("PLAN/IMPLEMENT/REVIEW require separate measured usage receipts")
             if candidate["head_sha"] == fixed["sha"]:
                 raise RuntimeError("candidate did not change source")
+            if args.probe_usage_replay:
+                graph = json.loads((output / "graph.json").read_text())
+                kinds = {job["job_id"]: job["kind"] for job in graph["jobs"]}
+                replayed = []
+                for receipt in costs["receipts"]:
+                    metadata = receipt["metadata_body"]
+                    tools = [
+                        tool for call in metadata["calls"] for tool in call.get("tool_calls", [])
+                    ]
+                    if not tools:
+                        continue
+                    body = {
+                        name: receipt[name]
+                        for name in (
+                            "provider",
+                            "delivery_id",
+                            "sequence",
+                            "total_microusd",
+                            "currency",
+                            "final",
+                        )
+                    }
+                    body.update(
+                        calls=metadata["calls"],
+                        pricing_manifest_hash=metadata["pricing_manifest_hash"],
+                    )
+                    secret = stage_secret if kinds[receipt["job_id"]] == "REVIEW" else model_secret
+                    with httpx.Client(
+                        base_url=cp_url,
+                        headers={"Authorization": f"Bearer {secret}"},
+                        trust_env=False,
+                    ) as client:
+                        replay = post(
+                            client, f"/v1/worker/attempts/{receipt['attempt_id']}/usage", body
+                        )
+                    if replay["receipt"] != receipt:
+                        raise RuntimeError("replaying actual usage changed the recorded receipt")
+                    replayed.append({"receipt_id": receipt["receipt_id"], "tool_calls": len(tools)})
+                if not replayed or user.get(f"/v1/runs/{run_id}/costs").json() != costs:
+                    raise RuntimeError("actual tool usage replay did not preserve the ledger")
+                report["usage_replay"] = {"receipts": replayed, "ledger_unchanged": True}
             if args.probe_disconnect:
                 fault_spec = spec | {"task": spec["task"] | {"title": "Codex disconnect probe"}}
                 fault_task = post(user, f"/v1/projects/{project['project_id']}/tasks", fault_spec)

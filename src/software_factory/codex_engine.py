@@ -80,6 +80,7 @@ class EngineManifest(BaseModel):
     reasoning_effort: Literal["low", "medium", "high", "xhigh"]
     execution_mode: Literal["structured_text_no_repo_checkout", "isolated_linux"]
     isolation: LinuxIsolation | None = None
+    code_mode_host_sha256: Annotated[str, Field(pattern=r"^[0-9a-f]{64}$")] | None = None
     timeout_seconds: int = Field(ge=1, le=2700)
     max_input_bytes: int = Field(ge=1024, le=2 * 1024 * 1024)
     max_output_bytes: int = Field(ge=1024, le=16 * 1024 * 1024)
@@ -88,6 +89,8 @@ class EngineManifest(BaseModel):
     def validate_isolation_mode(self):
         if (self.execution_mode == "isolated_linux") != (self.isolation is not None):
             raise ValueError("isolated_linux requires a pinned Runner and model destinations")
+        if self.code_mode_host_sha256 and self.isolation is None:
+            raise ValueError("the App Server requires an isolated Runner")
         return self
 
 

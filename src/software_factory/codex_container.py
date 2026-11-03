@@ -14,7 +14,7 @@ from threading import Lock
 from uuid import uuid4
 
 from . import model_egress
-from .codex_engine import CodexCLI, CodexError, file_hash
+from .codex_engine import DISABLED_FEATURES, CodexCLI, CodexError, file_hash
 from .codex_watchdog import AUTH_PREFIX, names
 from .sandbox import STOP_UNCONFIRMED, DockerRunner, RunnerError
 from .sandbox_watchdog import docker_environment
@@ -228,6 +228,32 @@ class DockerCodexCLI(CodexCLI):
         schema_path.chmod(0o444)
         name = self._container_name
         self._container = name
+        manifest = self.manifest
+        extra_mounts = []
+        cli_args = super().argv("/opt/schema.json")[1:]
+        if manifest.code_mode_host_sha256:
+            helper = Path(self.binary).with_name("codex-code-mode-host")
+            try:
+                verified = file_hash(helper) == manifest.code_mode_host_sha256
+            except OSError:
+                verified = False
+            if not verified:
+                raise CodexError("CODEX_TOOL_HOST_DIGEST_MISMATCH", "POLICY", before_launch=True)
+            extra_mounts = [
+                "--mount",
+                f"type=bind,src={helper},dst=/opt/codex-code-mode-host,readonly",
+            ]
+            cli_args = [
+                "app-server",
+                "--listen",
+                "stdio://",
+                "-c",
+                'web_search="disabled"',
+                "-c",
+                "project_doc_max_bytes=0",
+            ]
+            for feature in DISABLED_FEATURES:
+                cli_args.extend(("--disable", feature))
         created = DockerRunner.docker(
             "create",
             "-i",
@@ -236,6 +262,7 @@ class DockerCodexCLI(CodexCLI):
             "--network",
             self._network,
             *self.container_options(),
+            *extra_mounts,
             "--env",
             f"HTTPS_PROXY={self._proxy_url}",
             "--mount",
@@ -248,7 +275,7 @@ class DockerCodexCLI(CodexCLI):
             "-ec",
             'umask 077; cp /opt/auth.json /work/auth.json; exec /opt/codex "$@"',
             "--",
-            *super().argv("/opt/schema.json")[1:],
+            *cli_args,
             timeout=10,
         )
         if created.returncode:
@@ -302,9 +329,21 @@ class DockerCodexCLI(CodexCLI):
                     ) as network:
                         self._network, self._proxy_url = network
                         try:
+                            if self.manifest.code_mode_host_sha256:
+                                from .codex_app_server import run_app_server
+
+                                return run_app_server(
+                                    self, Path(root), context, output_model, cancelled, timeout
+                                )
                             return super().run(context, output_model, cancelled, timeout=timeout)
                         finally:
                             self.cancel()
+                            with self._lock:
+                                process, self._process = self._process, None
+                            if process is not None:
+                                for stream in (process.stdin, process.stdout):
+                                    if stream is not None:
+                                        stream.close()
                 except RunnerError as error:
                     raise CodexError(error.code, error.category) from None
         finally:
