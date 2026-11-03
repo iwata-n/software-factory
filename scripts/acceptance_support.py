@@ -12,6 +12,8 @@ EXTERNAL_CRITERIA = {
     "SF-17-AC01": "publication-verification.json",
     "SF-17-AC02": "publication-verification.json",
     "SF-17-AC03": "publication-verification.json",
+    "SF-19-AC01": "sf19-verification.json",
+    "SF-19-AC06": "sf19-verification.json",
 }
 
 

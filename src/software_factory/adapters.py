@@ -26,6 +26,14 @@ class AgentResult:
     reason: str | None = None
     usage_microusd: int | None = 0
     artifacts: tuple[ProducedArtifact, ...] = ()
+    usage_deliveries: tuple[dict, ...] = ()
+
+
+class AgentExecutionError(Exception):
+    def __init__(self, reason, category, *, usage_deliveries=()):
+        super().__init__(reason)
+        self.reason, self.category = reason, category
+        self.usage_deliveries = usage_deliveries
 
 
 class AgentAdapter(Protocol):

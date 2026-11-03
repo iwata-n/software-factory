@@ -149,6 +149,10 @@ class PublisherSupervisor:
         with self.journal.lock():
             pending = self.journal.read()
             if pending is None:
+                reconciliations = self.request("GET", "/v1/publisher/reconciliations")
+                self.accept(reconciliations)
+                if operations := reconciliations.json()["operations"]:
+                    return self.reconcile(operations[0])
                 queued = self.request("GET", "/v1/publisher/queue")
                 self.accept(queued)
                 if not queued.json()["operations"]:
@@ -219,20 +223,73 @@ class PublisherSupervisor:
                 }
                 pending["phase"] = "RESULT"
                 self.journal.save(pending)
-            report = PublicationReport.model_validate(pending["report"]).model_dump()
-            result = self.request(
-                "POST",
-                f"/v1/publisher/operations/{operation['operation_id']}/reports",
-                body=report,
-                key="publish-report:" + digest(report),
-            )
-            self.accept(result)
-            self.journal.clear()
-            return {
-                "processed": True,
-                "operation_id": operation["operation_id"],
-                "state": result.json()["operation"]["state"],
+            return self.deliver(pending)
+
+    def reconcile(self, operation):
+        operation_id = operation["operation_id"]
+        attempt = operation["reconcile_attempts"] + (operation["state"] == "UNKNOWN")
+        claim = self.request(
+            "POST",
+            f"/v1/publisher/operations/{operation_id}/reconcile",
+            body={"target_hash": operation["target_hash"], "attempt": attempt},
+            key=f"publish-reconcile:{operation_id}:{attempt}",
+        )
+        if (
+            claim.status_code == 409
+            and claim.json()["code"] == "PUBLICATION_RECONCILIATION_NOT_DUE"
+        ):
+            return {"processed": False}
+        self.accept(claim)
+        self.checkpoint("publisher.before_reconcile")
+        try:
+            result = {"status": "SUCCEEDED", "pull_request": self.backend.reconcile(claim.json())}
+        except PublicationError as error:
+            result = {
+                "status": "UNKNOWN",
+                "reason": error.reason,
+                "observed_head_sha": error.observed_head,
             }
+        except (ValueError, KeyError, TypeError, AttributeError):
+            result = {"status": "UNKNOWN", "reason": "PROVIDER_UNAVAILABLE"}
+        pending = {
+            "phase": "RESULT",
+            "operation": operation,
+            "report": {
+                "delivery_id": f"publish-reconcile-result:{operation_id}:{attempt}",
+                "target_hash": operation["target_hash"],
+                "reconcile_attempt": attempt,
+                "provider_requests": getattr(self.backend, "trace", []),
+                **result,
+            },
+        }
+        self.journal.save(pending)
+        self.checkpoint("publisher.after_reconcile")
+        return self.deliver(pending)
+
+    def deliver(self, pending):
+        operation_id = pending["operation"]["operation_id"]
+        report = PublicationReport.model_validate(pending["report"]).payload()
+        result = self.request(
+            "POST",
+            f"/v1/publisher/operations/{operation_id}/reports",
+            body=report,
+            key="publish-report:" + digest(report),
+        )
+        if (
+            report.get("reconcile_attempt") is not None
+            and result.status_code == 409
+            and result.json()["code"]
+            in {"PUBLICATION_RECONCILIATION_STALE", "PUBLICATION_DELIVERY_CONFLICT"}
+        ):
+            self.journal.clear()
+            return {"processed": False}
+        self.accept(result)
+        self.journal.clear()
+        return {
+            "processed": True,
+            "operation_id": operation_id,
+            "state": result.json()["operation"]["state"],
+        }
 
     @staticmethod
     def accept(response):

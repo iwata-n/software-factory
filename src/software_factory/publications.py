@@ -3,7 +3,7 @@
 import base64
 from urllib.parse import urlsplit
 
-from sqlalchemy import select
+from sqlalchemy import and_, or_, select
 
 from .candidates import candidate_view
 from .contracts import digest
@@ -26,6 +26,11 @@ from .source_runner import SourcePolicyDenied, canonical_remote
 def operation_view(item):
     return {
         "operation_id": item.id,
+        "required_action": (
+            "Inspect the remote branch and PR before deciding how to proceed."
+            if item.state == "BLOCKED" and item.reason == "PUBLISH_UNKNOWN"
+            else None
+        ),
         **{
             key: getattr(item, key)
             for key in (
@@ -125,6 +130,7 @@ class PublicationCommands:
             "head_ref": "codex/factory/" + run.id,
             "expected_remote_head": previous.head_sha if previous else None,
             "pull_request_number": previous.number if previous else None,
+            "pull_request_external_id": previous.external_id if previous else None,
             "candidate": candidate_view(candidate),
             "gate_id": gate.id,
             "evidence_digest": gate.evidence_digest,
@@ -254,6 +260,58 @@ class PublicationCommands:
             raise DomainError(409, "PUBLICATION_TARGET_CORRUPTED")
         return item
 
+    def reconciliation_queue(self, session, actor):
+        operations = session.scalars(
+            select(PublicationOperation)
+            .join(
+                PublisherGrant,
+                and_(
+                    PublisherGrant.workspace_id == PublicationOperation.workspace_id,
+                    PublisherGrant.repository_id == PublicationOperation.repository_id,
+                    PublisherGrant.publisher_id == actor.id,
+                ),
+            )
+            .where(
+                PublicationOperation.workspace_id == actor.workspace_id,
+                PublicationOperation.publisher_id == actor.id,
+                or_(
+                    PublicationOperation.state == "RECONCILING",
+                    and_(
+                        PublicationOperation.state == "UNKNOWN",
+                        PublicationOperation.next_reconcile_at <= db_now(session),
+                    ),
+                ),
+            )
+            .order_by(PublicationOperation.next_reconcile_at, PublicationOperation.id)
+            .limit(50)
+        )
+        return {"operations": [operation_view(item) for item in operations]}
+
+    def claim_reconciliation(self, session, actor, operation_id, data):
+        from .service import DomainError, event, owned
+
+        item = self.assigned(session, actor, operation_id)
+        if data.target_hash != item.target_hash:
+            raise DomainError(409, "PUBLICATION_TARGET_STALE")
+        if item.state == "RECONCILING" and data.attempt == item.reconcile_attempts:
+            return operation_view(item)
+        if (
+            item.state != "UNKNOWN"
+            or item.next_reconcile_at is None
+            or item.next_reconcile_at > db_now(session)
+            or data.attempt != item.reconcile_attempts + 1
+        ):
+            raise DomainError(409, "PUBLICATION_RECONCILIATION_NOT_DUE")
+        item.state = "RECONCILING"
+        item.reconcile_attempts = data.attempt
+        event(
+            session,
+            owned(session, Run, item.run_id, actor.workspace_id),
+            "PUBLICATION_RECONCILING",
+            {"operation_id": item.id, "attempt": data.attempt},
+        )
+        return operation_view(item)
+
     def inputs(self, session, actor, operation_id):
         from .service import DomainError, owned
 
@@ -277,13 +335,12 @@ class PublicationCommands:
         return {"operation": operation_view(item), "sources": list(reversed(chain))}
 
     def report(self, session, actor, operation_id, data):
-        from .domain import TERMINAL
         from .service import DomainError, event, owned, run_view, transition
 
         item = self.assigned(session, actor, operation_id)
         if data.target_hash != item.target_hash:
             raise DomainError(409, "PUBLICATION_TARGET_STALE")
-        payload = data.model_dump()
+        payload = data.payload()
         previous = session.scalar(
             select(PublicationObservation).where(
                 PublicationObservation.workspace_id == actor.workspace_id,
@@ -296,7 +353,13 @@ class PublicationCommands:
             if previous.payload_hash != digest(payload):
                 raise DomainError(409, "PUBLICATION_DELIVERY_CONFLICT")
             return {"operation": operation_view(item), "run": run_view(run)}
-        if item.state != "IN_FLIGHT":
+        reconciling = data.reconcile_attempt is not None
+        if reconciling:
+            if item.state != "RECONCILING" or data.reconcile_attempt != item.reconcile_attempts:
+                raise DomainError(409, "PUBLICATION_RECONCILIATION_STALE")
+            if data.status == "CONFLICT" or any(r.method != "GET" for r in data.provider_requests):
+                raise DomainError(409, "PUBLICATION_RECONCILIATION_INVALID")
+        elif item.state != "IN_FLIGHT":
             raise DomainError(409, "PUBLICATION_NOT_IN_FLIGHT")
         target = item.target
         now = db_now(session)
@@ -319,7 +382,9 @@ class PublicationCommands:
                 )
             )
             if draft and (
-                draft.number != report.number or draft.head_sha != target["expected_remote_head"]
+                draft.number != report.number
+                or draft.external_id != report.external_id
+                or draft.head_sha != target["expected_remote_head"]
             ):
                 raise DomainError(409, "PUBLICATION_PR_CONFLICT")
             if not draft:
@@ -335,10 +400,13 @@ class PublicationCommands:
             draft.candidate_id = item.candidate_id
             draft.metadata_body = {"origin_verified": True, "operation_id": item.id}
             draft.observed_at = now
-        item.state = "BLOCKED" if data.status == "CONFLICT" else data.status
-        item.reason = data.reason
+        exhausted = reconciling and data.status == "UNKNOWN" and item.reconcile_attempts == 3
+        item.state = "BLOCKED" if exhausted or data.status == "CONFLICT" else data.status
+        item.reason = "PUBLISH_UNKNOWN" if exhausted else data.reason
         item.completed_at = now if item.state in {"BLOCKED", "SUCCEEDED"} else None
-        item.next_reconcile_at = now + 1 if item.state == "UNKNOWN" else None
+        item.next_reconcile_at = (
+            now + 2**item.reconcile_attempts if item.state == "UNKNOWN" else None
+        )
         session.add(
             PublicationObservation(
                 workspace_id=item.workspace_id,
@@ -352,9 +420,7 @@ class PublicationCommands:
             )
         )
         job = owned(session, Job, item.job_id, actor.workspace_id)
-        job.state = {"SUCCEEDED": "SUCCEEDED", "UNKNOWN": "PUBLISH_UNKNOWN", "CONFLICT": "BLOCKED"}[
-            data.status
-        ]
+        job.state = "PUBLISH_UNKNOWN" if item.state == "UNKNOWN" else item.state
         event(
             session,
             run,
@@ -366,25 +432,32 @@ class PublicationCommands:
                 "draft_pr_id": draft.id if draft else None,
             },
         )
-        if (
-            run.status not in TERMINAL
-            and run.status != "CANCELLING"
-            and (run.current_candidate_id == item.candidate_id and run.phase == "PUBLISH_DRAFT")
+        if run.current_candidate_id == item.candidate_id and (
+            (run.status == "WAITING_EXTERNAL" and run.phase == "PUBLISH_UNKNOWN")
+            if reconciling
+            else (run.status in {"QUEUED", "RUNNING"} and run.phase == "PUBLISH_DRAFT")
         ):
-            if data.status == "CONFLICT":
-                transition(session, run, "BLOCKED", data.reason)
-            elif data.status == "UNKNOWN":
+            if item.state == "BLOCKED":
+                transition(session, run, "BLOCKED", item.reason)
+            elif item.state == "UNKNOWN":
                 run.status, run.phase = "WAITING_EXTERNAL", "PUBLISH_UNKNOWN"
             elif self.service.repository_allowed(session, run):
                 try:
                     self.service.interventions.require_current_context(session, run)
                     self.service.gates.require_publication(
-                        session, run, item.candidate_id, item.gate_id, target["evidence_digest"]
+                        session,
+                        run,
+                        item.candidate_id,
+                        item.gate_id,
+                        target["evidence_digest"],
+                        recovering=reconciling,
                     )
                 except DomainError:
                     transition(session, run, "BLOCKED", "PUBLICATION_GATE_STALE")
                 else:
-                    self.service.gates.begin_ci_wait(session, run, item.gate_id, draft_view(draft))
+                    self.service.gates.begin_ci_wait(
+                        session, run, item.gate_id, draft_view(draft), recovering=reconciling
+                    )
         session.flush()
         self.service.checkpoint("publication.reported")
         return {"operation": operation_view(item), "run": run_view(run)}

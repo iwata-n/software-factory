@@ -6,6 +6,7 @@ SECRET_KEY = re.compile(r"(?:token|password|secret|authorization|api[_-]?key|cre
 SECRETS = (
     re.compile(r"(?i)\bBearer\s+[^\s\"',}]+"),
     re.compile(r"(?i)\b(?:token|password|secret|api[_-]?key)\s*[:=]\s*[^\s\"',}]+"),
+    re.compile(r"\bxox[a-z]-[A-Za-z0-9-]+"),
     re.compile(r"\b(?:gh[pousr]_[A-Za-z0-9_]+|sk-[A-Za-z0-9_-]+)"),
     re.compile(r"https?://[^\s/@]+:[^\s/@]+@[^\s]+"),
     re.compile(r"https?://[^\s]+[?&](?:token|key|secret|password)=[^\s]+", re.I),

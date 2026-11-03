@@ -6,7 +6,7 @@
 
 前段のSF-01〜07再評価では、不足する基盤実装とAC付き試験を追加し、ローカルと実GitHub CIのPostgreSQL 17で各327ケースが成功した。全43 ACと共通6条件の証拠49件を対象SHAへ照合して受け入れた。現在の既定Fake実行は `PLAN → VALIDATE → IMPLEMENT` を模擬し、patchを生成しないため `ASSEMBLE_CANDIDATE` で `BLOCKED / CHANGE_ARTIFACT_MISSING` に停止する。PATCHを提出するWorkerには管理Assemblerを接続する。
 
-残り17タスクの実装を継続し、現在はSF-01〜16が受け入れ済みで、残り8タスク。最新の受入基準revisionは `ffde9f84778bc7f3bf148de2859ba68063c4533a`、全1,007ケースと106件の条件別証拠を実CIまで照合済み。M3を完了し、SF-17の専用Publisherを実装中。未検証条件を実装済みの部分だけで合格へ変更しない。以後のコード変更では全回帰・証拠・実CIを再評価する。
+残り17タスクの実装を継続し、現在はSF-01〜17が受け入れ済みで、残り7タスク。最新の受入基準revisionは `edfc4abdb626d61dcd0c5440c5a7d43a07de76a4`、全1,115ケースと112件の条件別証拠を実CIまで照合済み。M3とSF-17の専用Publisherを完了した。ユーザー指示によりSF-20の実Codex接続を先行し、実モデルによるLocal PASSと、変更後のローカル全1,157ケース成功まで確認した。SF-18のCI同期とSF-20全ACの受入確定は後続に残す。未検証条件を実装済みの部分だけで合格へ変更しない。以後のコード変更では全回帰・証拠・実CIを再評価する。
 
 ## マイルストーンと依存関係
 
@@ -22,7 +22,7 @@ M1は全ACと共通条件を満たし受け入れ済み。設計書17章の「�
 
 ## タスク一覧
 
-各タスクはコード、必要なマイグレーション、API契約、失敗系テスト、起動・運用手順を含む。実装状態と受け入れ状態は別に記録する。SF-01〜16は実CIとArtifact照合まで完了した。対象revisionと証拠は末尾の受入確定に記載する。
+各タスクはコード、必要なマイグレーション、API契約、失敗系テスト、起動・運用手順を含む。実装状態と受け入れ状態は別に記録する。SF-01〜17は実CIとArtifact照合まで完了した。対象revisionと証拠は末尾の受入確定に記載する。
 
 | ID | タスクと成果物 | 依存 | 受け入れ条件 | 実装状態 | 受入状態 |
 |---|---|---|---|---|---|
@@ -42,10 +42,10 @@ M1は全ACと共通条件を満たし受け入れ済み。設計書17章の「�
 | [SF-14](#sf-14-plan版と対象を固定する承認) | Plan版・再計画・計画承認 | SF-04、SF-12 | SF-14-AC01〜06 | 実装済み | 受け入れ済み |
 | [SF-15](#sf-15-費用台帳と予算変更) | 費用/予約台帳・精算・予算変更 | SF-05、SF-13 | SF-15-AC01〜06 | 実装済み | 受け入れ済み |
 | [SF-16](#sf-16-人間の介入コマンド) | 介入と承認の共通処理 | SF-14、SF-15 | SF-16-AC01〜06 | 実装済み | 受け入れ済み |
-| [SF-17](#sf-17-trusted-publisherとdraft-pr) | Trusted Publisher・Draft PR・操作台帳 | SF-10、SF-12、SF-16 | SF-17-AC01〜06 | 実装中 | 未判定 |
-| [SF-18](#sf-18-ci同期とwebhookの重複排除) | CI・Webhook Inbox・定期照合 | SF-17 | SF-18-AC01〜06 | 未着手 | 未判定 |
-| [SF-19](#sf-19-公開結果unknownの復旧とrun成功) | 公開UNKNOWN復旧・Run成功 | SF-18 | SF-19-AC01〜06 | 未着手 | 未判定 |
-| [SF-20](#sf-20-実agent-adapterと利用量計測) | 実Agent・利用量計測 | SF-06、SF-15 | SF-20-AC01〜06 | 未着手 | 未判定 |
+| [SF-17](#sf-17-trusted-publisherとdraft-pr) | Trusted Publisher・Draft PR・操作台帳 | SF-10、SF-12、SF-16 | SF-17-AC01〜06 | 実装済み | 受け入れ済み |
+| [SF-18](#sf-18-ci同期とwebhookの重複排除) | CI・Webhook Inbox・定期照合 | SF-17 | SF-18-AC01〜06 | 実装中 | 未判定 |
+| [SF-19](#sf-19-公開結果unknownの復旧とrun成功) | 公開UNKNOWN復旧・Run成功 | SF-18 | SF-19-AC01〜06 | 一部実装 | 未判定 |
+| [SF-20](#sf-20-実agent-adapterと利用量計測) | 実Agent・利用量計測 | SF-06、SF-15 | SF-20-AC01〜06 | 実装中 | 未判定 |
 | [SF-21](#sf-21-sandboxとプロセス停止) | Sandbox・資源/通信制限・停止 | SF-09、SF-20 | SF-21-AC01〜07 | 未着手 | 未判定 |
 | [SF-22](#sf-22-jira入力とslack通知) | Jira入力・Slack通知・Outbox配送 | SF-07、SF-19 | SF-22-AC01〜06 | 未着手 | 未判定 |
 | [SF-23](#sf-23-運用表示と認証更新と監査) | 運用表示・SSE・認証更新・監査 | SF-16、SF-19、SF-21 | SF-23-AC01〜06 | 一部実装 | 未判定 |
@@ -331,6 +331,8 @@ Gateは必須Jobが処理中なら待機を続ける。全必須Jobが終端ま�
 
 依存SF-17。試験追加先は `tests/acceptance/test_sf18.py`。外部CIはProfileのprovider/app/check IDに一致するものだけ信頼する。同じ表示名だけでは一致としない。
 
+先行実装で、GitHub Webhookの署名とリポジトリの照合、配送の永続化、再送と同時配送の重複排除を追加した。Inboxには配送ID、イベント種別、指紋、受信時刻を保存する。次はGitHub APIからの定期照合、Candidateへの証拠の紐付け、実サービスでの受け入れ試験。
+
 | AC ID | 前提と操作 | 合格となる期待結果 | 検証方法と証拠 |
 |---|---|---|---|
 | SF-18-AC01 | 正当/不正な署名、別Integration/RepositoryのWebhookを送信 | 正当な配送だけInboxに保存。不正署名401、署名正当でも対象不一致404、状態変更0 | CT/IT：署名fixture、配送IDとInbox/Run差分、秘密マスク |
@@ -341,6 +343,8 @@ Gateは必須Jobが処理中なら待機を続ける。全必須Jobが終端ま�
 | SF-18-AC06 | 試験用GitHubで実CIを成功/失敗させ、Webhook経由とpoll経由で取得 | 実PR headと同じ対象のCI結果・証拠URLを保存。両経路で同じ判定となる | E2E：実PR/CI URLとhead/base/tested SHA、受信/照合ログ。stubだけでは未検証 |
 
 ### SF-19 公開結果UNKNOWNの復旧とRun成功
+
+先行実装の範囲は公開UNKNOWNの読み取り照合、期限・履歴の永続化、取消競合。最終成功判定の実CI結線は、SF-18の正規化済み必須CIと現在PR/headの再照合契約の確定に依存する。契約確定後に成功snapshot、Outbox、現在PRとの表示分離、および対応するE2Eを結線する。
 
 依存SF-18。試験追加先は `tests/acceptance/test_sf19.py`。UNKNOWN照合はbranch、操作識別子、Repository、Run、Candidate/headを使う。単なるPRタイトル一致で復旧しない。
 
@@ -354,6 +358,8 @@ Gateは必須Jobが処理中なら待機を続ける。全必須Jobが終端ま�
 | SF-19-AC06 | CP/Publisherを外部待ち・UNKNOWN・成功直後に再起動し、同通知を再送 | 成功を重複計上せず、待機状態/照合期限/PR IDを復元。判断不能は理由と人間の必要操作を表示 | E2E：各停止点のbefore/after、成功件数とoperation/notification key |
 
 ### SF-20 実Agent Adapterと利用量計測
+
+ユーザーの実Codex接続の指示によりSF-18/19より先に進める。CLI既存ChatGPT認証の構造化応答と実測usageの接続を確認した。PLAN/IMPLEMENT/REPAIRのHTTP Workerと独立REVIEW backend、固定engine manifest、許可差分だけのpatch化、usageの冪等送信を実装中。信頼されたhost CLIはソースをデータとして受け取り、コード実行はLinuxのAssembler/Verifierが担当する。実engine自体のLinux隔離・SF-21の全停止保証・実CI同期・実Agentによる3タスク完走までを受け入れ済みにしない。全ACの期待値は変更しない。
 
 依存SF-06/15。試験追加先は `tests/acceptance/test_sf20.py`。最初の実Agentは単一CLIプロセス方式とし、engine/version、起動argv、モデル設定、イベントschema、料金計算版、許可接続先、image digestを設定manifestに固定する。manifest未記入なら受け入れ不可。
 
@@ -702,16 +708,42 @@ SF-15追加86ケースで、境界値、20回の予約/承認競合、予約・�
 
 SF-16追加90ケースは、両承認経路の共通認可・対象変異・再送、20回の経路間approve/deny競合、期限境界、全actionの監査・rollback、固定null Candidateの転用拒否、実Verifier証拠不足の拒否、信頼済み証拠の再評価、費用解消後の同入力retry、CI期限保持を含む。M3（SF-13〜16）の全ACを受け入れた。残りはSF-17〜24の8タスク。
 
-### SF-17の実装中の範囲
+### SF-17の実装と検証経過
 
 0011で専用Publisher主体・Repository grant、固定identityの公開操作、追記専用の外部観測、Runあたり1つのDraft PRを追加した。CPは公開開始の認可をTXで確定し、Git/外部APIは別Publisherプロセスで実行する。汎用WorkerはPUBLISH_DRAFTをClaimできない。取消・権限/Policy/Candidate変更後も開始済みの外部結果を記録し、Run成功へ変換しない。
 
 PublisherはCandidateのarchive/digest/tree/raw commit/親chain/保護差分を再照合する。Git objectだけを再構成して既知remote headへの明示的なlease条件でpushし、想定外commitを上書きしない。GitHub書込は対象RepositoryのDraft PR作成だけを許す。モデル・checkout・build・merge/deployは呼ばない。個別・共有journalを送信前後に永続化し、同じ認証の異なる作業dirでの起動・応答消失・再起動も二重公開を防ぐ。
 
-先行44ケース（API/DB 7、実bare GitとGitHub契約12、journal/応答消失/20回同時起動25）が通過した。さらに全ACの条件別54ケースと外部証拠照合を追加した。空DB upgrade/downgrade後のモデル差分0も確認した。`7d91dbec019d8b869d7c0ce7fca9ccd8cc75dbe6` のローカル全1,113件が通過し、実GitHubでDraft PR作成・同PR更新・人間commitの保護を確認した。PR head反映遅延を実検証で発見し、既知の旧headだけ読み取り再試行し、解消しなければUNKNOWNとする修正を加えた。SF-17全体は実CIと外部証拠の最終照合まで未判定である。
+先行44ケース（API/DB 7、実bare GitとGitHub契約12、journal/応答消失/20回同時起動25）が通過した。さらに全ACの条件別54ケースと外部証拠照合を追加した。空DB upgrade/downgrade後のモデル差分0も確認した。`7d91dbec019d8b869d7c0ce7fca9ccd8cc75dbe6` のローカル全1,113件が通過し、実GitHubでDraft PR作成・同PR更新・人間commitの保護を確認した。PR head反映遅延を実検証で発見し、既知の旧headだけ読み取り再試行し、解消しなければUNKNOWNとする修正を加えた。この時点では最終照合前のため未判定とし、後述の対象revisionで受け入れを確定した。
 
 SF-17-AC01〜03は契約試験だけでPASSにせず、対象commitの実GitHub照合証明を必須とした。詳細なDB/Artifact/API履歴はローカルに保持する。CIへ渡す対象は、既に公開されているPR/branch/commitの固定whitelist項目と公開実装のSHA/digestだけとし、private Repository・追加フィールドを拒否する。実装PRの対象SHA付き参照からCIが公開情報を取得・再照合し、証明をArtifactへ保存する。参照がなければ未検証のまま残す。DB/Artifact一式の公開Git blobへの転送は、公開範囲が未確認という自動承認審査の拒否を受け、実行せずpublic情報だけに縮小した。
 
 SF-24の固定評価用baseとgolden testを `examples/evaluation/` に追加し、ホスト上で対象10件の想定失敗・12件成功（非対象API含む）を確認した。実Runnerでのbase照合と実Agent評価は未実行である。SF-17の実GitHub試験はfixture Agent/Reviewerと契約CI入力を使うtransport評価であり、SF-24の実Agent評価batchには数えない。
 
 GitHubの既定ブランチが `codex/sf01-07-acceptance` であることを確認したため、後続実装は新しい `codex/sf17-publisher` に分離した。既定ブランチの更新・mergeは行わず、実公開試験は専用の `codex/factory/<run_id>` を使用する。
+
+### SF-17の受入確定
+
+対象commit `edfc4abdb626d61dcd0c5440c5a7d43a07de76a4` の[実CI run 41419500089](https://github.com/iwata-n/software-factory/actions/runs/41419500089)が成功した。固定worktreeのローカル1,115件PASS（831.89秒）、CI1,115件PASS（812.26秒）、両環境skip/xfail 0。0011の移行・モデル一致と既存全回帰を含む。
+
+入力digest `ad820b0d4effc93b4fef1d556fcbeefe42eb105757f49ae301ea5f0bdb31ef79`、[factory-acceptance Artifact](https://github.com/iwata-n/software-factory/actions/runs/41419500089/artifacts/13130106725)のZIP SHA-256 `c36078181ca5c943e25771785789897a92e98b9d3d4d1dc22a519195a4c51111` が実GitHub APIと一致した。全106 ACと共通6条件を対象SHA・JUnit・fixtureへ照合し、`verified_records=112, external_pending=[]`。保存先は `.local/acceptance/edfc4abdb626d61dcd0c5440c5a7d43a07de76a4+inputs-ad820b0d4effc93b/`。同保存先の `local-regression/` に固定worktreeのローカル試験証拠を保存した。
+
+[実Draft PR #4](https://github.com/iwata-n/software-factory/pull/4)で初回公開、同じPRの修正更新、人間commitとの競合停止を確認し、対象SHA/digest付きの公開GitHub情報を実CI内でも一次APIから再照合した。詳細DB・Artifactのローカル証明は `.local/evaluation/publication-edfc4ab/verified-local/` に保持する。専用Publisherの境界・取消競合・再送と実公開の全条件を受け入れた。この試験のAgent/ReviewerおよびCI判定入力はfixtureであり、SF-18の製品内CI同期とSF-20/24の実Agent評価は引き続き未検証。残りはSF-18〜24の7タスク。
+
+### SF-20の実Codex接続と動作確認
+
+`codex_engine.py` / `codex_adapter.py` を追加し、HTTP Workerの `--adapter codex_cli` から実PLAN/IMPLEMENT/REPAIR、管理pipelineの `--reviewer codex_cli` から独立REVIEWを呼べるようにした。既存CLIのChatGPT認証を使い、APIキーは追加しない。engine manifestでCLI版・binary SHA-256・モデル・推論設定・timeout・入出力上限を固定する。Codexはソースをデータとして受け取り、hostでRepositoryのコードを実行しない。モデルのshell/apps/plugins/browser等を無効にし、CP/Worker/GitHub資格情報をCLIの環境へ渡さない。許可pathと採用Planを超える変更、保護差分、秘密を含む入力、未知イベント、不正/空の結果を拒否する。
+
+実測usageを最終受領APIへ冪等送信してから成果物を確定する。金額はAPI公開単価に基づく予算用推計と明記し、ChatGPT契約の請求額や残枠と混同しない。計測不能を0円に変換しない。既存レビューbackendの入力契約を保つため、CodexだけがJob contextを要求する明示的なbindingを使う。
+
+対象入力digest `912e007d0a2318594def756b6f5b60953424d74b2c4b081ee026b6e0fd901a27`（基準commit `edfc4abdb626d61dcd0c5440c5a7d43a07de76a4` に未commitの変更を含む）で、`scripts/evaluate_codex.py` が実Codex CLI `0.166.0-alpha.5.1` / `gpt-6.1-sol` を実行した。Run `7b5cb487-3203-4573-9a75-2f285dd0ef7d`、Candidate `a048cf59-49a8-450c-8d50-f79cfa5aac55`。固定baseの独立golden testは4件中1件が想定どおり失敗し、実CodexのPlan・patch・別呼出レビューを経て、Linux Verifierの同4件とAC-1/AC-2のレビューがPASS、Local Gate PASS / `PUBLISH_DRAFT` に到達した。人のコード修正0、対象外関数のAST変更0、実測usage受領3件、消費推計72,728 microUSD・予約0・cost_state KNOWN。GitHubへの書込・通知は0。
+
+同じ入力digestの全回帰1,157件PASS（839.25秒）、failure/error/skip 0。Ruff checkとformat（116ファイル）も成功。保存先は `.local/evaluation/codex-live-02/`（実モデルpatch・base/生成後JUnit・API/Artifact/usage証拠）と `.local/verification/codex-integration/final-regression/`（全回帰）。先行評価と互換修正前の記録は別ディレクトリに保持する。
+
+これは「実Codexで変更を生成し、独立検証へ渡せる」という接続部分の動作確認である。CLIクライアント自体のLinux隔離、通信切断を含むSF-20全条件の実接続証拠、SF-21の独立watchdog/全停止保証、製品内の実CI同期、3タスクの総合評価は未受入のままとし、SF-20全体およびMVPの受入完了とはしない。
+
+### SF-18〜24の並行実装の統合
+
+7タスクの着手分を統合ブランチに集約した。DB移行はWebhook Inbox 0012、公開復旧 0013、Jira／Slack 0014の順。着手分の試験は `test_sf*_boundaries.py` と各機能の回帰試験としてCIで実行する。全条件を備えた受け入れ試験モジュールと実サービス証拠は各タスクの確定時に追加する。
+
+統合対象はCI照合、公開UNKNOWN復旧、実Codex利用量、Linux watchdog、Jira／Slack、運用カンバン、保持と復元の着手分。実CIでの受入、Run成功の確定と通知への結線、実Codexの隔離、運用画面の操作権限、復元演習と総合受け入れは各タスクの残作業として追跡する。

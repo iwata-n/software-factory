@@ -1,9 +1,11 @@
 import asyncio
+import logging
 import os
 import time
 from contextlib import asynccontextmanager
 from typing import Annotated
 
+import httpx
 from fastapi import Depends, FastAPI, Header, Request, Response
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
@@ -12,6 +14,8 @@ from sqlalchemy import select
 from sqlalchemy.exc import SQLAlchemyError
 from starlette.concurrency import run_in_threadpool
 
+from .ci_poll import CIPoller, configured_read_tokens
+from .ci_webhook import configured_webhooks, webhook_router
 from .contracts import (
     ApprovalSubmission,
     ArtifactFinalize,
@@ -26,6 +30,7 @@ from .contracts import (
     Intervention,
     ProjectCreate,
     PublicationBegin,
+    PublicationReconcile,
     PublicationReport,
     ReplanRequest,
     RepositoryCreate,
@@ -35,6 +40,7 @@ from .contracts import (
     WorkerEventBatch,
 )
 from .db import Database
+from .jira_input import configured_jira, jira_router
 from .models import (
     ApprovalRequest,
     Artifact,
@@ -45,15 +51,19 @@ from .models import (
     Gate,
     Job,
     JobDependency,
+    OutboxEvent,
     PlanVersion,
     Run,
     RunEvent,
+    SlackDelivery,
     SpecVersion,
     Task,
     Worker,
 )
+from .operations import operations_router
 from .resolver import SourceResolver
 from .service import DomainError, Service, owned, run_view
+from .slack_delivery import NOTIFICATION
 
 security = HTTPBearer(auto_error=False)
 
@@ -80,11 +90,12 @@ def create_app(
         database or Database(), resolver=resolver, checkpoint=checkpoint, storage=storage
     )
 
+    integrations = configured_webhooks()
+    ci_poller = CIPoller(service, integrations, configured_read_tokens())
+
     @asynccontextmanager
     async def lifespan(app: FastAPI):
         async def reconciliation_loop():
-            import logging
-
             while True:
                 try:
                     await run_in_threadpool(service.reconcile)
@@ -92,15 +103,27 @@ def create_app(
                     logging.getLogger(__name__).error("lease reconciliation failed")
                 await asyncio.sleep(reconcile_interval)
 
-        task = asyncio.create_task(reconciliation_loop())
+        def poll_ci():
+            with httpx.Client(timeout=10, trust_env=False) as client:
+                ci_poller.poll(client)
+
+        async def ci_loop():
+            while True:
+                try:
+                    await run_in_threadpool(poll_ci)
+                except Exception:
+                    logging.getLogger(__name__).error("GitHub CI reconciliation failed")
+                await asyncio.sleep(min(reconcile_interval, 5))
+
+        tasks = [asyncio.create_task(reconciliation_loop())]
+        if ci_poller.bindings:
+            tasks.append(asyncio.create_task(ci_loop()))
         try:
             yield
         finally:
-            task.cancel()
-            try:
-                await task
-            except asyncio.CancelledError:
-                pass
+            for task in tasks:
+                task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
 
     app = FastAPI(
         title="Software Factory Control Plane",
@@ -113,6 +136,10 @@ def create_app(
         ),
     )
     app.state.service = service
+    app.include_router(webhook_router(service, integrations))
+    if jira := configured_jira():
+        app.include_router(jira_router(service, *jira))
+    app.include_router(operations_router(service, Token))
 
     @app.exception_handler(DomainError)
     async def domain_error(request: Request, error: DomainError):
@@ -223,6 +250,36 @@ def create_app(
     @app.get("/v1/runs/{run_id}", tags=["Runs"])
     def run_get(run_id: str, token: Token):
         return service.read(token, lambda s, a: run_view(owned(s, Run, run_id, a.workspace_id)))
+
+    @app.get("/v1/runs/{run_id}/notifications", tags=["Integrations"])
+    def run_notifications(run_id: str, token: Token):
+        def query(session, actor):
+            run = owned(session, Run, run_id, actor.workspace_id)
+            rows = session.execute(
+                select(OutboxEvent, SlackDelivery)
+                .outerjoin(SlackDelivery, SlackDelivery.outbox_id == OutboxEvent.id)
+                .where(
+                    OutboxEvent.workspace_id == run.workspace_id,
+                    OutboxEvent.run_id == run.id,
+                    OutboxEvent.kind == NOTIFICATION,
+                )
+                .order_by(OutboxEvent.created_at, OutboxEvent.id)
+            )
+            return {
+                "notifications": [
+                    {
+                        "delivery_key": outbox.id,
+                        "run_status": outbox.body["status"],
+                        "state": delivery.state if delivery else "PENDING",
+                        "attempts": delivery.attempts if delivery else 0,
+                        "message_id": delivery.message_id if delivery else None,
+                        "reason": delivery.reason if delivery else None,
+                    }
+                    for outbox, delivery in rows
+                ]
+            }
+
+        return service.read(token, query)
 
     @app.get("/v1/runs/{run_id}/plan", tags=["Runs"])
     def plan_get(run_id: str, token: Token):
@@ -344,6 +401,23 @@ def create_app(
             lambda s, a: service.publications.begin(s, a, job_id, data),
         )
 
+    @app.get("/v1/publisher/reconciliations", tags=["Publisher"])
+    def publication_reconciliations(token: Token):
+        return service.read(token, service.publications.reconciliation_queue, role="PUBLISHER")
+
+    @app.post("/v1/publisher/operations/{operation_id}/reconcile", tags=["Publisher"])
+    def publication_reconcile(
+        operation_id: str, data: PublicationReconcile, token: Token, key: Key = None
+    ):
+        return service.write(
+            token,
+            "PUBLISHER",
+            f"publication:{operation_id}:reconcile",
+            key,
+            data.model_dump(),
+            lambda s, a: service.publications.claim_reconciliation(s, a, operation_id, data),
+        )
+
     @app.get("/v1/publisher/operations/{operation_id}/inputs", tags=["Publisher"])
     def publication_inputs(operation_id: str, token: Token):
         return service.read(
@@ -359,7 +433,7 @@ def create_app(
             "PUBLISHER",
             f"publication:{operation_id}:report",
             key,
-            data.model_dump(),
+            data.payload(),
             lambda s, a: service.publications.report(s, a, operation_id, data),
         )
 

@@ -1,0 +1,13 @@
+{
+  "schema_version": 1,
+  "engine": "codex-cli",
+  "authentication": "existing_chatgpt_cli",
+  "version": "0.166.0-alpha.5.1",
+  "binary_sha256": "58a91f6ea19bea477ae3a2ec48d619f0039afe75d3476260747e11d201fa7cea",
+  "model": "gpt-6.1-sol",
+  "reasoning_effort": "low",
+  "execution_mode": "structured_text_no_repo_checkout",
+  "timeout_seconds": 120,
+  "max_input_bytes": 262144,
+  "max_output_bytes": 2097152
+}

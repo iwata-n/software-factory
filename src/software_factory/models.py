@@ -667,7 +667,9 @@ class PublicationOperation(Tenant, Base):
         ),
         CheckConstraint("kind = 'PUBLISH_DRAFT'"),
         CheckConstraint(
-            "state IN ('PENDING','IN_FLIGHT','UNKNOWN','SUCCEEDED','BLOCKED','CANCELLED')"
+            "state IN ('PENDING','IN_FLIGHT','UNKNOWN','RECONCILING','SUCCEEDED','BLOCKED',"
+            "'CANCELLED')",
+            name="ck_publication_operations_state",
         ),
     )
     repository_id: Mapped[str] = mapped_column(String(36))
@@ -746,3 +748,47 @@ class DraftPullRequest(Tenant, Base):
     state: Mapped[str] = mapped_column(String(20))
     metadata_body: Mapped[dict] = mapped_column(JSON)
     observed_at: Mapped[float] = mapped_column(Float)
+
+
+class CIWebhookDelivery(Tenant, Base):
+    __tablename__ = "ci_webhook_deliveries"
+    __table_args__ = (
+        UniqueConstraint("workspace_id", "repository_id", "integration_id", "delivery_id"),
+        ForeignKeyConstraint(
+            ["workspace_id", "repository_id"], ["repositories.workspace_id", "repositories.id"]
+        ),
+    )
+    repository_id: Mapped[str] = mapped_column(String(36))
+    integration_id: Mapped[str] = mapped_column(String(36))
+    delivery_id: Mapped[str] = mapped_column(String(36))
+    event: Mapped[str] = mapped_column(String(20))
+    fingerprint: Mapped[str] = mapped_column(String(64))
+    received_at: Mapped[float] = mapped_column(Float)
+
+
+class JiraIssueRevision(Tenant, Base):
+    __tablename__ = "jira_issue_revisions"
+    __table_args__ = (
+        UniqueConstraint("workspace_id", "integration_id", "issue_id", "source_version"),
+        ForeignKeyConstraint(["workspace_id", "task_id"], ["tasks.workspace_id", "tasks.id"]),
+    )
+    integration_id: Mapped[str] = mapped_column(String(36))
+    issue_id: Mapped[str] = mapped_column(String(32))
+    source_version: Mapped[int] = mapped_column(BigInteger)
+    issue_url: Mapped[str] = mapped_column(String(500))
+    fingerprint: Mapped[str | None] = mapped_column(String(64))
+    task_id: Mapped[str | None] = mapped_column(String(36))
+    spec_version: Mapped[int | None] = mapped_column(Integer)
+    state: Mapped[str] = mapped_column(String(20))
+
+
+class SlackDelivery(Base):
+    __tablename__ = "slack_deliveries"
+    outbox_id: Mapped[str] = mapped_column(ForeignKey("outbox_events.id"), primary_key=True)
+    channel: Mapped[str] = mapped_column(String(32))
+    state: Mapped[str] = mapped_column(String(20))
+    attempts: Mapped[int] = mapped_column(Integer)
+    due_at: Mapped[float] = mapped_column(Float)
+    claim_id: Mapped[str] = mapped_column(String(36))
+    message_id: Mapped[str | None] = mapped_column(String(32))
+    reason: Mapped[str | None] = mapped_column(String(40))

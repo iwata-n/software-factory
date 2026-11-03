@@ -4,6 +4,7 @@ import argparse
 import hashlib
 import json
 import os
+import shutil
 import time
 from concurrent.futures import Future
 from threading import Thread
@@ -31,8 +32,42 @@ class Supervisor:
         self.client = client
         self.adapter = adapter
         self.heartbeat_interval = heartbeat_interval
+        self._pending_usage = {}
+
+    def _queue_usage(self, attempt_id, result):
+        if result is None:
+            return
+        for index, delivery in enumerate(result.usage_deliveries):
+            self._pending_usage[(attempt_id, index)] = delivery
+
+    def _flush_usage(self, deadline=None):
+        for (attempt_id, index), delivery in list(self._pending_usage.items()):
+            for retry in range(3):
+                remaining = 10 if deadline is None else deadline - time.monotonic()
+                if remaining <= 0:
+                    raise TimeoutError("confirmed lease deadline reached before usage submission")
+                try:
+                    reply = self.client.post(
+                        f"/v1/worker/attempts/{attempt_id}/usage",
+                        json=delivery,
+                        headers={"Idempotency-Key": f"usage:{attempt_id}:{index}"},
+                        timeout=min(10, remaining),
+                    )
+                    reply.raise_for_status()
+                except (httpx.TransportError, httpx.HTTPStatusError) as error:
+                    transient = not isinstance(error, httpx.HTTPStatusError) or (
+                        error.response.status_code == 429 or error.response.status_code >= 500
+                    )
+                    if not transient or retry == 2:
+                        raise
+                    time.sleep(0.2 * (retry + 1))
+                else:
+                    del self._pending_usage[(attempt_id, index)]
+                    break
 
     def run_once(self, *, wait_seconds: int = 0) -> dict | None:
+        # Late financial receipts have their own authority and do not renew execution rights.
+        self._flush_usage()
         response = self.client.post(
             "/v1/worker/claims",
             json={"protocol_version": 1, "wait_seconds": wait_seconds},
@@ -68,7 +103,7 @@ class Supervisor:
             payload = reply.json()
             allowance = payload["lease_expires_in_seconds"]
             # A proportionate margin also works with short test/job deadlines.
-            confirmed_until = sent_at + max(0, allowance - min(5, allowance / 4))
+            confirmed_until = sent_at + max(0, allowance - min(10, allowance / 4))
             return confirmed_until, payload["cancel_requested"]
 
         def background_heartbeat() -> Future:
@@ -85,6 +120,7 @@ class Supervisor:
             return future
 
         started = False
+        usage_queued = False
         try:
             deadline, cancelled = heartbeat()
             preparation = None
@@ -123,7 +159,6 @@ class Supervisor:
             ):
                 now = time.monotonic()
                 if now >= deadline:
-                    self.adapter.cancel()
                     raise TimeoutError("confirmed lease deadline reached; Agent cancelled")
                 if pending_heartbeat is not None and pending_heartbeat.done():
                     deadline, cancelled = pending_heartbeat.result()
@@ -169,9 +204,12 @@ class Supervisor:
                 time.sleep(min(0.1, max(0, deadline - time.monotonic())))
             result = preparation_error or self.adapter.result()
             if time.monotonic() >= deadline:
-                self.adapter.cancel()
                 raise TimeoutError("confirmed lease deadline reached before submission")
             buffered_events.extend(self.adapter.events())
+            # Metering precedes output upload so a later failure cannot erase usage.
+            self._queue_usage(job["attempt_id"], result)
+            usage_queued = True
+            self._flush_usage(deadline)
             artifact_ids = []
             references = {}
             for artifact in result.artifacts:
@@ -278,12 +316,16 @@ class Supervisor:
         except BaseException:
             # Real adapters must make cancel() a bounded process-group stop (future sandbox task).
             if started:
+                # Capture a completed result before cancel() can replace it.
+                result = self.adapter.result()
                 self.adapter.cancel()
+                if not usage_queued:
+                    self._queue_usage(job["attempt_id"], result or self.adapter.result())
             raise
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Software Factory Fake Agent worker")
+    parser = argparse.ArgumentParser(description="Software Factory HTTP worker")
     parser.add_argument(
         "--api-url", default=os.environ.get("FACTORY_API_URL", "http://127.0.0.1:8000")
     )
@@ -294,12 +336,31 @@ def main():
     parser.add_argument(
         "--scenario", choices=["success", "infra-fail", "inconclusive"], default="success"
     )
-    parser.add_argument("--adapter", choices=["fake", "pipeline"], default="fake")
+    parser.add_argument("--adapter", choices=["fake", "pipeline", "codex_cli"], default="fake")
+    parser.add_argument("--reviewer", choices=["none", "codex_cli"], default="none")
+    parser.add_argument(
+        "--codex-manifest",
+        default=os.environ.get("FACTORY_CODEX_MANIFEST", "config/codex_cli.json"),
+    )
+    parser.add_argument(
+        "--codex-binary",
+        default=os.environ.get("FACTORY_CODEX_BINARY")
+        or shutil.which("codex")
+        or (
+            "/Applications/ChatGPT.app/Contents/Resources/"
+            "codex-cli/CodexCLI.app/Contents/MacOS/codex"
+        ),
+    )
     args = parser.parse_args()
     validate_api_url(args.api_url)
     token = os.environ.get("FACTORY_WORKER_TOKEN")
     if not token:
         parser.error("FACTORY_WORKER_TOKEN is required")
+    engine = None
+    if args.adapter == "codex_cli" or args.reviewer == "codex_cli":
+        from .codex_engine import CodexCLI
+
+        engine = CodexCLI.from_file(args.codex_binary, args.codex_manifest)
     with httpx.Client(
         base_url=args.api_url, headers={"Authorization": f"Bearer {token}"}
     ) as client:
@@ -310,7 +371,16 @@ def main():
             image = os.environ.get("FACTORY_RUNNER_IMAGE_DIGEST")
             if not image:
                 parser.error("FACTORY_RUNNER_IMAGE_DIGEST is required for managed stages")
-            adapter = PipelineAdapter(DockerRunner(image))
+            reviewer = None
+            if args.reviewer == "codex_cli":
+                from .codex_adapter import CodexReviewer
+
+                reviewer = CodexReviewer(engine)
+            adapter = PipelineAdapter(DockerRunner(image), reviewer=reviewer)
+        elif args.adapter == "codex_cli":
+            from .codex_adapter import CodexAdapter
+
+            adapter = CodexAdapter(engine)
         else:
             adapter = FakeAgent(args.scenario)
         supervisor = Supervisor(client, adapter)

@@ -55,6 +55,7 @@ from .resolver import (
     valid_sha,
 )
 from .security import redact
+from .slack_delivery import enqueue_result
 
 LEASE_SECONDS = 90
 T = TypeVar("T")
@@ -186,6 +187,7 @@ def transition(
     depends_on=None,
 ) -> None:
     previous_phase = run.phase
+    previous_status = run.status
     decision = decide(
         RunSnapshot(run.status, run.phase, run.stop_reason), DomainEvent(kind, reason)
     )
@@ -211,6 +213,8 @@ def transition(
             step_key=step_key,
         )
     event(session, run, kind, {"reason": decision.reason, "phase": run.phase})
+    if run.status != previous_status and run.status in {"FAILED", "BLOCKED"}:
+        enqueue_result(session, run)
 
 
 class Service:

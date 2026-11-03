@@ -401,6 +401,11 @@ class PublicationBegin(Contract):
     target_hash: Annotated[str, Field(pattern=r"^[0-9a-f]{64}$")]
 
 
+class PublicationReconcile(Contract):
+    attempt: int = Field(ge=1, le=3, strict=True)
+    target_hash: Annotated[str, Field(pattern=r"^[0-9a-f]{64}$")]
+
+
 class PublishedDraft(Contract):
     repository: Annotated[str, Field(pattern=r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")]
     number: int = Field(gt=0, strict=True)
@@ -425,6 +430,7 @@ class PublicationReport(Contract):
     delivery_id: Name
     target_hash: Annotated[str, Field(pattern=r"^[0-9a-f]{64}$")]
     status: Literal["SUCCEEDED", "UNKNOWN", "CONFLICT"]
+    reconcile_attempt: int | None = Field(default=None, ge=1, le=3, strict=True)
     pull_request: PublishedDraft | None = None
     observed_head_sha: Sha | None = None
     provider_requests: list[ProviderRequest] = Field(default_factory=list, max_length=1000)
@@ -441,6 +447,12 @@ class PublicationReport(Contract):
         ]
         | None
     ) = None
+
+    def payload(self):
+        # Preserve hashes of initial reports stored before reconciliation was added.
+        return self.model_dump(
+            exclude={"reconcile_attempt"} if self.reconcile_attempt is None else None
+        )
 
     @model_validator(mode="after")
     def outcome(self):

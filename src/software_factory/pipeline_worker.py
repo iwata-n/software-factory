@@ -7,7 +7,7 @@ from threading import Event, Lock, Thread
 
 import httpx
 
-from .adapters import AgentResult, Capabilities, ProducedArtifact
+from .adapters import AgentExecutionError, AgentResult, Capabilities, ProducedArtifact
 from .sandbox import DockerRunner, RunnerError
 
 
@@ -127,6 +127,15 @@ class PipelineAdapter:
                 result_value = AgentResult("EXECUTED", report, artifacts=(output,))
             else:
                 raise RunnerError("MANAGED_STAGE_UNSUPPORTED", "POLICY")
+        except AgentExecutionError as error:
+            result_value = AgentResult(
+                "FAILED",
+                {},
+                category=error.category,
+                reason=error.reason,
+                usage_microusd=None,
+                usage_deliveries=error.usage_deliveries,
+            )
         except RunnerError as error:
             result_value = AgentResult("FAILED", {}, category=error.category, reason=error.code)
         except httpx.HTTPStatusError as error:
@@ -146,7 +155,12 @@ class PipelineAdapter:
             )
         finally:
             if cancelled.is_set():
-                result_value = AgentResult("CANCELLED", {})
+                result_value = AgentResult(
+                    "CANCELLED",
+                    {},
+                    usage_microusd=result_value.usage_microusd,
+                    usage_deliveries=result_value.usage_deliveries,
+                )
             with self._lock:
                 if generation == self._generation:
                     self._events.extend(events)
@@ -210,6 +224,7 @@ class PipelineAdapter:
             "findings": [],
         }
         outputs = []
+        usage_deliveries = ()
         if job["kind"] == "VERIFY":
             for index, observation in enumerate(observations):
                 item = {
@@ -241,8 +256,11 @@ class PipelineAdapter:
                 report["checks"].append(item)
         else:
             # The backend receives immutable bytes and a data context, never the HTTP client/token.
+            reviewer = self.reviewer
+            if reviewer and hasattr(reviewer, "for_job"):
+                reviewer = reviewer.for_job(job)
             reviewed = (
-                self.reviewer.review(
+                reviewer.review(
                     {
                         "target": target,
                         "task_spec": job["snapshot"]["task_spec"],
@@ -252,13 +270,14 @@ class PipelineAdapter:
                     },
                     cancelled,
                 )
-                if self.reviewer
+                if reviewer
                 else {}
             )
             if not isinstance(reviewed, dict) or set(reviewed) - {"criteria", "findings"}:
                 raise RunnerError("REVIEW_SCHEMA_INVALID", "POLICY")
             report["criteria"] = reviewed.get("criteria", [])
             report["findings"] = reviewed.get("findings", [])
+            usage_deliveries = getattr(reviewed, "usage_deliveries", ())
             outputs.append(
                 ProducedArtifact(
                     "review-log",
@@ -267,11 +286,18 @@ class PipelineAdapter:
                         {
                             "backend_configured": self.reviewer is not None,
                             "criteria_reported": len(report["criteria"]),
+                            "engine": getattr(reviewed, "audit", {}),
                         }
                     ).encode(),
                 )
             )
-        return AgentResult("EXECUTED", report, artifacts=tuple(outputs)), events
+        return AgentResult(
+            "EXECUTED",
+            report,
+            artifacts=tuple(outputs),
+            usage_microusd=None if usage_deliveries else 0,
+            usage_deliveries=usage_deliveries,
+        ), events
 
     def events(self):
         with self._lock:
@@ -287,8 +313,16 @@ class PipelineAdapter:
             cancelled, generation, thread = self._cancel, self._generation, self._thread
         cancelled.set()
         self.runner.cancel()
+        if self.reviewer and hasattr(self.reviewer, "cancel"):
+            self.reviewer.cancel()
         if thread:
             thread.join(timeout=2)
         with self._lock:
             if generation == self._generation:
-                self._result = AgentResult("CANCELLED", {})
+                result = self._result
+                self._result = AgentResult(
+                    "CANCELLED",
+                    {},
+                    usage_microusd=result.usage_microusd if result else None,
+                    usage_deliveries=result.usage_deliveries if result else (),
+                )

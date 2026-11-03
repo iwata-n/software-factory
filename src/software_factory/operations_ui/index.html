@@ -1,0 +1,39 @@
+<!doctype html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Run カンバン | Software Factory</title>
+  <link rel="stylesheet" href="/operations/board.css">
+  <script type="module" src="/operations/board.js"></script>
+</head>
+<body>
+  <header class="masthead"><span>Software Factory</span><span>運用</span></header>
+  <main>
+    <h1>Run カンバン</h1>
+    <form id="connect">
+      <label for="token">Workspace の User トークン</label>
+      <div class="controls">
+        <input type="password" id="token" required autocomplete="off" spellcheck="false">
+        <button type="submit">接続</button>
+      </div>
+    </form>
+    <div id="toolbar" class="controls" hidden>
+      <button id="refresh">更新</button>
+      <button id="disconnect">切断</button>
+    </div>
+    <p id="status" role="status">User トークンで接続すると Run を表示します。</p>
+    <div id="board" class="board" aria-label="Run の状態別一覧" hidden></div>
+    <button id="older" hidden>過去の Run を追加表示</button>
+  </main>
+  <dialog id="detail" aria-labelledby="detail-title">
+    <header class="detail-header">
+      <h2 id="detail-title">Run 詳細</h2>
+      <form method="dialog"><button>閉じる</button></form>
+    </header>
+    <button id="reload-detail">詳細を更新</button>
+    <p id="detail-status" role="status"></p>
+    <div id="detail-content"></div>
+  </dialog>
+</body>
+</html>
