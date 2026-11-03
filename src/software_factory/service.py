@@ -385,6 +385,7 @@ class Service:
         fn: Callable[[Session, Principal], dict],
         *,
         user_access: str = "OPERATOR",
+        replay_check: Callable[[dict], None] | None = None,
     ) -> dict:
         with self.db.transaction() as session:
             actor = self.principal(session, token, role)
@@ -414,6 +415,8 @@ class Service:
                 )
             )
             if previous:
+                if replay_check:
+                    replay_check(previous.response)
                 if previous.request_hash != request_hash:
                     raise DomainError(409, "IDEMPOTENCY_CONFLICT")
                 return previous.response
@@ -528,6 +531,7 @@ class Service:
             )
         )
         task.latest_spec_version = version
+        task.retention_touched_at = db_now(session)
         return {"task_id": task.id, "spec_version": version, "spec_hash": digest(body)}
 
     def new_spec(
@@ -703,6 +707,7 @@ class Service:
                         if name in source_details
                     }
                 )
+        task.retention_touched_at = db_now(session)
         run = Run(
             workspace_id=actor.workspace_id,
             task_id=task.id,

@@ -143,6 +143,7 @@ class Task(Tenant, Base):
     repository_id: Mapped[str] = mapped_column(String(36))
     title: Mapped[str] = mapped_column(String(200))
     latest_spec_version: Mapped[int] = mapped_column(Integer, default=1)
+    retention_touched_at: Mapped[float | None] = mapped_column(Float, nullable=True)
 
 
 class SpecVersion(Tenant, Base):
@@ -340,6 +341,8 @@ class IdempotencyRecord(Tenant, Base):
     key: Mapped[str] = mapped_column(String(200))
     request_hash: Mapped[str] = mapped_column(String(64))
     response: Mapped[dict] = mapped_column(JSON)
+    parent_deleted_at: Mapped[float | None] = mapped_column(Float, nullable=True)
+    retired_lease_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
 
 
 class WorkerEvent(Tenant, Base):

@@ -15,21 +15,28 @@ from tempfile import TemporaryDirectory
 from uuid import uuid4
 
 from psycopg.conninfo import make_conninfo
-from sqlalchemy import delete, func, inspect, select, update
+from sqlalchemy import delete, func, inspect, select, text, update
 
 from software_factory.db import Database, db_now
 from software_factory.domain import TERMINAL
 from software_factory.models import (
+    ApprovalRequest,
     Artifact,
     Attempt,
     AuditEvent,
+    Base,
     Enrollment,
+    IdempotencyRecord,
+    JiraIssueRevision,
     Job,
     OutboxEvent,
     Principal,
     PublicationOperation,
     Run,
     RunEvent,
+    SlackDelivery,
+    SpecVersion,
+    Task,
     WorkerEvent,
     Workspace,
 )
@@ -237,6 +244,176 @@ def restore(database, root, bundle, certificate, key):
     }
 
 
+def purge_run(session, run, now):
+    """Remove one terminal Run in foreign-key order and retire its command receipts."""
+    workspace_id, run_id = run.workspace_id, run.id
+    tables = Base.metadata.tables
+
+    def scoped(model):
+        return (model.workspace_id == workspace_id, model.run_id == run_id)
+
+    outbox_ids = list(
+        session.scalars(select(OutboxEvent.id).where(*scoped(OutboxEvent)).with_for_update())
+    )
+    if session.scalar(
+        select(SlackDelivery.outbox_id)
+        .where(
+            SlackDelivery.outbox_id.in_(outbox_ids),
+            SlackDelivery.state.in_(["SENDING", "RETRY", "UNKNOWN"]),
+        )
+        .limit(1)
+    ):
+        return False
+
+    job_ids = list(session.scalars(select(Job.id).where(*scoped(Job))))
+    attempts = session.execute(
+        select(Attempt.id, Attempt.lease_id).where(
+            Attempt.workspace_id == workspace_id, Attempt.job_id.in_(job_ids)
+        )
+    ).all()
+    operations = [
+        f"cancel:{run_id}",
+        f"resolve-blocked:{run_id}",
+        f"runs:{run_id}:budget-request",
+        f"runs:{run_id}:replan",
+    ]
+    for attempt_id, lease_id in attempts:
+        operations.append(f"attempts:{attempt_id}:usage")
+        operations.extend(
+            f"{prefix}:{lease_id}" for prefix in ("complete", "fail", "artifact.reserve")
+        )
+    leases = {attempt.id: attempt.lease_id for attempt in attempts}
+    for artifact_id, attempt_id in session.execute(
+        select(Artifact.id, Artifact.attempt_id).where(*scoped(Artifact))
+    ):
+        operations.append(f"artifact.finalize:{artifact_id}")
+        session.execute(
+            update(IdempotencyRecord)
+            .where(
+                IdempotencyRecord.workspace_id == workspace_id,
+                IdempotencyRecord.operation == f"artifact.upload:{artifact_id}",
+            )
+            .values(parent_deleted_at=now, retired_lease_id=leases[attempt_id])
+        )
+    operations.extend(f"publication:{job_id}:begin" for job_id in job_ids)
+    for operation_id in session.scalars(
+        select(PublicationOperation.id).where(*scoped(PublicationOperation))
+    ):
+        operations.extend(
+            f"publication:{operation_id}:{action}" for action in ("report", "reconcile")
+        )
+    operations.extend(
+        f"approval:{approval_id}:decision"
+        for approval_id in session.scalars(
+            select(ApprovalRequest.id).where(*scoped(ApprovalRequest))
+        )
+    )
+    session.execute(
+        update(IdempotencyRecord)
+        .where(
+            IdempotencyRecord.workspace_id == workspace_id,
+            IdempotencyRecord.operation.in_(operations),
+        )
+        .values(parent_deleted_at=now)
+    )
+    session.execute(
+        delete(SlackDelivery).where(
+            SlackDelivery.outbox_id.in_(select(OutboxEvent.id).where(*scoped(OutboxEvent)))
+        )
+    )
+    session.execute(
+        delete(WorkerEvent).where(
+            WorkerEvent.workspace_id == workspace_id,
+            WorkerEvent.attempt_id.in_([attempt.id for attempt in attempts]),
+        )
+    )
+    # Drop the Run -> current Candidate edge before deleting the Candidate chain.
+    run.current_candidate_id = None
+    session.flush()
+    for name in (
+        "publication_observations",
+        "publication_operations",
+        "draft_pull_requests",
+        "gates",
+        "findings",
+        "checks",
+        "candidates",
+        "artifacts",
+        "usage_receipts",
+        "cost_entries",
+        "approval_decisions",
+        "budget_versions",
+        "approval_requests",
+        "plan_versions",
+        "job_dependencies",
+        "outbox_events",
+        "run_events",
+        "verified_run_results",
+    ):
+        table = tables[name]
+        session.execute(
+            delete(table).where(table.c.workspace_id == workspace_id, table.c.run_id == run_id)
+        )
+    session.execute(
+        delete(Attempt).where(Attempt.workspace_id == workspace_id, Attempt.job_id.in_(job_ids))
+    )
+    session.execute(delete(Job).where(*scoped(Job)))
+    session.delete(run)
+    session.add(
+        AuditEvent(
+            workspace_id=workspace_id,
+            actor_id="local-admin",
+            operation="run.retention.purge",
+            body={"run_id": run_id, "reason": "RUN_RETENTION_EXPIRED"},
+            created_at=now,
+        )
+    )
+
+    return True
+
+
+def purge_tasks(session, now):
+    has_runs = (
+        select(Run.id).where(Run.workspace_id == Task.workspace_id, Run.task_id == Task.id).exists()
+    )
+    tasks = list(
+        session.scalars(select(Task).where(Task.retention_touched_at <= now - 90 * DAY, ~has_runs))
+    )
+    for task in tasks:
+        session.execute(
+            update(IdempotencyRecord)
+            .where(
+                IdempotencyRecord.workspace_id == task.workspace_id,
+                IdempotencyRecord.operation.in_([f"specs:{task.id}", f"runs:{task.id}"]),
+            )
+            .values(parent_deleted_at=now)
+        )
+        session.execute(
+            update(JiraIssueRevision)
+            .where(
+                JiraIssueRevision.workspace_id == task.workspace_id,
+                JiraIssueRevision.task_id == task.id,
+            )
+            .values(state="RETIRED", task_id=None, spec_version=None, fingerprint=None)
+        )
+        session.execute(
+            delete(SpecVersion).where(
+                SpecVersion.workspace_id == task.workspace_id, SpecVersion.task_id == task.id
+            )
+        )
+        session.delete(task)
+        session.add(
+            AuditEvent(
+                workspace_id=task.workspace_id,
+                actor_id="local-admin",
+                operation="task.retention.purge",
+                body={"task_id": task.id, "reason": "TASK_RETENTION_EXPIRED"},
+                created_at=now,
+            )
+        )
+    return len(tasks)
+
+
 def collect(database, root):
     if not root.is_dir():
         raise ValueError("Artifact source directory must exist")
@@ -348,7 +525,50 @@ def collect(database, root):
             select(Artifact.workspace_id, Artifact.id).where(Artifact.status == "DELETED")
         ):
             storage.delete(workspace, artifact)
-    return {"marked_deleted": marked, "events_removed": removed_events}
+    with database.transaction() as session:
+        list(session.scalars(select(Workspace.id).order_by(Workspace.id).with_for_update()))
+        now = db_now(session)
+        session.execute(text("SET LOCAL factory.retention = 'on'"))
+        uncollected = (
+            select(Artifact.id)
+            .where(
+                Artifact.workspace_id == Run.workspace_id,
+                Artifact.run_id == Run.id,
+                Artifact.status != "DELETED",
+            )
+            .exists()
+        )
+        pending_approval = (
+            select(ApprovalRequest.id)
+            .where(
+                ApprovalRequest.workspace_id == Run.workspace_id,
+                ApprovalRequest.run_id == Run.id,
+                ApprovalRequest.status == "PENDING",
+            )
+            .exists()
+        )
+        runs = list(
+            session.scalars(
+                select(Run).where(
+                    *eligible,
+                    Run.finished_at <= now - 90 * DAY,
+                    ~uncollected,
+                    ~pending_approval,
+                )
+            )
+        )
+        purged = sum(purge_run(session, run, now) for run in runs)
+        purged_tasks = purge_tasks(session, now)
+        session.execute(delete(AuditEvent).where(AuditEvent.created_at <= now - 90 * DAY))
+        session.execute(
+            delete(IdempotencyRecord).where(IdempotencyRecord.parent_deleted_at <= now - 90 * DAY)
+        )
+    return {
+        "marked_deleted": marked,
+        "events_removed": removed_events,
+        "runs_purged": purged,
+        "tasks_purged": purged_tasks,
+    }
 
 
 def main():

@@ -52,6 +52,7 @@ from .models import (
     Check,
     Finding,
     Gate,
+    IdempotencyRecord,
     Job,
     JobDependency,
     OutboxEvent,
@@ -887,6 +888,21 @@ def create_app(
         def authorize():
             with service.db.transaction() as s:
                 actor = service.principal(s, token, "WORKER")
+                receipt = (
+                    s.scalar(
+                        select(IdempotencyRecord.id).where(
+                            IdempotencyRecord.workspace_id == actor.workspace_id,
+                            IdempotencyRecord.principal_id == actor.id,
+                            IdempotencyRecord.operation == f"artifact.upload:{artifact_id}",
+                            IdempotencyRecord.key == key,
+                            IdempotencyRecord.retired_lease_id == lease_id,
+                        )
+                    )
+                    if key
+                    else None
+                )
+                if receipt is not None:
+                    return
                 item = owned(s, Artifact, artifact_id, actor.workspace_id)
                 attempt = s.scalar(
                     select(Attempt).where(

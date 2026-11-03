@@ -52,9 +52,14 @@ class InterventionCommands:
             if action is not None and request.action != action:
                 raise DomainError(409, "APPROVAL_ACTION_MISMATCH")
 
-        self.service.read(token, authorize)
+        def check_replay(result):
+            if run_id is not None and result["run"]["run_id"] != run_id:
+                raise DomainError(404, "NOT_FOUND")
+            if action is not None and result["approval"]["action"] != action:
+                raise DomainError(409, "APPROVAL_ACTION_MISMATCH")
 
         def command(session, actor):
+            authorize(session, actor)
             result = self.service.plans.decide(session, actor, approval_id, data)
             self.service.checkpoint("intervention.decided")
             return result
@@ -66,6 +71,7 @@ class InterventionCommands:
             key,
             data.model_dump(),
             command,
+            replay_check=check_replay,
         )
 
     def execute(self, token, key, run_id, data):

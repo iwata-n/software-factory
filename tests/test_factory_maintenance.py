@@ -23,6 +23,7 @@ from software_factory.models import (
 from software_factory.service import event
 from software_factory.storage import LocalArtifactStorage
 from tests.acceptance.test_sf09 import artifacts as artifacts
+from tests.conftest import example_spec
 
 pytestmark = pytest.mark.postgres
 
@@ -41,18 +42,33 @@ def test_artifact_collection_at_boundaries(world, artifacts):
     )
     try:
         # A live run protects finalized evidence even when its events are old.
-        assert collect(database, root) == {"marked_deleted": 1, "events_removed": 0}
+        assert collect(database, root) == {
+            "marked_deleted": 1,
+            "events_removed": 0,
+            "runs_purged": 0,
+            "tasks_purged": 0,
+        }
         assert world.get(f"/v1/artifacts/{evidence}/content").content == b"hello"
         with database.transaction() as session:
             session.execute(update(Job).values(state="SUCCEEDED"))
             session.execute(update(Attempt).values(state="SUCCEEDED"))
             session.execute(update(Run).values(status="SUCCEEDED", finished_at=now - 30 * DAY))
         database.sessions.configure(info={"clock": lambda: now - 0.001})
-        assert collect(database, root) == {"marked_deleted": 0, "events_removed": 0}
+        assert collect(database, root) == {
+            "marked_deleted": 0,
+            "events_removed": 0,
+            "runs_purged": 0,
+            "tasks_purged": 0,
+        }
         database.sessions.configure(info={"clock": lambda: now})
         collected = collect(database, root)
         assert collected["marked_deleted"] == 1 and collected["events_removed"] > 0
-        assert collect(database, root) == {"marked_deleted": 0, "events_removed": 0}
+        assert collect(database, root) == {
+            "marked_deleted": 0,
+            "events_removed": 0,
+            "runs_purged": 0,
+            "tasks_purged": 0,
+        }
         assert world.run()["evidence_expired_at"] == now
         assert world.run()["finished_at"] == now - 30 * DAY
         cursor = f"{world.run_id}:{last_revision}"
@@ -145,7 +161,12 @@ def test_retention_prunes_only_old_history_prefix_and_keeps_terminal_anchor(worl
             ).status_code
             == 200
         )
-        assert collect(database, root) == {"marked_deleted": 0, "events_removed": 0}
+        assert collect(database, root) == {
+            "marked_deleted": 0,
+            "events_removed": 0,
+            "runs_purged": 0,
+            "tasks_purged": 0,
+        }
     finally:
         database.engine.dispose()
 
@@ -245,3 +266,73 @@ def test_encrypted_backup_restore(world, artifacts, tmp_path):
         with admin.engine.connect().execution_options(isolation_level="AUTOCOMMIT") as connection:
             connection.execute(text(f"DROP DATABASE {name}"))
         admin.engine.dispose()
+
+
+def test_run_purge_preserves_command_receipt_for_ninety_more_days(world, artifacts):
+    root = world.client.app.state.service.artifacts.storage.root
+    artifact = artifacts.reserve().json()["id"]
+    uploaded = artifacts.upload(artifact, key="retention-upload")
+    assert uploaded.status_code == 200
+    assert artifacts.finalize(artifact).status_code == 200
+    task_path = f"/v1/tasks/{world.task_id}"
+    spec = example_spec(world.repository_id)
+    updated = world.post(task_path + "/spec-versions", spec, key="retention-spec")
+    assert updated.status_code == 201
+    run_path = f"/v1/runs/{world.run_id}"
+    payload = {"expected_run_revision": world.run()["state_revision"], "reason": "retention"}
+    cancelled = world.post(run_path + "/cancel", payload, key="retention-cancel")
+    assert cancelled.status_code == 202
+    lease = artifacts.lease
+    assert (
+        world.post(
+            f"/v1/worker/leases/{lease['id']}/complete",
+            {"fence": lease["fence"], "outcome": "CANCELLED"},
+            token=world.worker_token,
+        ).status_code
+        == 200
+    )
+    finished = world.run()["finished_at"]
+    purge_at = finished + 90 * DAY
+    database = Database(
+        world.database.engine.url.render_as_string(hide_password=False),
+        clock=lambda: purge_at - 1,
+    )
+    try:
+        assert collect(database, root)["runs_purged"] == 0
+        assert world.get(run_path).status_code == 200
+        database.sessions.configure(info={"clock": lambda: purge_at})
+        collected = collect(database, root)
+        assert collected["runs_purged"] == collected["tasks_purged"] == 1
+        assert world.get(run_path).status_code == world.get(task_path).status_code == 404
+        assert (
+            world.post(task_path + "/spec-versions", spec, key="retention-spec").json()
+            == updated.json()
+        )
+        assert artifacts.upload(artifact, key="retention-upload").json() == uploaded.json()
+        assert (
+            artifacts.upload(artifact, body=b"changed", key="retention-upload").status_code == 409
+        )
+        assert world.get(f"/v1/artifacts/{artifact}/content").status_code == 404
+        assert not (root / world.workspace_id / artifact).exists()
+        assert (
+            world.post(run_path + "/cancel", payload, key="retention-cancel").json()
+            == cancelled.json()
+        )
+        assert (
+            world.post(
+                run_path + "/cancel", payload, key="retention-cancel", token=world.other_user_token
+            ).status_code
+            == 404
+        )
+        database.sessions.configure(info={"clock": lambda: purge_at + 90 * DAY - 1})
+        assert collect(database, root)["runs_purged"] == 0
+        assert world.post(run_path + "/cancel", payload, key="retention-cancel").status_code == 202
+        database.sessions.configure(info={"clock": lambda: purge_at + 90 * DAY})
+        assert collect(database, root)["runs_purged"] == 0
+        assert world.post(run_path + "/cancel", payload, key="retention-cancel").status_code == 404
+        assert (
+            world.post(task_path + "/spec-versions", spec, key="retention-spec").status_code == 404
+        )
+        assert artifacts.upload(artifact, key="retention-upload").status_code == 404
+    finally:
+        database.engine.dispose()

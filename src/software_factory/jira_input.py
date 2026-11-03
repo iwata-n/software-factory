@@ -99,6 +99,8 @@ def receive(service: Service, mapping: JiraMapping, delivery: JiraInput, secret:
             f"{mapping.site}/browse/{mapping.project_key}-"
         ):
             raise DomainError(403, "JIRA_MAPPING_DENIED")
+        if session.scalar(issue.where(JiraIssueRevision.state == "RETIRED").limit(1)):
+            raise DomainError(404, "JIRA_TASK_RETIRED")
         imported = session.scalar(
             issue.where(JiraIssueRevision.state == "IMPORTED")
             .order_by(JiraIssueRevision.source_version.desc())
