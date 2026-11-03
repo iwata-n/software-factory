@@ -123,6 +123,7 @@ def execute(engine, job):
     return adapter.result()
 
 
+@pytest.mark.ac("SF-20-AC02")
 def test_plan_uses_only_scoped_source_and_measured_estimated_usage(job):
     engine = Engine()
     result = execute(engine, job)
@@ -136,6 +137,7 @@ def test_plan_uses_only_scoped_source_and_measured_estimated_usage(job):
     assert result.usage_microusd is None
 
 
+@pytest.mark.ac("SF-20-AC02")
 def test_implementation_produces_real_patch_without_executing_generated_code(job):
     job["kind"] = "IMPLEMENT"
     result = execute(Engine(), job)
@@ -144,6 +146,7 @@ def test_implementation_produces_real_patch_without_executing_generated_code(job
 
 
 @pytest.mark.parametrize("attack", ["policy", "manifest", "pricing", "source_digest", "sensitive"])
+@pytest.mark.ac("SF-20-AC05")
 def test_denied_or_invalid_context_never_calls_codex(job, attack):
     if attack == "policy":
         job["snapshot"]["policy"]["allow_external_model"] = False
@@ -172,6 +175,7 @@ def test_denied_or_invalid_context_never_calls_codex(job, attack):
         "src/auth/key.py",
     ],
 )
+@pytest.mark.ac("SF-20-AC02")
 def test_model_cannot_expand_policy_or_plan_or_modify_protected_files(job, path):
     job["kind"] = "IMPLEMENT"
     changes = dict(CHANGES, changes=[{"path": path, "content": "bad\n"}])
@@ -197,6 +201,7 @@ def test_missing_usage_is_unknown_and_schema_failure_preserves_measured_usage(jo
     assert measured.usage_deliveries[0]["total_microusd"] == 50
 
 
+@pytest.mark.ac("SF-20-AC02")
 def test_repair_reads_granted_parent_candidate_instead_of_root_source(job):
     code, archive, _ = entry.pack([("src/example.py", "100644", b"value = 0\n")])
     job["kind"] = "REPAIR"
@@ -253,6 +258,7 @@ def test_patch_handles_creation_deletion_and_missing_final_newline(job):
 
 
 @pytest.mark.parametrize("invalid", [False, True])
+@pytest.mark.ac("SF-20-AC02")
 def test_codex_review_binds_evidence_to_current_candidate_and_real_locations(job, invalid):
     job["kind"] = "REVIEW"
     location = {
@@ -291,11 +297,13 @@ def test_codex_review_binds_evidence_to_current_candidate_and_real_locations(job
         assert result.usage_deliveries[0]["total_microusd"] == 47
 
 
+@pytest.mark.ac("SF-20-AC05")
 def test_archive_digest_is_verified_before_source_can_become_model_input(job):
     with pytest.raises(CodexError, match="MODEL_SOURCE_DIGEST_MISMATCH"):
         archive_files(base64.b64decode(job["source"]["archive"]), "0" * 64)
 
 
+@pytest.mark.ac("SF-20-AC01")
 def test_capabilities_and_events_bind_one_execution_id_to_the_attempt(job):
     engine = Engine()
     adapter = CodexAdapter(engine)
@@ -317,6 +325,7 @@ def test_capabilities_and_events_bind_one_execution_id_to_the_attempt(job):
 
 
 @pytest.mark.parametrize("claimed", [["unknown"], ["same", "same"]])
+@pytest.mark.ac("SF-20-AC02")
 def test_repair_rejects_ungrounded_or_duplicate_claims(job, claimed):
     job["kind"] = "REPAIR"
     failure = ["check", "unit", "FAIL_ONE", "high", "src/example.py", "value"]
@@ -340,6 +349,7 @@ def test_repair_rejects_ungrounded_or_duplicate_claims(job, claimed):
     assert not adapter.result().artifacts
 
 
+@pytest.mark.ac("SF-20-AC03")
 def test_cancellation_before_codex_start_yields_result():
     adapter = CodexAdapter(Engine())
     adapter.cancel()
@@ -347,6 +357,7 @@ def test_cancellation_before_codex_start_yields_result():
     assert adapter.engine.calls == []
 
 
+@pytest.mark.ac("SF-20-AC03")
 def test_codex_signal_failure_is_not_reported_as_cancelled():
     class UnstoppableEngine(Engine):
         def cancel(self):

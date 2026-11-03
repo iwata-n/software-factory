@@ -100,6 +100,7 @@ if mode=='metered-exit':
     return make
 
 
+@pytest.mark.ac("SF-20-AC01")
 def test_cli_runs_in_empty_directory_with_pinned_safe_flags(cli):
     engine = cli()
     result = engine.run({"task": "Return ok"}, Reply, Event())
@@ -112,6 +113,7 @@ def test_cli_runs_in_empty_directory_with_pinned_safe_flags(cli):
     assert engine._process is None
 
 
+@pytest.mark.ac("SF-20-AC05")
 def test_control_plane_github_and_api_credentials_are_not_in_cli_environment(cli, monkeypatch):
     for key in [
         "FACTORY_DATABASE_URL",
@@ -136,6 +138,7 @@ def test_control_plane_github_and_api_credentials_are_not_in_cli_environment(cli
         ("large", "CODEX_OUTPUT_TOO_LARGE"),
     ],
 )
+@pytest.mark.ac("SF-20-AC03")
 def test_process_failures_never_become_success_or_echo_stderr(cli, mode, code):
     engine = cli(mode)
     with pytest.raises(CodexError) as caught:
@@ -144,12 +147,14 @@ def test_process_failures_never_become_success_or_echo_stderr(cli, mode, code):
     assert "secret-canary" not in str(caught.value) and engine._process is None
 
 
+@pytest.mark.ac("SF-20-AC03")
 def test_exited_cli_does_not_leave_running_child(cli, tmp_path):
     assert cli("child").run({"task": "safe"}, Reply, Event()).value == {"value": "ok"}
     time.sleep(0.75)
     assert not (tmp_path / "child-survived").exists()
 
 
+@pytest.mark.ac("SF-20-AC03")
 def test_timeout_stops_term_ignoring_cli(cli):
     engine = cli("hang")
     started = time.monotonic()
@@ -158,6 +163,7 @@ def test_timeout_stops_term_ignoring_cli(cli):
     assert time.monotonic() - started < 8 and engine._process is None
 
 
+@pytest.mark.ac("SF-20-AC03")
 def test_cancel_stops_running_cli_and_next_call_is_not_cancelled(cli):
     engine, stopped = cli("hang"), Event()
     with ThreadPoolExecutor(1) as pool:
@@ -205,6 +211,7 @@ def test_binary_replacement_is_rejected_before_execution(cli):
         "non_json_message",
     ],
 )
+@pytest.mark.ac("SF-20-AC03")
 def test_event_stream_rejects_missing_or_forged_success(attack):
     items = events()
     if attack == "usage_missing":
@@ -231,6 +238,7 @@ def test_invalid_final_json_keeps_real_usage_for_failure_settlement():
     assert caught.value.usage.output_tokens == 3
 
 
+@pytest.mark.ac("SF-20-AC05")
 def test_sensitive_context_and_pre_cancel_never_start_provider(cli):
     engine = cli()
     with pytest.raises(CodexError, match="SENSITIVE_MODEL_INPUT"):
@@ -264,6 +272,7 @@ def test_json_schema_requires_nullable_and_defaulted_properties():
         "access_token = 'quoted-secret-canary'",
     ],
 )
+@pytest.mark.ac("SF-20-AC05")
 def test_quoted_source_credentials_are_rejected_before_serializing_context(cli, secret):
     engine = cli()
     with pytest.raises(CodexError, match="SENSITIVE_MODEL_INPUT"):
@@ -280,6 +289,7 @@ def test_nonzero_exit_preserves_validated_usage(cli):
     assert caught.value.thread_id == "test-thread"
 
 
+@pytest.mark.ac("SF-20-AC03")
 def test_cancel_during_manifest_check_does_not_launch_provider(cli, monkeypatch):
     engine = cli()
     cancelled = Event()
@@ -298,6 +308,7 @@ def test_cancel_during_manifest_check_does_not_launch_provider(cli, monkeypatch)
     assert engine._process is None
 
 
+@pytest.mark.ac("SF-20-AC03")
 def test_cli_signal_failure_is_classified_as_unconfirmed(cli, monkeypatch):
     from types import SimpleNamespace
 
