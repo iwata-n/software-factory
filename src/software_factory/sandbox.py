@@ -12,6 +12,8 @@ from pathlib import Path
 from threading import Event, Lock
 from uuid import uuid4
 
+STOP_UNCONFIRMED = "STOP_UNCONFIRMED"
+
 
 class RunnerError(Exception):
     def __init__(self, code: str, category: str = "INFRASTRUCTURE"):
@@ -44,6 +46,7 @@ class DockerRunner:
         self.source_ca_pem = source_ca_pem
         self._active: set[str] = set()
         self._lock = Lock()
+        self._quarantined = Event()
         self.state_root = Path(
             os.environ.get("FACTORY_RUNNER_STATE_ROOT", ".local/runner/owners")
         ).absolute()
@@ -74,14 +77,19 @@ class DockerRunner:
         for container in listing.stdout.decode().split():
             inspected = self.docker("inspect", container, timeout=5)
             if inspected.returncode:
+                self.require_orphan_absent(container)
                 continue
             labels = json.loads(inspected.stdout)[0]["Config"].get("Labels") or {}
             owner = labels.get("factory.owner", "")
-            if owner == self.owner or not re.fullmatch(r"[0-9a-f]{32}", owner):
+            if owner == self.owner:
+                continue
+            if not re.fullmatch(r"[0-9a-f]{32}", owner):
+                self.require_orphan_absent(container)
                 continue
             try:
                 fd = os.open(self.state_root / (owner + ".lock"), os.O_RDWR | os.O_NOFOLLOW)
             except OSError:
+                self.require_orphan_absent(container)
                 continue
             try:
                 try:
@@ -90,7 +98,7 @@ class DockerRunner:
                     continue
                 result = self.docker("rm", "--force", container, timeout=7)
                 if result.returncode:
-                    raise RunnerError("ORPHAN_STOP_UNCONFIRMED")
+                    self.require_orphan_absent(container)
                 removed.append(container)
             finally:
                 os.close(fd)
@@ -128,6 +136,14 @@ class DockerRunner:
             finally:
                 os.close(fd)
         return removed
+
+    def require_orphan_absent(self, container):
+        # A concurrent owner may have removed it since listing. Confirm absence
+        # from the daemon rather than inferring it from a failed inspect/remove.
+        listing = self.docker("ps", "-aq", "--filter", f"id={container}", timeout=5)
+        if listing.returncode or listing.stdout.strip():
+            self._quarantined.set()
+            raise RunnerError("ORPHAN_STOP_UNCONFIRMED")
 
     def execute_candidate(self, request, archive, *, timeout=120, cancelled=None):
         from .candidate_mount import readonly_tar
@@ -188,10 +204,17 @@ class DockerRunner:
                 candidate_volume=volume,
             )
         finally:
-            self.docker("rm", "--force", helper, timeout=7)
-            removed = self.docker("volume", "rm", volume, timeout=7)
-            if removed.returncode:
-                raise RunnerError("CANDIDATE_VOLUME_CLEANUP_FAILED")
+            try:
+                try:
+                    self.docker("rm", "--force", helper, timeout=7)
+                finally:
+                    removed = self.docker("volume", "rm", volume, timeout=7)
+                    if removed.returncode:
+                        raise RunnerError("CANDIDATE_VOLUME_CLEANUP_FAILED")
+            except (OSError, subprocess.SubprocessError, RunnerError):
+                if self._quarantined.is_set():
+                    raise RunnerError(STOP_UNCONFIRMED) from None
+                raise
 
     @staticmethod
     def docker(*args, **kwargs):
@@ -204,6 +227,8 @@ class DockerRunner:
         return subprocess.run(["docker", *args], env=env, capture_output=True, **kwargs)
 
     def verify_image(self):
+        if self._quarantined.is_set():
+            raise RunnerError(STOP_UNCONFIRMED)
         result = self.docker(
             "image", "inspect", self.image_digest, "--format", "{{.Id}}", timeout=10
         )
@@ -300,7 +325,12 @@ class DockerRunner:
             while True:
                 remaining = timeout - 10 - (time.monotonic() - started)
                 if remaining <= 0 or (cancelled and cancelled.is_set()):
-                    self.docker("stop", "--timeout", "5", name, timeout=7)
+                    try:
+                        stopped = self.docker("stop", "--timeout", "5", name, timeout=7)
+                        if stopped.returncode:
+                            raise RunnerError(STOP_UNCONFIRMED)
+                    except (OSError, subprocess.SubprocessError):
+                        raise RunnerError(STOP_UNCONFIRMED) from None
                     raise RunnerError(
                         "RUNNER_CANCELLED" if cancelled and cancelled.is_set() else "RUNNER_TIMEOUT"
                     )
@@ -348,13 +378,28 @@ class DockerRunner:
             return RunnerResult(
                 body, name, self.image_digest, time.monotonic() - started, isolation
             )
+        except RunnerError as error:
+            if error.code == STOP_UNCONFIRMED:
+                self._quarantined.set()
+            raise
         finally:
-            self.docker("rm", "--force", name, timeout=7)
-            if "process" in locals():
-                try:
-                    process.communicate(timeout=2)
-                except subprocess.TimeoutExpired:
-                    process.kill()
-                    process.communicate(timeout=2)
-            with self._lock:
-                self._active.discard(name)
+            try:
+                if "process" in locals():
+                    try:
+                        process.communicate(timeout=0.25)
+                    except subprocess.TimeoutExpired:
+                        process.kill()
+                        process.communicate(timeout=2)
+                    removed = self.docker("rm", "--force", name, timeout=7)
+                    if removed.returncode:
+                        remaining = self.docker(
+                            "ps", "-aq", "--filter", f"name=^/{name}$", timeout=2
+                        )
+                        if remaining.returncode or remaining.stdout.strip():
+                            raise RunnerError(STOP_UNCONFIRMED)
+            except (OSError, subprocess.SubprocessError, RunnerError):
+                self._quarantined.set()
+                raise RunnerError(STOP_UNCONFIRMED) from None
+            finally:
+                with self._lock:
+                    self._active.discard(name)

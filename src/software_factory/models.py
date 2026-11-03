@@ -35,6 +35,11 @@ class Workspace(Base):
     __tablename__ = "workspaces"
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
     name: Mapped[str] = mapped_column(String(200))
+    execution_stopped: Mapped[bool] = mapped_column(Boolean, default=False, server_default="false")
+    execution_stop_revision: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
+    restore_reconciliation_required: Mapped[bool] = mapped_column(
+        Boolean, default=False, server_default="false"
+    )
 
 
 class Principal(Tenant, Base):
@@ -42,10 +47,18 @@ class Principal(Tenant, Base):
     __table_args__ = (
         UniqueConstraint("workspace_id", "id"),
         CheckConstraint("role IN ('USER', 'WORKER', 'PUBLISHER')", name="ck_principals_role"),
+        UniqueConstraint("previous_token_hash", name="uq_principals_previous_token"),
+        CheckConstraint(
+            "user_access IN ('ADMIN', 'OPERATOR', 'VIEWER')", name="ck_principals_user_access"
+        ),
     )
     role: Mapped[str] = mapped_column(String(20))
+    user_access: Mapped[str] = mapped_column(String(20), default="ADMIN", server_default="ADMIN")
     token_hash: Mapped[str] = mapped_column(String(64), unique=True)
     active: Mapped[bool] = mapped_column(Boolean, default=True)
+    token_expires_at: Mapped[float | None] = mapped_column(Float, nullable=True)
+    previous_token_hash: Mapped[str | None] = mapped_column(String(64))
+    previous_token_expires_at: Mapped[float | None] = mapped_column(Float, nullable=True)
 
 
 class Enrollment(Tenant, Base):
@@ -133,6 +146,7 @@ class Task(Tenant, Base):
     repository_id: Mapped[str] = mapped_column(String(36))
     title: Mapped[str] = mapped_column(String(200))
     latest_spec_version: Mapped[int] = mapped_column(Integer, default=1)
+    retention_touched_at: Mapped[float | None] = mapped_column(Float, nullable=True)
 
 
 class SpecVersion(Tenant, Base):
@@ -184,6 +198,9 @@ class Run(Tenant, Base):
     reserved_microusd: Mapped[int] = mapped_column(BigInteger, default=0)
     spent_microusd: Mapped[int] = mapped_column(BigInteger, default=0)
     created_at: Mapped[float] = mapped_column(Float)
+    finished_at: Mapped[float | None] = mapped_column(Float, nullable=True)
+    evidence_expired_at: Mapped[float | None] = mapped_column(Float, nullable=True)
+    events_pruned_through: Mapped[int | None] = mapped_column(Integer, nullable=True)
     wait_context: Mapped[dict | None] = mapped_column(JSON, nullable=True)
     current_candidate_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
     cost_state: Mapped[str] = mapped_column(String(20), default="KNOWN", server_default="KNOWN")
@@ -278,6 +295,17 @@ class Attempt(Tenant, Base):
     input_digest: Mapped[str | None] = mapped_column(String(64), nullable=True)
 
 
+class VerifiedRunResult(Tenant, Base):
+    __tablename__ = "verified_run_results"
+    __table_args__ = (
+        UniqueConstraint("workspace_id", "run_id"),
+        ForeignKeyConstraint(["workspace_id", "run_id"], ["runs.workspace_id", "runs.id"]),
+    )
+    run_id: Mapped[str] = mapped_column(String(36))
+    body: Mapped[dict] = mapped_column(JSON)
+    created_at: Mapped[float] = mapped_column(Float)
+
+
 class RunEvent(Tenant, Base):
     __tablename__ = "run_events"
     __table_args__ = (
@@ -316,6 +344,8 @@ class IdempotencyRecord(Tenant, Base):
     key: Mapped[str] = mapped_column(String(200))
     request_hash: Mapped[str] = mapped_column(String(64))
     response: Mapped[dict] = mapped_column(JSON)
+    parent_deleted_at: Mapped[float | None] = mapped_column(Float, nullable=True)
+    retired_lease_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
 
 
 class WorkerEvent(Tenant, Base):
@@ -667,7 +697,9 @@ class PublicationOperation(Tenant, Base):
         ),
         CheckConstraint("kind = 'PUBLISH_DRAFT'"),
         CheckConstraint(
-            "state IN ('PENDING','IN_FLIGHT','UNKNOWN','SUCCEEDED','BLOCKED','CANCELLED')"
+            "state IN ('PENDING','IN_FLIGHT','UNKNOWN','RECONCILING','SUCCEEDED','BLOCKED',"
+            "'CANCELLED')",
+            name="ck_publication_operations_state",
         ),
     )
     repository_id: Mapped[str] = mapped_column(String(36))
@@ -746,3 +778,68 @@ class DraftPullRequest(Tenant, Base):
     state: Mapped[str] = mapped_column(String(20))
     metadata_body: Mapped[dict] = mapped_column(JSON)
     observed_at: Mapped[float] = mapped_column(Float)
+
+
+class CIWebhookDelivery(Tenant, Base):
+    __tablename__ = "ci_webhook_deliveries"
+    __table_args__ = (
+        UniqueConstraint("workspace_id", "id", name="uq_ci_webhook_workspace_id"),
+        UniqueConstraint("workspace_id", "repository_id", "integration_id", "delivery_id"),
+        ForeignKeyConstraint(
+            ["workspace_id", "repository_id"], ["repositories.workspace_id", "repositories.id"]
+        ),
+    )
+    repository_id: Mapped[str] = mapped_column(String(36))
+    integration_id: Mapped[str] = mapped_column(String(36))
+    delivery_id: Mapped[str] = mapped_column(String(36))
+    event: Mapped[str] = mapped_column(String(20))
+    fingerprint: Mapped[str] = mapped_column(String(64))
+    received_at: Mapped[float] = mapped_column(Float)
+
+
+class HistoricalCIObservation(Tenant, Base):
+    __tablename__ = "historical_ci_observations"
+    __table_args__ = (
+        UniqueConstraint("workspace_id", "candidate_id", "inbox_id"),
+        ForeignKeyConstraint(
+            ["workspace_id", "inbox_id"],
+            ["ci_webhook_deliveries.workspace_id", "ci_webhook_deliveries.id"],
+        ),
+        ForeignKeyConstraint(
+            ["workspace_id", "run_id", "candidate_id"],
+            ["candidates.workspace_id", "candidates.run_id", "candidates.id"],
+        ),
+    )
+    run_id: Mapped[str] = mapped_column(String(36))
+    candidate_id: Mapped[str] = mapped_column(String(36))
+    inbox_id: Mapped[str] = mapped_column(String(36))
+    body: Mapped[dict] = mapped_column(JSON)
+    received_at: Mapped[float] = mapped_column(Float)
+
+
+class JiraIssueRevision(Tenant, Base):
+    __tablename__ = "jira_issue_revisions"
+    __table_args__ = (
+        UniqueConstraint("workspace_id", "integration_id", "issue_id", "source_version"),
+        ForeignKeyConstraint(["workspace_id", "task_id"], ["tasks.workspace_id", "tasks.id"]),
+    )
+    integration_id: Mapped[str] = mapped_column(String(36))
+    issue_id: Mapped[str] = mapped_column(String(32))
+    source_version: Mapped[int] = mapped_column(BigInteger)
+    issue_url: Mapped[str] = mapped_column(String(500))
+    fingerprint: Mapped[str | None] = mapped_column(String(64))
+    task_id: Mapped[str | None] = mapped_column(String(36))
+    spec_version: Mapped[int | None] = mapped_column(Integer)
+    state: Mapped[str] = mapped_column(String(20))
+
+
+class SlackDelivery(Base):
+    __tablename__ = "slack_deliveries"
+    outbox_id: Mapped[str] = mapped_column(ForeignKey("outbox_events.id"), primary_key=True)
+    channel: Mapped[str] = mapped_column(String(32))
+    state: Mapped[str] = mapped_column(String(20))
+    attempts: Mapped[int] = mapped_column(Integer)
+    due_at: Mapped[float] = mapped_column(Float)
+    claim_id: Mapped[str] = mapped_column(String(36))
+    message_id: Mapped[str | None] = mapped_column(String(32))
+    reason: Mapped[str | None] = mapped_column(String(40))

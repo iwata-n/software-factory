@@ -1,0 +1,43 @@
+name: Software Factory evaluation
+
+on:
+  pull_request:
+    branches:
+      - 'codex/factory-evaluation/**'
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    name: factory-eval-${{ matrix.task }}
+    if: github.event.pull_request.head.repo.id == github.event.pull_request.base.repo.id && startsWith(github.head_ref, 'codex/factory/')
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - task: empty
+            check: check_empty.py
+          - task: count
+            check: check_count.py
+          - task: spaces
+            check: check_spaces.py
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          persist-credentials: false
+      - name: Verify candidate head
+        env:
+          EXPECTED_HEAD: ${{ github.event.pull_request.head.sha }}
+        run: test "$(git rev-parse HEAD)" = "$EXPECTED_HEAD"
+      - uses: astral-sh/setup-uv@v6
+      - name: Run fixed evaluation tests
+        env:
+          CHECK_FILE: ${{ matrix.check }}
+        run: |
+          uv run --locked --python 3.11 pytest -q -p no:cacheprovider \
+            "examples/evaluation/checks/$CHECK_FILE" \
+            examples/evaluation/checks/check_compat.py

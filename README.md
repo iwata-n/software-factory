@@ -2,7 +2,7 @@
 
 [設計書 v0.4](docs/Software_Factory_Design_v0.4.md) に基づくソフトウェアファクトリーの初期実装です。[実装計画](docs/Implementation_Plan.md) にタスク、依存関係、完了条件、受け入れ試験の対応を記載しています。
 
-FastAPIのControl Plane、PostgreSQL、Leaseで接続する別プロセスWorker、Source Runner、Artifact、不変Candidateと管理対象Assemblerを実装しています。既定のFake Agentは `PLAN → 計画検証 → IMPLEMENT` を模擬実行し、変更patchを作らないため `BLOCKED / CHANGE_ARTIFACT_MISSING` で停止します。独立Verifierと構造化レビュー証拠を実装しています。決定論的品質Gateまで実装しています。実Agent、PR作成、MVP全体の成功判定は後続です。
+FastAPIのControl Plane、PostgreSQL、Leaseで接続する別プロセスWorker、Source Runner、Artifact、不変Candidateと管理対象Assemblerを実装しています。既定のFake Agentは `PLAN → 計画検証 → IMPLEMENT` を模擬実行し、変更patchを作らないため `BLOCKED / CHANGE_ARTIFACT_MISSING` で停止します。Codex CLIによるPlan・変更patch・修正・独立レビュー、Verifier、決定論的品質Gate、専用PublisherによるDraft PR公開を実装しています。実CI同期とMVP全体の成功判定は後続です。
 
 有効な変更patchを受理したRunは、管理対象Assemblerでbase/tree/digestを照合し、不変CandidateとVERIFY/REVIEWの入力Jobを作成します。Verifierは固定Profileで実行し、ReviewerはAC別証拠を提出します。Local GateのPASSは公開Jobを作成します。Run成功は実公開・CI同期・最終照合を実装してから判定します。タスク全体の受入判定は実装計画に従います。
 
@@ -38,6 +38,11 @@ uv run factory-worker
 
 Workerの接続先は `FACTORY_API_URL` または `--api-url` で指定できます。HTTPを許可するのはループバックだけです。`--once` は1 Job、`--drain` は取得可能なJobがなくなるまで実行します。`--scenario infra-fail` と `--scenario inconclusive` で制御分岐を再現できます。
 
+Workerトークンは発行から24時間で失効します。期限前に現在のBearerトークンと新しい `Idempotency-Key` を使って `POST /v1/worker/credentials/rotate` を呼び、応答の `worker_token` に差し替えます。Worker IDと実行枠は引き継がれ、旧トークンも更新後60秒間使えます。応答が失われた場合は、その猶予内に旧トークンと同じキーで再送できます。ローカル管理者が `python -m software_factory.cli revoke --principal-id <worker_id> --reason '<理由>'` を実行すると、両方のトークンが即時失効します。
+
+自動更新するWorkerは、登録時のJSON応答を所有者だけが読めるディレクトリ（0700）のファイル（0600）へ保存し、`python -m software_factory.worker --credential-file <path>` で起動します。資格情報ファイルと `FACTORY_WORKER_TOKEN` はどちらか一方を指定します。資格情報ファイルを使用するWorkerは、残り1時間以内で次のJobを受け取る前に更新します。更新途中で再起動した場合はファイルから復旧し、同じWorker IDを引き継ぎます。
+
+
 ## デモTaskの作成
 
 User資格情報を設定し、別ターミナルでデモを登録します。APIだけを使い、実Repositoryへの接続やコード変更は行いません。
@@ -48,6 +53,36 @@ uv run python scripts/create_demo.py --workspace-id '<bootstrapのworkspace_id>'
 ```
 
 実行中Workerがあれば、Runは `BLOCKED / ASSEMBLE_CANDIDATE / CHANGE_ARTIFACT_MISSING` に到達します。出力されるRun URLはAPIリソースです。User認証付きのGETでスナップショット、停止理由、費用を確認できます。`/graph` は試行とLease状態、`/event-history?after_revision=N` は保存した履歴を返します。SSE配信は後続です。
+
+## 実Codex CLIの利用
+
+`--adapter codex_cli` は既存のCodex CLIのChatGPTログインを使い、PLAN／IMPLEMENT／REPAIRを実行します。管理対象pipeline Workerの `--reviewer codex_cli` は同じ候補を別のCodex呼出でレビューします。Codex選択時にFakeへ切り替える処理はありません。
+
+[engine manifest](config/codex_cli.json)でCLIの版・バイナリSHA-256・モデル・推論設定・入出力上限・timeoutを固定します。現在は `gpt-6.1-sol`、CLI `0.166.0-alpha.5.1`。CLI更新後は管理者がmanifestを更新し、既存Runは再利用せず、新しいmanifest hashを持つProject／Runを作成します。任意のCLI引数をTaskやRepositoryから追加できません。
+
+Project Policyは `agent_adapter=codex_cli`、`allow_external_model=true`、`agent_configuration.engine_manifest_hash` にmanifestの正規化hash、`pricing_manifest` に[予算用推計設定](config/codex_pricing.json)を指定します。Model Workerは管理者が `--managed --usage-authority --adapter codex_cli --kinds PLAN IMPLEMENT REPAIR` で登録し、管理対象pipeline Workerは同じadapterの `ASSEMBLE_CANDIDATE VERIFY REVIEW` を担当します。
+
+Codexは空の一時作業領域で、shell・apps・plugins・browser・画像・sub-agent・hooksを無効にして非対話実行します。Repositoryは許可されたUTF-8ソースのデータとしてだけ渡し、hostへcheckout・実行しません。CP／Worker／GitHub／APIキーの環境変数をCodexプロセスへ渡しません。認証はこの信頼されたCLIクライアントだけが利用します。モデルが返した変更は許可path・保護path・採用Planと照合してpatch化し、適用・実行・PASSの判断は管理対象の隔離Assembler／Verifier／Gateが担当します。OSによる全Sandbox保証の受け入れはSF-21に残ります。
+
+実測トークン数をusage受領APIで精算してから成果物を確定します。記録するUSDはAPI公開単価を参照した **予算用の推計** で、ChatGPT契約の請求額や残利用枠ではありません。usage欠落を架空のゼロ円に変換せず、UNKNOWNで停止します。
+
+実Codexを含む再現用評価は、一時DB・実HTTP Worker・公開Repositoryの固定ソース・Linux Runnerを使います。空状態のgolden testがbaseで失敗することを確認し、Codex生成だけの変更を独立検証してLocal Gateまで進めます。PR／Slack送信はこの評価の対象に含みません。
+
+```sh
+sh scripts/try_codex.sh
+```
+
+実行ごとに新しい保存先を作り、終了時に評価結果と生成コードのパスを表示します。`evaluation.json`、実モデルのpatch、base／生成後JUnit、Candidate・Gate・費用台帳をローカルに保持します。PostgreSQL 17 の配置が異なる場合は `FACTORY_POSTGRES_BIN` を指定します。CLIが別の場所にある場合は `--codex-binary`、別の管理manifestは `--codex-manifest` で指定します。
+
+同じWi-Fiに接続したスマホから試す場合は、MacのLANアドレスを指定して起動します。
+
+```sh
+uv run --locked python scripts/serve_codex_demo.py --host "$(ipconfig getifaddr en0)"
+```
+
+ターミナルに表示された試用リンクをスマホで開き、「デモを実行」を押します。実行状況と生成コードが画面に表示されます。このHTTPサーバーは信頼できるLANでの試用向けです。ターミナルで Ctrl+C を押すと終了します。
+
+CLI契約は[公式の非対話実行](https://learn.chatgpt.com/docs/non-interactive-mode)、推計の参照単価は[モデルの公式情報](https://developers.openai.com/api/docs/models/gpt-6.1-sol)に基づきます。
 
 ## 検証
 
@@ -120,7 +155,7 @@ uv run factory reconcile
 
 失効したTokenは新規要求を拒否します。実行中Workerの物理停止は断定せず、Lease失効または停止報告を記録します。失効Attemptの未確定消費は予約額を消費済みとして記録します。費用は整数のmicro USDによる模擬集計で、Providerの実課金を抑える保証ではありません。
 
-基盤内ではWorkspace行を短時間ロックし、同一Workspaceの変更操作を直列化します。Long Pollingの待機はDBトランザクションの外で行います。Outboxは保存のみで、JiraやSlackへの配送はSF-22の対象です。
+基盤内ではWorkspace行を短時間ロックし、同一Workspaceの変更操作を直列化します。Long Pollingの待機はDBトランザクションの外で行います。Run結果はOutboxに保存し、Slack配送は別プロセスで処理します。
 
 Repositoryの取消は既存Runのsnapshotより優先し、新規Claim・公開認可を停止します。ResolverはRun Compilerの外側に置き、解決待ちにDBトランザクションを維持しません。remote_url未指定の既存Repositoryは管理者登録済みSHAを使います。remote_urlがある場合はHTTP Source Runnerを必須とし、未設定時に登録済みSHAへ黙って退避しません。Planのsymlink検査には信頼されたWorkerの読取専用調査結果を使い、Agentの自己申告から許可範囲を増やしません。
 
@@ -241,3 +276,81 @@ factory-publisher --publisher-token-file .local/publisher.token \
 `--github-token-file` で同様の0600ファイルを使う方法もあります。Publisherは固定Candidateのarchive/tree/raw commit/保護差分を再照合し、コードのcheckout・build・LLM実行を行いません。書込先は `codex/factory/<run_id>` とDraft PR作成だけです。既知のremote headに固定したpush条件が一致しなければ止まります。
 
 `GET /v1/runs/{id}/publication` で操作台帳と外部PRを確認できます。公開開始前の取消は送信を止め、開始後の外部結果は取消Runとは別に履歴へ残します。Publisherは送信前後を永続化し、同じ認証の別起動とも共有します。開始後に結果を確認できなければ `UNKNOWN` とし、盲目的に再公開しません。UNKNOWNの定期照合はSF-19で実装します。現在は契約・ローカルbare Git試験までで、SF-17の実GitHub受け入れは未完了です。
+
+## Workspaceの操作権限
+
+`python -m software_factory.cli issue-user --workspace-id <id> --access VIEWER` で閲覧専用の資格情報を発行します。`OPERATOR` と `ADMIN` も指定できます。既存Userは移行時にADMINを引き継ぎます。
+
+| 操作 | VIEWER | OPERATOR | ADMIN |
+|---|---|---|---|
+| Workspace内のRun・証拠・Workerの閲覧 | 可 | 可 | 可 |
+| Task・Spec作成、Run開始・取消・承認・予算操作 | | 可 | 可 |
+| Project・Repository登録、Worker登録・失効 | | | 可 |
+
+Worker登録用の単回トークンは `POST /v1/workspaces/{id}/worker-enrollments` で発行します。Workerはこれを使い従来どおり `POST /v1/worker/enroll` で登録します。失効は `POST /v1/workspaces/{id}/workers/{worker_id}/revoke` に理由と `Idempotency-Key` を付けて実行します。発行したトークンは発行応答で受け取り、Worker一覧は資格情報を返さない設計です。
+
+### 緊急停止と解除
+
+`GET /v1/workspaces/{id}/execution-control` で現在の状態とrevisionを確認します。管理者が同じパスに `stopped`、`expected_revision`、`reason` を指定し、`Idempotency-Key` 付きでPOSTすると停止・解除できます。停止中は新規Claimと公開開始が保留され、稼働中のWorkerにはHeartbeatで停止を要求します。解除には現在のrevisionが必要です。
+
+## GitHub CIのWebhook受信
+
+`alembic upgrade head` でInboxを追加します。Control Planeの起動時に、環境変数 `FACTORY_GITHUB_WEBHOOKS` にIntegration UUIDをキーとするJSONオブジェクトを渡すと受信を有効化できます。各エントリの項目は `workspace_id`、`repository_id`、`github_repository_id`（GitHubの数値ID）、`github_repository`（owner/repo）、`secret`（32文字以上）です。署名用secretはローカルの秘密設定から渡します。
+
+受信先は `POST /v1/webhooks/github/<integration UUID>` です。GitHubのJSON配送を署名とリポジトリで照合し、同じ配送を1件として保存します。対象は `ping`、`workflow_run`、`check_run`、`check_suite` です。配送を受けると、次の照合ループで GitHub API から状態を取得します。配送がない場合も60秒間隔で照合します。
+
+照合を有効にするには、同じ Integration UUID をキーに、読み取り専用トークンを値とする JSON オブジェクトを環境変数 `FACTORY_GITHUB_CI_READ_TOKENS` に設定します。GitHub の対象リポジトリに Pull requests、Contents、Checks の読み取り権限が必要です。固定された Draft PR と base/head SHA を再確認し、公開時に merge SHA がある場合はその親も確認します。merge SHA がない場合は固定 head 上で対象 PR の関連が確認できるチェックを使います。判定は Profile の GitHub App ID とチェック名に一致するチェックだけを対象とします。
+
+
+GitHub Actions（App ID `15368`）の必須チェックには、Policy の `required_ci_checks` で `app_id` と `check_name` に加えて `github_workflow_id` と `github_workflow_path` を指定します。トークンには Actions の読み取り権限も必要です。ワークフローのSHA-256を同じPolicyの `protected_manifest` に登録します。Control Planeはbase/head両方のワークフローファイル、現在のPR、`pull_request` イベント、ジョブと最新の実行試行を照合します。
+
+固定するワークフローは `pull_request` を起点とし、検証対象のジョブでPRのheadを明示的にcheckoutしてから `Verify candidate head` ステップを実行します。テストはその作業ツリーで実行してください。検証ステップの成功を確認できない終端チェックは判定不能とし、GitHubが報告したSHAと実際に検証できたSHAを別に記録します。
+
+```yaml
+- uses: actions/checkout@v4
+  with:
+    ref: ${{ github.event.pull_request.head.sha }}
+    persist-credentials: false
+- name: Verify candidate head
+  env:
+    EXPECTED_HEAD: ${{ github.event.pull_request.head.sha }}
+  run: test "$(git rev-parse HEAD)" = "$EXPECTED_HEAD"
+```
+
+## Jira取り込みとSlack配送
+
+Jira Cloudの対象Projectに専用の複数行テキスト欄を用意し、TaskSpecのJSONを入力します。Control Planeと取り込みプロセスに同じ設定を渡します。
+
+```sh
+export FACTORY_JIRA_MAPPING='{"integration_id":"swf","site":"https://example.atlassian.net","project_key":"SWF","workspace_id":"WORKSPACE_ID","project_id":"FACTORY_PROJECT_ID","principal_id":"OPERATOR_PRINCIPAL_ID","field_id":"customfield_12345"}'
+```
+
+`FACTORY_JIRA_RELAY_TOKEN`（32文字以上）は秘密情報として両プロセスに設定します。取り込みプロセスにだけ、課題の読み取り権限を持つ `FACTORY_JIRA_EMAIL` と `FACTORY_JIRA_API_TOKEN` を設定します。
+
+```sh
+uv run python -m software_factory.jira_relay SWF-123 --api-url http://127.0.0.1:8000
+```
+
+返された `task_id` と `spec_version` を使い、認証付きの `POST /v1/tasks/{task_id}/runs` でRunを開始します。同じJira課題の更新は同じTaskの新しいSpecとして取り込まれます。
+
+Slack配送プロセスには対象のFactory Workspace IDを `FACTORY_SLACK_WORKSPACE_ID`、送信先チャンネルIDを `FACTORY_SLACK_CHANNEL_ID`、Bot認証を `FACTORY_SLACK_BOT_TOKEN` として設定します。Control Planeと同じDBを指定し、`uv run python -m software_factory.slack_delivery` を定期実行すると、配送期限に達した通知を処理します。応答が不明な配送を照合するため、Botには対象チャンネルの履歴の読み取りも許可します。
+
+## バックアップと復元
+
+バックアップではPostgreSQLの同一スナップショットをDBダンプとArtifact台帳に使用し、Artifact本体のサイズとSHA-256を照合します。暗号化先はArtifactルートとは別の、所有者専用のディレクトリを指定します。日次運用では、停止時間帯に以下のバックアップを24時間ごとに実行し、結果の時刻・サイズ・失敗を記録します。7世代を保持します。
+
+```sh
+uv run python scripts/factory_maintenance.py --offline --artifact-root "$SOURCE_ARTIFACT_ROOT" \
+  backup "$BACKUP_DIR" --certificate "$BACKUP_CERTIFICATE"
+```
+
+復元する際は、稼働サービスから分離した空DBを `FACTORY_DATABASE_URL` に設定し、存在しない新しいArtifactルートを指定します。秘密鍵は復元担当者だけが参照できる場所から渡します。
+
+```sh
+uv run python scripts/factory_maintenance.py --offline --artifact-root "$RESTORE_ARTIFACT_ROOT" \
+  restore "$BACKUP_BUNDLE" --certificate "$BACKUP_CERTIFICATE" --key "$BACKUP_PRIVATE_KEY"
+```
+
+`STAGED_RECONCILIATION_REQUIRED` を確認してから、復元先のControl Planeを隔離状態で起動します。復元は全Workspaceを停止状態にし、旧Worker・Publisher資格情報と旧Leaseの実行権を失効させます。Workerを同じIDで復旧する場合は、ローカル管理者が復元先を指定して `python -m software_factory.cli reissue-worker --worker-id <id> --reason '<理由>'` を実行します。新しい資格情報で旧Leaseが拒否されることを確認します。復元時に公開中だった操作は `UNKNOWN` に戻り、Publisherによる読み取り照合の対象になります。
+
+Publisherも同じIDとRepository権限を保持して再発行します。復元先を指定し、`python -m software_factory.cli reissue-publisher --publisher-id <id> --reason '<理由>'` の結果を所有者専用ファイルに保存します。復元先では新しい `--state-dir` と再発行したトークンでPublisherを起動し、`GET /v1/publisher/reconciliations` とRunの公開履歴を確認します。未照合の公開処理が残っている間、停止解除は `RESTORE_RECONCILIATION_REQUIRED` で拒否されます。照合で確定できず `BLOCKED` になったRunは、解除後も個別に対応します。

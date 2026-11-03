@@ -7,7 +7,14 @@ from pathlib import Path
 import pytest
 from sqlalchemy import text
 
-from scripts.acceptance_support import EXTERNAL_CRITERIA, required_criteria, sha, source_manifest
+from scripts.acceptance_support import (
+    EXTERNAL_CRITERIA,
+    acceptance_scenarios,
+    required_criteria,
+    sha,
+    source_manifest,
+    task_criteria,
+)
 from software_factory.security import redact
 
 
@@ -75,8 +82,11 @@ class Reporter:
         (self.output / "manifest.json").write_text(
             json.dumps(metadata, indent=2, ensure_ascii=False)
         )
-        all_ids = required_criteria() + [f"C-{n:02d}" for n in range(1, 7)]
+        audited = set(required_criteria()) | {f"C-{n:02d}" for n in range(1, 7)}
+        all_ids = task_criteria() + [f"C-{n:02d}" for n in range(1, 7)]
         results = []
+        pending = []
+        scenario_records = {}
         for ac in all_ids:
             names = [name for name, ids in self.expected.items() if ac in ids]
             cases = [
@@ -90,13 +100,14 @@ class Reporter:
                 if cases and all(c["result"] == "PASS" for c in cases)
                 else "未検証"
             )
-            if ac in EXTERNAL_CRITERIA and status == "PASS":
-                # Real service evidence is verified separately from contract cases.
-                status = "未検証"
             if ac == "C-01":
                 legacy = [case for name, case in self.cases.items() if not self.expected.get(name)]
                 if not legacy or any(c["result"] != "PASS" for c in legacy):
                     status = "FAIL" if any(c["result"] == "FAIL" for c in legacy) else "未検証"
+            automated_status = status
+            if (ac in EXTERNAL_CRITERIA or ac not in audited) and status == "PASS":
+                # A green subset or a contract case cannot prove the full criterion.
+                status = "未検証"
             record = {
                 "ac_id": ac,
                 "revision": metadata["revision"],
@@ -126,8 +137,40 @@ class Reporter:
             target = self.output / (ac[:5] if ac.startswith("SF-") else "common")
             target.mkdir(exist_ok=True)
             (target / f"{ac}.json").write_text(json.dumps(record, indent=2, ensure_ascii=False))
-            results.append({"ac_id": ac, "result": status})
+            scenario_records[ac] = {
+                "result": status,
+                "automated_result": automated_status,
+                "test_case_ids": names,
+                "evidence_path": f"{target.name}/{ac}.json",
+            }
+            summary = {"ac_id": ac, "result": status}
+            if ac in audited:
+                results.append(summary)
+            else:
+                pending.append(
+                    summary | {"automated_result": automated_status, "cases": len(cases)}
+                )
+        (self.output / "pending-criteria.json").write_text(
+            json.dumps(
+                {"revision": metadata["revision"], "criteria": pending},
+                indent=2,
+                ensure_ascii=False,
+            )
+        )
         (self.output / "summary.json").write_text(json.dumps({"criteria": results}, indent=2))
+        scenarios = {}
+        for scenario, references in acceptance_scenarios().items():
+            records = {ac: scenario_records[ac] for ac in references}
+            statuses = {item["result"] for item in records.values()}
+            result = "FAIL" if "FAIL" in statuses else "PASS" if statuses == {"PASS"} else "未検証"
+            scenarios[scenario] = {"result": result, "criteria": records}
+        (self.output / "acceptance-scenarios.json").write_text(
+            json.dumps(
+                {"revision": metadata["revision"], "scenarios": scenarios},
+                indent=2,
+                ensure_ascii=False,
+            )
+        )
 
 
 def pytest_configure(config):

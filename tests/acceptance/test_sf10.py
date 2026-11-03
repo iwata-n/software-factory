@@ -25,6 +25,10 @@ from .helpers import worker_client
 
 @pytest.fixture
 def pipeline(world, source_bundle, runner, tmp_path):
+    return make_pipeline(world, source_bundle, runner, tmp_path)
+
+
+def make_pipeline(world, source_bundle, runner, tmp_path):
     source = source_bundle
     service = world.client.app.state.service
     service.artifacts._storage = LocalArtifactStorage(tmp_path / "pipeline-artifacts")
@@ -34,6 +38,9 @@ def pipeline(world, source_bundle, runner, tmp_path):
     )
 
     class Source:
+        def resolve(self, reference):
+            return reference.registered_sha
+
         def resolve_details(self, reference):
             return source
 

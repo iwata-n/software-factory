@@ -16,7 +16,8 @@ from .models import (
     Workspace,
     new_id,
 )
-from .service import Service, issue_token, token_hash
+from .security import redact
+from .service import WORKER_TOKEN_SECONDS, Service, issue_token, token_hash
 
 
 def main():
@@ -24,6 +25,9 @@ def main():
     sub = parser.add_subparsers(dest="command", required=True)
     bootstrap = sub.add_parser("bootstrap", help="Create a workspace and a local user credential")
     bootstrap.add_argument("--name", required=True)
+    user = sub.add_parser("issue-user", help="Issue a local Workspace user credential")
+    user.add_argument("--workspace-id", required=True)
+    user.add_argument("--access", choices=["ADMIN", "OPERATOR", "VIEWER"], required=True)
     publisher = sub.add_parser(
         "issue-publisher", help="Issue a dedicated trusted Publisher credential"
     )
@@ -49,6 +53,17 @@ def main():
     )
     revoke = sub.add_parser("revoke", help="Revoke a local user/worker credential")
     revoke.add_argument("--principal-id", required=True)
+    revoke.add_argument("--reason", default="Local administrator revoked credential")
+    reissue = sub.add_parser(
+        "reissue-worker", help="Reissue an inactive Worker in a stopped Workspace"
+    )
+    reissue.add_argument("--worker-id", required=True)
+    reissue.add_argument("--reason", required=True)
+    reissue_publisher = sub.add_parser(
+        "reissue-publisher", help="Reissue an inactive Publisher in a stopped Workspace"
+    )
+    reissue_publisher.add_argument("--publisher-id", required=True)
+    reissue_publisher.add_argument("--reason", required=True)
     revoke_repository = sub.add_parser(
         "revoke-repository", help="Revoke repository execution access"
     )
@@ -82,6 +97,30 @@ def main():
                 "principal_id": principal.id,
                 "user_token": secret,
             }
+        elif args.command == "issue-user":
+            workspace = session.get(Workspace, args.workspace_id)
+            if workspace is None:
+                parser.error("workspace not found")
+            service.lock_workspace(session, workspace.id)
+            secret = issue_token()
+            principal = Principal(
+                workspace_id=workspace.id,
+                role="USER",
+                user_access=args.access,
+                token_hash=token_hash(secret),
+            )
+            session.add(principal)
+            session.flush()
+            session.add(
+                AuditEvent(
+                    workspace_id=workspace.id,
+                    actor_id="local-admin",
+                    operation="user.issued",
+                    body={"principal_id": principal.id, "access": args.access},
+                    created_at=db_now(session),
+                )
+            )
+            result = {"principal_id": principal.id, "user_token": secret, "access": args.access}
         elif args.command == "issue-publisher":
             workspace = session.get(Workspace, args.workspace_id)
             if workspace is None:
@@ -147,6 +186,38 @@ def main():
                 )
             )
             result = {"enrollment_token": secret}
+        elif args.command in {"reissue-worker", "reissue-publisher"}:
+            is_worker = args.command == "reissue-worker"
+            kind = "worker" if is_worker else "publisher"
+            identity = args.worker_id if is_worker else args.publisher_id
+            principal = session.get(Principal, identity)
+            if principal is None or principal.role != kind.upper():
+                parser.error(f"{kind} not found")
+            service.lock_workspace(session, principal.workspace_id)
+            session.refresh(principal)
+            workspace = session.get(Workspace, principal.workspace_id)
+            if principal.active or not workspace.execution_stopped:
+                parser.error(
+                    f"{kind} reissue requires an inactive identity and a stopped Workspace"
+                )
+            secret, now = issue_token(), db_now(session)
+            principal.token_hash = token_hash(secret)
+            principal.token_expires_at = now + WORKER_TOKEN_SECONDS if is_worker else None
+            principal.previous_token_hash = None
+            principal.previous_token_expires_at = None
+            principal.active = True
+            session.add(
+                AuditEvent(
+                    workspace_id=principal.workspace_id,
+                    actor_id="local-admin",
+                    operation=f"{kind}.credential.reissue",
+                    body={f"{kind}_id": principal.id, "reason": redact(args.reason)},
+                    created_at=now,
+                )
+            )
+            result = {f"{kind}_id": principal.id, f"{kind}_token": secret}
+            if is_worker:
+                result.update(token_expires_at=principal.token_expires_at, protocol_version=1)
         elif args.command == "revoke-repository":
             repository = session.get(Repository, args.repository_id)
             if repository is None:
@@ -168,13 +239,20 @@ def main():
             if principal is None:
                 parser.error("principal not found")
             service.lock_workspace(session, principal.workspace_id)
+            session.refresh(principal)
+            previous_active = principal.active
             principal.active = False
             session.add(
                 AuditEvent(
                     workspace_id=principal.workspace_id,
                     actor_id="local-admin",
                     operation="principal.revoke",
-                    body={"principal_id": principal.id},
+                    body={
+                        "principal_id": principal.id,
+                        "before_active": previous_active,
+                        "after_active": False,
+                        "reason": redact(args.reason),
+                    },
                     created_at=db_now(session),
                 )
             )

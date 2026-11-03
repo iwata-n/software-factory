@@ -168,6 +168,8 @@ class ArtifactCommands:
         from .service import DomainError, owned
 
         artifact = owned(session, Artifact, artifact_id, actor.workspace_id)
+        if artifact.status == "DELETED" and artifact.finalized_at is not None:
+            raise DomainError(404, "EVIDENCE_RETENTION_EXPIRED")
         if artifact.status != "AVAILABLE":
             raise DomainError(404, "NOT_FOUND")
         try:

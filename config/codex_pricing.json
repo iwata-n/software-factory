@@ -1,0 +1,11 @@
+{
+  "version": "codex-chatgpt-budget-2026-11-02",
+  "provider": "codex_cli",
+  "model": "gpt-6.1-sol",
+  "currency": "USD",
+  "basis": "budget_estimate",
+  "source_url": "https://developers.openai.com/api/docs/models/gpt-6.1-sol",
+  "input_usd_per_million": "2.00",
+  "cached_input_usd_per_million": "0.10",
+  "output_usd_per_million": "10.00"
+}

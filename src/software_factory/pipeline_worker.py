@@ -2,16 +2,18 @@
 
 import base64
 import json
+import subprocess
 import time
 from threading import Event, Lock, Thread
 
 import httpx
 
-from .adapters import AgentResult, Capabilities, ProducedArtifact
-from .sandbox import DockerRunner, RunnerError
+from .adapters import AgentExecutionError, AgentResult, Capabilities, ProducedArtifact
+from .sandbox import STOP_UNCONFIRMED, DockerRunner, RunnerError
 
 
 class PipelineAdapter:
+    stop_margin_seconds = 10
     capabilities = Capabilities(
         kinds=("ASSEMBLE_CANDIDATE", "VERIFY", "REVIEW"), adapters=("fake", "codex_cli")
     )
@@ -127,6 +129,15 @@ class PipelineAdapter:
                 result_value = AgentResult("EXECUTED", report, artifacts=(output,))
             else:
                 raise RunnerError("MANAGED_STAGE_UNSUPPORTED", "POLICY")
+        except AgentExecutionError as error:
+            result_value = AgentResult(
+                "FAILED",
+                {},
+                category=error.category,
+                reason=error.reason,
+                usage_microusd=None,
+                usage_deliveries=error.usage_deliveries,
+            )
         except RunnerError as error:
             result_value = AgentResult("FAILED", {}, category=error.category, reason=error.code)
         except httpx.HTTPStatusError as error:
@@ -145,10 +156,17 @@ class PipelineAdapter:
                 "FAILED", {}, category="INFRASTRUCTURE", reason="MANAGED_STAGE_CRASHED"
             )
         finally:
-            if cancelled.is_set():
-                result_value = AgentResult("CANCELLED", {})
+            if cancelled.is_set() and result_value.reason != STOP_UNCONFIRMED:
+                result_value = AgentResult(
+                    "CANCELLED",
+                    {},
+                    usage_microusd=result_value.usage_microusd,
+                    usage_deliveries=result_value.usage_deliveries,
+                )
             with self._lock:
-                if generation == self._generation:
+                if generation == self._generation and (
+                    self._result is None or self._result.reason != STOP_UNCONFIRMED
+                ):
                     self._events.extend(events)
                     self._result = result_value
 
@@ -187,7 +205,12 @@ class PipelineAdapter:
                 }
             ]
         except RunnerError as error:
-            if job["kind"] != "VERIFY" or error.category == "POLICY" or cancelled.is_set():
+            if (
+                error.code == STOP_UNCONFIRMED
+                or job["kind"] != "VERIFY"
+                or error.category == "POLICY"
+                or cancelled.is_set()
+            ):
                 raise
             observations = [
                 {
@@ -210,6 +233,7 @@ class PipelineAdapter:
             "findings": [],
         }
         outputs = []
+        usage_deliveries = ()
         if job["kind"] == "VERIFY":
             for index, observation in enumerate(observations):
                 item = {
@@ -241,8 +265,11 @@ class PipelineAdapter:
                 report["checks"].append(item)
         else:
             # The backend receives immutable bytes and a data context, never the HTTP client/token.
+            reviewer = self.reviewer
+            if reviewer and hasattr(reviewer, "for_job"):
+                reviewer = reviewer.for_job(job)
             reviewed = (
-                self.reviewer.review(
+                reviewer.review(
                     {
                         "target": target,
                         "task_spec": job["snapshot"]["task_spec"],
@@ -252,13 +279,14 @@ class PipelineAdapter:
                     },
                     cancelled,
                 )
-                if self.reviewer
+                if reviewer
                 else {}
             )
             if not isinstance(reviewed, dict) or set(reviewed) - {"criteria", "findings"}:
                 raise RunnerError("REVIEW_SCHEMA_INVALID", "POLICY")
             report["criteria"] = reviewed.get("criteria", [])
             report["findings"] = reviewed.get("findings", [])
+            usage_deliveries = getattr(reviewed, "usage_deliveries", ())
             outputs.append(
                 ProducedArtifact(
                     "review-log",
@@ -267,11 +295,18 @@ class PipelineAdapter:
                         {
                             "backend_configured": self.reviewer is not None,
                             "criteria_reported": len(report["criteria"]),
+                            "engine": getattr(reviewed, "audit", {}),
                         }
                     ).encode(),
                 )
             )
-        return AgentResult("EXECUTED", report, artifacts=tuple(outputs)), events
+        return AgentResult(
+            "EXECUTED",
+            report,
+            artifacts=tuple(outputs),
+            usage_microusd=None if usage_deliveries else 0,
+            usage_deliveries=usage_deliveries,
+        ), events
 
     def events(self):
         with self._lock:
@@ -283,12 +318,29 @@ class PipelineAdapter:
             return self._result
 
     def cancel(self):
+        deadline = time.monotonic() + 7
         with self._lock:
             cancelled, generation, thread = self._cancel, self._generation, self._thread
         cancelled.set()
-        self.runner.cancel()
+        stop_unconfirmed = False
+        if self.reviewer and hasattr(self.reviewer, "cancel"):
+            try:
+                self.reviewer.cancel()
+            except (AgentExecutionError, OSError, subprocess.SubprocessError):
+                stop_unconfirmed = True
         if thread:
-            thread.join(timeout=2)
+            thread.join(timeout=max(0, deadline - time.monotonic()))
+            stop_unconfirmed |= thread.is_alive()
         with self._lock:
             if generation == self._generation:
-                self._result = AgentResult("CANCELLED", {})
+                result = self._result
+                if result and result.reason == STOP_UNCONFIRMED:
+                    return
+                self._result = AgentResult(
+                    "FAILED" if stop_unconfirmed else "CANCELLED",
+                    {},
+                    category="INFRASTRUCTURE" if stop_unconfirmed else None,
+                    reason=STOP_UNCONFIRMED if stop_unconfirmed else None,
+                    usage_microusd=result.usage_microusd if result else None,
+                    usage_deliveries=result.usage_deliveries if result else (),
+                )

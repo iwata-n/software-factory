@@ -7,11 +7,16 @@ from software_factory.models import Base
 
 target_metadata = Base.metadata
 url = os.environ.get("FACTORY_DATABASE_URL")
-if not url:
+connection = context.config.attributes.get("connection")
+if not url and connection is None:
     raise RuntimeError("FACTORY_DATABASE_URL is required for migrations")
 
 if context.is_offline_mode():
     context.configure(url=url, target_metadata=target_metadata, literal_binds=True)
+    with context.begin_transaction():
+        context.run_migrations()
+elif connection is not None:
+    context.configure(connection=connection, target_metadata=target_metadata)
     with context.begin_transaction():
         context.run_migrations()
 else:

@@ -44,6 +44,7 @@ jobs:
           docker build -t software-factory-runner:dev runner
           factory_runner_image=$(docker image inspect software-factory-runner:dev --format '{{.Id}}')
           echo "FACTORY_RUNNER_IMAGE_DIGEST=${factory_runner_image}" >> "$GITHUB_ENV"
+          echo "SF21_TEST_IMAGE=${factory_runner_image}" >> "$GITHUB_ENV"
       - run: uv run ruff check .
       - run: uv run ruff format --check .
       - run: uv run alembic upgrade head

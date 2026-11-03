@@ -203,3 +203,74 @@ def test_user_worker_other_tenant_and_ungranted_publisher_cannot_dispatch(public
     before = dump(world.database)
     assert pub.begin().status_code == 404
     assert dump(world.database) == before
+
+
+@pytest.mark.parametrize("authorized", [False, True])
+def test_emergency_stop_blocks_unstarted_publication_but_preserves_external_report(
+    publication, authorized
+):
+    pub = publication
+    world = pub.world
+    operation = pub.begin().json() if authorized else None
+    stop_path = f"/v1/workspaces/{world.workspace_id}/execution-control"
+    assert (
+        world.post(
+            stop_path, {"stopped": True, "expected_revision": 0, "reason": "publication stop"}
+        ).status_code
+        == 200
+    )
+    assert world.get("/v1/publisher/queue", token=pub.secret).json() == {"operations": []}
+    if operation is None:
+        assert pub.begin().json()["code"] == "WORKSPACE_EXECUTION_STOPPED"
+        assert world.run()["phase"] == "PUBLISH_DRAFT"
+        return
+    inputs = f"/v1/publisher/operations/{operation['operation_id']}/inputs"
+    assert world.get(inputs, token=pub.secret).json()["code"] == "WORKSPACE_EXECUTION_STOPPED"
+    assert pub.report(operation, pub.success(operation)).status_code == 200
+    record = world.get(f"/v1/runs/{world.run_id}/publication").json()
+    assert record["pull_request"]["number"] == 123
+    assert world.run()["status"] == "CANCELLED"
+
+
+@pytest.mark.ac("SF-24-AC06")
+@pytest.mark.parametrize("unresolved", [False, True])
+def test_run_retention_protects_unknown_publication_and_purges_resolved_graph(
+    publication, unresolved
+):
+    from scripts.factory_maintenance import DAY, collect
+    from software_factory.db import Database
+
+    pub = publication
+    world = pub.world
+    operation = pub.begin().json()
+    report = pub.success(operation)
+    if unresolved:
+        report = {
+            "status": "UNKNOWN",
+            "reason": "PUBLISH_UNKNOWN",
+            "target_hash": operation["target_hash"],
+            "delivery_id": "retention-unknown",
+        }
+    assert pub.report(operation, report).status_code == 200
+    run_path = f"/v1/runs/{world.run_id}"
+    assert (
+        world.post(
+            run_path + "/cancel",
+            {"expected_run_revision": world.run()["state_revision"], "reason": "retention graph"},
+        ).status_code
+        == 202
+    )
+    finished = world.run()["finished_at"]
+    database = Database(
+        world.database.engine.url.render_as_string(hide_password=False),
+        clock=lambda: finished + 90 * DAY,
+    )
+    try:
+        storage = world.client.app.state.service.artifacts.storage.root
+        collect(database, storage)
+        assert world.get(run_path).status_code == (200 if unresolved else 404)
+        rows = dump(world.database)
+        for table in ("publication_operations", "publication_observations", "candidates", "gates"):
+            assert any(row["run_id"] == world.run_id for row in rows[table]) == unresolved, table
+    finally:
+        database.engine.dispose()

@@ -1,26 +1,12 @@
 """Append-only USD accounting. Execution rights and late financial receipts are separate."""
 
-from decimal import ROUND_CEILING, Decimal, localcontext
-
 from sqlalchemy import func, select
 
-from .contracts import PricingManifest, digest
+from .contracts import digest
 from .db import db_now
+from .metering import price_call
 from .models import Attempt, BudgetVersion, CostEntry, Job, UsageReceipt, Worker
 from .security import redact
-
-
-def price_call(manifest, call):
-    rates = PricingManifest.model_validate(manifest)
-    with localcontext() as context:
-        context.prec = 80
-        value = (
-            Decimal(call.input_tokens - call.cached_input_tokens)
-            * Decimal(rates.input_usd_per_million)
-            + Decimal(call.cached_input_tokens) * Decimal(rates.cached_input_usd_per_million)
-            + Decimal(call.output_tokens) * Decimal(rates.output_usd_per_million)
-        )
-        return int(value.to_integral_value(rounding=ROUND_CEILING))
 
 
 def entry_view(entry):
@@ -301,6 +287,16 @@ class CostCommands:
         )
         if applied and not data.final and latest and data.total_microusd < latest.total_microusd:
             raise DomainError(409, "USAGE_TOTAL_DECREASED")
+        metadata = {
+            "calls": [c.model_dump() for c in data.calls],
+            "pricing_manifest_hash": data.pricing_manifest_hash,
+        }
+        if data.provider == "codex_cli" and manifest and data.pricing_manifest_hash:
+            metadata.update(
+                pricing_version=manifest["version"],
+                currency_basis=manifest["basis"],
+                token_basis="cli_turn_total" if data.calls else "no_call",
+            )
         receipt = UsageReceipt(
             workspace_id=run.workspace_id,
             run_id=run.id,
@@ -317,10 +313,7 @@ class CostCommands:
             origin="simulation"
             if run.snapshot.get("simulation", run.snapshot.get("agent_adapter", "fake") == "fake")
             else "trusted_supervisor",
-            metadata_body={
-                "calls": [c.model_dump() for c in data.calls],
-                "pricing_manifest_hash": data.pricing_manifest_hash,
-            },
+            metadata_body=metadata,
             created_at=db_now(session),
         )
         session.add(receipt)

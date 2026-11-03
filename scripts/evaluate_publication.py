@@ -16,19 +16,23 @@ import sys
 import time
 from contextlib import ExitStack
 from pathlib import Path
+from tempfile import TemporaryDirectory
 from uuid import uuid4
 
 import httpx
 from acceptance_support import source_manifest
 from alembic import command
 from alembic.config import Config
-from sqlalchemy import MetaData, select
+from factory_maintenance import backup, restore
+from live_github_webhook import github_webhook_ingress
+from sqlalchemy import MetaData, select, text
 from sqlalchemy.engine import make_url
 
 from software_factory.adapters import AgentResult, Capabilities, FakeAgent, ProducedArtifact
 from software_factory.db import Database
-from software_factory.models import Run
+from software_factory.models import CIWebhookDelivery, PublicationOperation, Run, RunEvent
 from software_factory.pipeline_worker import PipelineAdapter
+from software_factory.publisher import PublicationJournal, PublisherSupervisor
 from software_factory.publisher_backend import GitHubDraftPublisher
 from software_factory.sandbox import DockerRunner
 from software_factory.service import Service
@@ -39,6 +43,7 @@ ROOT = Path(__file__).resolve().parents[1]
 REMOTE = "https://github.com/iwata-n/software-factory.git"
 REPOSITORY = "iwata-n/software-factory"
 TARGET = "examples/evaluation/app.py"
+EVALUATION_WORKFLOW = ".github/workflows/factory-evaluation.yml"
 
 
 def process_json(argv, *, environment=None):
@@ -46,7 +51,7 @@ def process_json(argv, *, environment=None):
 
 
 def github(path):
-    return process_json(["gh", "api", "repos/" + REPOSITORY + "/" + path])
+    return process_json(["gh", "api", ("repos/" + REPOSITORY + "/" + path).rstrip("/")])
 
 
 def port():
@@ -150,11 +155,331 @@ class FixtureReviewer:
         }
 
 
+def verify_live_ci(
+    user,
+    run_id,
+    publication,
+    state,
+    output,
+    identity,
+    restart_control_plane,
+    *,
+    expect_failure=False,
+):
+    deadline = time.monotonic() + 900
+    while time.monotonic() < deadline:
+        run = state()
+        if expect_failure and run["phase"] == "REPAIR" and run["status"] == "QUEUED":
+            return verify_live_ci_failure(
+                user, run, publication, state, output, identity, restart_control_plane
+            )
+        if run["status"] == "SUCCEEDED":
+            assert not expect_failure, "Failed required CI must not finalize a Run"
+            break
+        if run["status"] != "WAITING_EXTERNAL" or run["phase"] not in {
+            "WAIT_CI",
+            "FINAL_GATE_READY",
+        }:
+            raise RuntimeError(f"Unexpected evaluation state: {run['status']} / {run['phase']}")
+        time.sleep(2)
+    else:
+        raise RuntimeError("Live GitHub CI did not finish within 900 seconds")
+
+    def receipt():
+        result = user.get(f"/v1/runs/{run_id}/result")
+        result.raise_for_status()
+        notifications = user.get(f"/v1/runs/{run_id}/notifications")
+        notifications.raise_for_status()
+        return result.json(), notifications.json()
+
+    result, notifications = receipt()
+    draft = publication["pull_request"]
+    (check,) = result["checks"]
+    (notification,) = notifications["notifications"]
+    assert result["kind"] == "VERIFIED_DRAFT_PR"
+    assert result["draft_pr"] == draft
+    assert check["status"] == "PASS" and check["tested_sha"] == draft["head_sha"]
+    assert notification["run_status"] == "SUCCEEDED" and notification["state"] == "PENDING"
+    restart_control_plane()
+    assert state()["status"] == "SUCCEEDED" and receipt() == (result, notifications)
+    observed_pr = user.get(f"/v1/runs/{run_id}/result/current-pr")
+    observed_pr.raise_for_status()
+    assert observed_pr.headers["Cache-Control"] == "no-store"
+    current_pr = observed_pr.json()
+    assert current_pr == {
+        "status": "OBSERVED",
+        "state": "OPEN",
+        "draft": True,
+        "head_sha": draft["head_sha"],
+        "base_sha": draft["base_sha"],
+        "target_matches": True,
+    }
+    assert receipt() == (result, notifications)
+    (output / "evaluation.json").write_text(
+        json.dumps(
+            {
+                "evaluation": "SF18_LIVE_GITHUB_POLL",
+                "revision": identity["revision"],
+                "run_id": run_id,
+                "local_agent_and_reviewer": "fixture",
+                "ci_input_origin": "actual_github",
+                "notification": notification,
+                "result": result,
+                "current_pr_after_restart": current_pr,
+            },
+            indent=2,
+            ensure_ascii=False,
+        )
+    )
+    print(json.dumps({"run_id": run_id, "pr": draft["url"], "ci": check["url"]}), flush=True)
+
+
+def verify_live_ci_failure(user, run, publication, state, output, identity, restart_control_plane):
+    run_id = run["run_id"]
+    candidate_id = run["current_candidate_id"]
+    verification_path = f"/v1/candidates/{candidate_id}/verification"
+
+    def evidence():
+        verification = user.get(verification_path)
+        verification.raise_for_status()
+        result = user.get(f"/v1/runs/{run_id}/result")
+        assert result.status_code == 404
+        notifications = user.get(f"/v1/runs/{run_id}/notifications")
+        notifications.raise_for_status()
+        assert not any(
+            item["run_status"] == "SUCCEEDED" for item in notifications.json()["notifications"]
+        )
+        return verification.json()["gates"]
+
+    gates = evidence()
+    (local,) = [gate for gate in gates if gate["stage"] == "LOCAL"]
+    (final,) = [gate for gate in gates if gate["stage"] == "FINAL"]
+    assert local["status"] == "PASS"
+    assert final["status"] == "FAIL" and final["reason"] == "CI_FAILED"
+    (check,) = final["metadata_body"]["checks"]
+    draft = publication["pull_request"]
+    assert check["status"] == "FAIL" and check["tested_sha"] == draft["head_sha"]
+    restart_control_plane()
+    assert state()["phase"] == "REPAIR" and evidence() == gates
+    summary = {
+        "evaluation": "SF18_LIVE_GITHUB_POLL_FAILURE",
+        "revision": identity["revision"],
+        "run_id": run_id,
+        "run_phase": run["phase"],
+        "draft_pr": draft,
+        "local_gate": local["status"],
+        "final_gate": final,
+        "check": check,
+        "success_receipt": False,
+        "success_notification": False,
+    }
+    (output / "evaluation.json").write_text(json.dumps(summary, indent=2) + "\n")
+    print(json.dumps({"run_id": run_id, "pr": draft["url"], "ci": check["url"]}), flush=True)
+
+
+def verify_live_restore(output, identity, account, publisher, run_id, cp_url, cp_environment):
+    """Lose the provider response before CP persistence, then recover from an encrypted backup."""
+
+    class LostPublicationReport(Exception):
+        pass
+
+    def interrupt(point):
+        if point == "publisher.after_external":
+            raise LostPublicationReport
+
+    github_token = subprocess.check_output(
+        ["gh", "auth", "token", "--hostname", "github.com"], text=True
+    ).strip()
+    original_token = publisher["publisher_token"]
+    backend = GitHubDraftPublisher(SourcePolicy((REMOTE,)), github_token)
+    journal = PublicationJournal(output / "interrupted-publisher")
+    with httpx.Client(
+        base_url=cp_url, trust_env=False, headers={"Authorization": f"Bearer {original_token}"}
+    ) as client:
+        try:
+            PublisherSupervisor(client, backend, journal, checkpoint=interrupt).run_once()
+        except LostPublicationReport:
+            pending = journal.read()
+        else:
+            raise RuntimeError("Publisher did not reach the lost-report injection point")
+    if pending["report"]["status"] != "SUCCEEDED":
+        raise RuntimeError(f"GitHub publication failed: {pending['report'].get('reason')}")
+    pull = pending["report"]["pull_request"]
+    operation = pending["operation"]
+    source = Database()
+    with source.transaction() as session:
+        stored = session.get(PublicationOperation, operation["operation_id"])
+        assert stored.state == "IN_FLIGHT"
+
+    def remote_matches():
+        params = httpx.QueryParams(
+            state="all",
+            head=f"{REPOSITORY.split('/')[0]}:{pull['head_ref']}",
+            base=pull["base_ref"],
+        )
+        return [
+            (item["id"], item["number"], item["head"]["sha"]) for item in github(f"pulls?{params}")
+        ]
+
+    before = remote_matches()
+    assert len(before) == 1 and before[0][1:] == (pull["number"], pull["head_sha"])
+    name = "sf24_publication_" + uuid4().hex
+    with source.engine.connect().execution_options(isolation_level="AUTOCOMMIT") as connection:
+        connection.execute(text(f"CREATE DATABASE {name}"))
+    target_url = source.engine.url.set(database=name).render_as_string(hide_password=False)
+    target = Database(target_url)
+    try:
+        with TemporaryDirectory() as directory:
+            private = Path(directory)
+            certificate, key = private / "recovery.crt", private / "recovery.key"
+            subprocess.run(
+                [
+                    "openssl",
+                    "req",
+                    "-x509",
+                    "-newkey",
+                    "rsa:2048",
+                    "-nodes",
+                    "-subj",
+                    "/CN=SF24 live recovery",
+                    "-days",
+                    "1",
+                    "-keyout",
+                    str(key),
+                    "-out",
+                    str(certificate),
+                ],
+                capture_output=True,
+                check=True,
+            )
+            captured = backup(source, output / "artifacts", private / "backup", certificate)
+            restored_root = output / "restored-artifacts"
+            staging = restore(target, restored_root, captured["backup"], certificate, key)
+            assert staging["status"] == "STAGED_RECONCILIATION_REQUIRED"
+        restored_port = port()
+        restored_url = f"http://127.0.0.1:{restored_port}"
+        env = cp_environment | {
+            "FACTORY_DATABASE_URL": target_url,
+            "FACTORY_PORT": str(restored_port),
+            "FACTORY_ARTIFACT_ROOT": str(restored_root),
+        }
+        issued = process_json(
+            [
+                sys.executable,
+                "-m",
+                "software_factory.cli",
+                "reissue-publisher",
+                "--publisher-id",
+                publisher["publisher_id"],
+                "--reason",
+                "Live recovery fixture",
+            ],
+            environment=env,
+        )
+        assert issued["publisher_id"] == publisher["publisher_id"]
+        with (output / "restored-control-plane.log").open("wb") as log:
+            process = subprocess.Popen(
+                [sys.executable, "-m", "software_factory.cli", "serve"],
+                env=env,
+                cwd=ROOT,
+                stdout=log,
+                stderr=log,
+            )
+            try:
+                wait_ready(restored_url + "/healthz", process)
+                with httpx.Client(base_url=restored_url, trust_env=False) as client:
+                    old = client.get(
+                        "/v1/publisher/reconciliations",
+                        headers={"Authorization": f"Bearer {original_token}"},
+                    )
+                    assert old.status_code == 401
+                    client.headers["Authorization"] = f"Bearer {account['user_token']}"
+                    path = f"/v1/workspaces/{account['workspace_id']}/execution-control"
+                    revision = client.get(path).json()["revision"]
+                    action = {
+                        "stopped": False,
+                        "expected_revision": revision,
+                        "reason": "Live recovery fixture",
+                    }
+                    denied = client.post(path, json=action, headers={"Idempotency-Key": "release"})
+                    assert denied.status_code == 409
+                    assert denied.json()["code"] == "RESTORE_RECONCILIATION_REQUIRED"
+                    with httpx.Client(
+                        base_url=restored_url,
+                        trust_env=False,
+                        headers={"Authorization": f"Bearer {issued['publisher_token']}"},
+                    ) as restored_publisher:
+                        recovery = PublisherSupervisor(
+                            restored_publisher,
+                            backend,
+                            PublicationJournal(output / "restored-publisher"),
+                        ).run_once()
+                    assert recovery["state"] == "SUCCEEDED"
+                    reads = list(backend.trace)
+                    assert reads and all(item["method"] == "GET" for item in reads)
+                    result = client.get(f"/v1/runs/{run_id}/publication").json()
+                    assert result["pull_request"]["number"] == pull["number"]
+                    assert result["pull_request"]["head_sha"] == pull["head_sha"]
+                    post(client, path, action)
+                after = remote_matches()
+                assert after == before
+            finally:
+                process.terminate()
+                process.wait(timeout=10)
+        evidence = {
+            "evaluation": "SF24_LIVE_PUBLICATION_RESTORE",
+            "revision": identity["revision"],
+            "run_id": run_id,
+            "pull_request": pull["url"],
+            "head_sha": pull["head_sha"],
+            "pre_restore_operation": "IN_FLIGHT",
+            "recovered_operation": recovery["state"],
+            "provider_requests": reads,
+            "matching_prs_before": len(before),
+            "matching_prs_after": len(after),
+            "old_token_status": old.status_code,
+            "release_before_reconciliation_status": denied.status_code,
+        }
+        encoded = json.dumps(evidence, indent=2) + "\n"
+        assert not any(
+            token in encoded
+            for token in (
+                github_token,
+                original_token,
+                issued["publisher_token"],
+                account["user_token"],
+            )
+        )
+        (output / "evaluation.json").write_text(encoded)
+        print(encoded, flush=True)
+    finally:
+        target.engine.dispose()
+        with source.engine.connect().execution_options(isolation_level="AUTOCOMMIT") as connection:
+            connection.execute(text(f"DROP DATABASE {name}"))
+        source.engine.dispose()
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--base-ref", required=True)
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--actions-workflow-id", type=int)
+    parser.add_argument("--fixture-base-sha")
+    parser.add_argument("--restore-publication", action="store_true")
+    parser.add_argument("--expect-ci-failure", action="store_true")
+    parser.add_argument("--live-webhook", action="store_true")
     args = parser.parse_args()
+    live_ci = args.actions_workflow_id is not None
+    if (args.restore_publication or args.expect_ci_failure or args.live_webhook) and not live_ci:
+        parser.error("restore and failure rehearsals require the fixed Actions evaluation profile")
+    if args.restore_publication and (args.expect_ci_failure or args.live_webhook):
+        parser.error("select one rehearsal at a time")
+    if live_ci != bool(args.fixture_base_sha):
+        parser.error("--actions-workflow-id and --fixture-base-sha must be specified together")
+    if live_ci and (
+        args.actions_workflow_id <= 0 or not args.base_ref.startswith("codex/factory-evaluation/")
+    ):
+        parser.error("live CI requires a positive workflow ID and an evaluation-only base ref")
     url = make_url(os.environ["FACTORY_DATABASE_URL"])
     if not str(url.query.get("host", "")).startswith("/private/tmp/factory-pg-"):
         raise SystemExit("use with_postgres.py and its disposable PostgreSQL")
@@ -162,8 +487,8 @@ def main():
         raise SystemExit("commit the evaluated implementation and fixtures before this evaluation")
     identity = source_manifest()
     remote_sha = github("git/ref/heads/" + args.base_ref)["object"]["sha"]
-    if remote_sha != identity["base_sha"]:
-        raise SystemExit("evaluation base ref must point at this exact implementation commit")
+    if remote_sha != (args.fixture_base_sha or identity["base_sha"]):
+        raise SystemExit("evaluation base ref does not match the fixed SHA")
     output = args.output.resolve()
     output.mkdir(mode=0o700, parents=True, exist_ok=False)
     command.upgrade(Config(str(ROOT / "alembic.ini")), "head")
@@ -236,6 +561,10 @@ def main():
                 p.relative_to(ROOT).as_posix(): hashlib.sha256(p.read_bytes()).hexdigest()
                 for p in checks.glob("*.py")
             }
+            if live_ci:
+                protected[EVALUATION_WORKFLOW] = hashlib.sha256(
+                    (ROOT / EVALUATION_WORKFLOW).read_bytes()
+                ).hexdigest()
             policy = {
                 "allowed_write_paths": [TARGET],
                 "protected_paths": [
@@ -279,10 +608,23 @@ def main():
                     }
                 ],
                 "required_ci_checks": [
-                    {"provider": "github", "app_id": 15368, "check_name": name}
+                    {"provider": "github", "app_id": 123, "check_name": name}
                     for name in ("publication-transport-a", "publication-transport-b")
                 ],
             }
+            if live_ci:
+                policy["required_ci_checks"] = [
+                    {
+                        "provider": "github",
+                        "app_id": 15368,
+                        # The Agent fixture fixes empty-state behavior only.
+                        "check_name": (
+                            "factory-eval-count" if args.expect_ci_failure else "factory-eval-empty"
+                        ),
+                        "github_workflow_id": args.actions_workflow_id,
+                        "github_workflow_path": EVALUATION_WORKFLOW,
+                    }
+                ]
             project = post(
                 user,
                 f"/v1/workspaces/{account['workspace_id']}/projects",
@@ -435,8 +777,104 @@ def main():
 
             assert Supervisor(agent_client, fixture, heartbeat_interval=0.1).run_once()["accepted"]
             managed_stages()
-            result, publication = publish()
-            assert result["state"] == "SUCCEEDED" and state()["phase"] == "WAIT_CI"
+            if args.restore_publication:
+                verify_live_restore(
+                    output, identity, account, publisher, run_id, cp_url, cp_environment
+                )
+                return
+            if not args.live_webhook:
+                result, publication = publish()
+                assert result["state"] == "SUCCEEDED" and state()["phase"] == "WAIT_CI"
+            if live_ci:
+                integration_id = str(uuid4())
+                webhook_secret = uuid4().hex + uuid4().hex
+                provider_token = subprocess.check_output(
+                    ["gh", "auth", "token", "--hostname", "github.com"], text=True
+                ).strip()
+                known_secrets.extend([webhook_secret, provider_token])
+                cp_environment["FACTORY_GITHUB_WEBHOOKS"] = json.dumps(
+                    {
+                        integration_id: {
+                            "workspace_id": account["workspace_id"],
+                            "repository_id": repository["repository_id"],
+                            "github_repository_id": github("")["id"],
+                            "github_repository": REPOSITORY,
+                            "secret": webhook_secret,
+                        }
+                    }
+                )
+                cp_environment["FACTORY_GITHUB_CI_READ_TOKENS"] = json.dumps(
+                    {integration_id: provider_token}
+                )
+
+                def restart_control_plane():
+                    process = processes.pop()
+                    process.terminate()
+                    process.wait(timeout=10)
+                    log = files.enter_context((output / "control-plane-live-ci.log").open("ab"))
+                    processes.append(
+                        subprocess.Popen(
+                            [sys.executable, "-m", "software_factory.cli", "serve"],
+                            env=cp_environment,
+                            cwd=ROOT,
+                            stdout=log,
+                            stderr=log,
+                        )
+                    )
+                    wait_ready(cp_url + "/healthz", processes[-1])
+
+                restart_control_plane()
+                if args.live_webhook:
+                    hook_path = f"/v1/webhooks/github/{integration_id}"
+                    files.enter_context(
+                        github_webhook_ingress(REPOSITORY, cp_url, hook_path, webhook_secret)
+                    )
+                    result, publication = publish()
+                    assert result["state"] == "SUCCEEDED"
+                verify_live_ci(
+                    user,
+                    run_id,
+                    publication,
+                    state,
+                    output,
+                    identity,
+                    restart_control_plane,
+                    expect_failure=args.expect_ci_failure,
+                )
+                if args.live_webhook:
+                    with Database().transaction() as session:
+                        deliveries = list(
+                            session.scalars(
+                                select(CIWebhookDelivery)
+                                .where(CIWebhookDelivery.integration_id == integration_id)
+                                .order_by(CIWebhookDelivery.received_at)
+                            )
+                        )
+                        triggers = list(
+                            session.scalars(
+                                select(RunEvent)
+                                .where(
+                                    RunEvent.run_id == run_id,
+                                    RunEvent.kind == "GITHUB_CI_RECONCILED",
+                                )
+                                .order_by(RunEvent.revision)
+                            )
+                        )
+                    proof = {
+                        "deliveries": [
+                            {
+                                "id": row.delivery_id,
+                                "event": row.event,
+                                "received_at": row.received_at,
+                            }
+                            for row in deliveries
+                        ],
+                        "reconciliations": [row.body for row in triggers],
+                    }
+                    (output / "webhook.json").write_text(json.dumps(proof, indent=2) + "\n")
+                    assert any(row.event != "ping" for row in deliveries)
+                    assert triggers and triggers[-1].body.get("trigger") == "WEBHOOK"
+                return
             first_publication = publication
             database = Database()
             service = Service(database)

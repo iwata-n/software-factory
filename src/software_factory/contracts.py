@@ -184,10 +184,26 @@ class EvidenceReport(Contract):
         return self
 
 
+GITHUB_ACTIONS_APP_ID = 15368
+
+
 class RequiredCICheck(Contract):
     provider: Literal["github"] = "github"
     app_id: int = Field(gt=0)
     check_name: Name
+    github_workflow_id: int | None = Field(default=None, strict=True, gt=0)
+    github_workflow_path: Name | None = None
+
+    @model_validator(mode="after")
+    def workflow_identity(self):
+        if self.app_id == GITHUB_ACTIONS_APP_ID:
+            if self.github_workflow_id is None or self.github_workflow_path is None:
+                raise ValueError("GitHub Actions requires a fixed workflow ID and path")
+            if not re.fullmatch(r"\.github/workflows/[\w.-]+\.ya?ml", self.github_workflow_path):
+                raise ValueError("invalid GitHub Actions workflow path")
+        elif self.github_workflow_id is not None or self.github_workflow_path is not None:
+            raise ValueError("workflow identity is only supported for GitHub Actions")
+        return self
 
 
 MicroUSD = Annotated[int, Field(strict=True, ge=0, le=10**12)]
@@ -282,6 +298,11 @@ class ProjectPolicy(Contract):
         ids = [command.check_id for command in self.verification_commands]
         if len(ids) != len(set(ids)) or not set(ids).issubset(self.verification.required_checks):
             raise ValueError("verification command IDs must be unique required checks")
+        if any(
+            check.github_workflow_path and check.github_workflow_path not in self.protected_manifest
+            for check in self.required_ci_checks
+        ):
+            raise ValueError("GitHub Actions workflow must be in the protected manifest")
         identities = [(c.provider, c.app_id, c.check_name) for c in self.required_ci_checks]
         if len(identities) != len(set(identities)):
             raise ValueError("required CI identities must be unique")
@@ -401,6 +422,11 @@ class PublicationBegin(Contract):
     target_hash: Annotated[str, Field(pattern=r"^[0-9a-f]{64}$")]
 
 
+class PublicationReconcile(Contract):
+    attempt: int = Field(ge=1, le=3, strict=True)
+    target_hash: Annotated[str, Field(pattern=r"^[0-9a-f]{64}$")]
+
+
 class PublishedDraft(Contract):
     repository: Annotated[str, Field(pattern=r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")]
     number: int = Field(gt=0, strict=True)
@@ -425,6 +451,7 @@ class PublicationReport(Contract):
     delivery_id: Name
     target_hash: Annotated[str, Field(pattern=r"^[0-9a-f]{64}$")]
     status: Literal["SUCCEEDED", "UNKNOWN", "CONFLICT"]
+    reconcile_attempt: int | None = Field(default=None, ge=1, le=3, strict=True)
     pull_request: PublishedDraft | None = None
     observed_head_sha: Sha | None = None
     provider_requests: list[ProviderRequest] = Field(default_factory=list, max_length=1000)
@@ -442,6 +469,12 @@ class PublicationReport(Contract):
         | None
     ) = None
 
+    def payload(self):
+        # Preserve hashes of initial reports stored before reconciliation was added.
+        return self.model_dump(
+            exclude={"reconcile_attempt"} if self.reconcile_attempt is None else None
+        )
+
     @model_validator(mode="after")
     def outcome(self):
         if (self.status == "SUCCEEDED") != (self.pull_request is not None):
@@ -454,6 +487,30 @@ class PublicationReport(Contract):
 class Claim(Contract):
     protocol_version: Literal[1] = 1
     wait_seconds: int = Field(default=0, ge=0, le=20)
+
+
+class WorkerEnrollmentRequest(Contract):
+    kinds: list[
+        Literal["PLAN", "IMPLEMENT", "REPAIR", "ASSEMBLE_CANDIDATE", "VERIFY", "REVIEW"]
+    ] = Field(min_length=1, max_length=6)
+    adapter: Literal["fake", "codex_cli"] = "fake"
+    ttl_seconds: int = Field(default=600, ge=1, le=3600)
+    managed: bool = False
+    usage_authority: bool = False
+
+    @model_validator(mode="after")
+    def trusted_capabilities(self):
+        if len(set(self.kinds)) != len(self.kinds):
+            raise ValueError("duplicate Worker capabilities")
+        if not self.managed and (
+            self.usage_authority or set(self.kinds) & {"ASSEMBLE_CANDIDATE", "VERIFY", "REVIEW"}
+        ):
+            raise ValueError("trusted capabilities require a managed Worker")
+        return self
+
+
+class WorkerRevocation(Contract):
+    reason: Name
 
 
 class Enroll(Contract):
@@ -479,6 +536,12 @@ class Fail(Contract):
     category: Literal["INFRASTRUCTURE", "POLICY", "INCONCLUSIVE"]
     reason: Annotated[str, Field(min_length=1, max_length=2000)]
     usage_microusd: MicroUSD | None = 0
+
+
+class WorkspaceExecutionChange(Contract):
+    stopped: bool = Field(strict=True)
+    expected_revision: int = Field(ge=0, strict=True)
+    reason: Annotated[str, Field(min_length=1, max_length=2000)]
 
 
 class Cancel(Contract):

@@ -4,14 +4,18 @@ import argparse
 import hashlib
 import json
 import os
+import shutil
 import time
 from concurrent.futures import Future
+from contextlib import nullcontext
+from dataclasses import replace
 from threading import Thread
 from urllib.parse import urlparse
 
 import httpx
 
 from .adapters import AgentAdapter, AgentResult, FakeAgent
+from .worker_credentials import WorkerCredentials
 
 
 def validate_api_url(url: str) -> None:
@@ -31,8 +35,45 @@ class Supervisor:
         self.client = client
         self.adapter = adapter
         self.heartbeat_interval = heartbeat_interval
+        self._pending_usage = {}
+        self._quarantined = False
+
+    def _queue_usage(self, attempt_id, result):
+        if result is None:
+            return
+        for index, delivery in enumerate(result.usage_deliveries):
+            self._pending_usage[(attempt_id, index)] = delivery
+
+    def _flush_usage(self, deadline=None):
+        for (attempt_id, index), delivery in list(self._pending_usage.items()):
+            for retry in range(3):
+                remaining = 10 if deadline is None else deadline - time.monotonic()
+                if remaining <= 0:
+                    raise TimeoutError("confirmed lease deadline reached before usage submission")
+                try:
+                    reply = self.client.post(
+                        f"/v1/worker/attempts/{attempt_id}/usage",
+                        json=delivery,
+                        headers={"Idempotency-Key": f"usage:{attempt_id}:{index}"},
+                        timeout=min(10, remaining),
+                    )
+                    reply.raise_for_status()
+                except (httpx.TransportError, httpx.HTTPStatusError) as error:
+                    transient = not isinstance(error, httpx.HTTPStatusError) or (
+                        error.response.status_code == 429 or error.response.status_code >= 500
+                    )
+                    if not transient or retry == 2:
+                        raise
+                    time.sleep(0.2 * (retry + 1))
+                else:
+                    del self._pending_usage[(attempt_id, index)]
+                    break
 
     def run_once(self, *, wait_seconds: int = 0) -> dict | None:
+        if self._quarantined:
+            raise RuntimeError("Worker quarantined after an unconfirmed stop")
+        # Late financial receipts have their own authority and do not renew execution rights.
+        self._flush_usage()
         response = self.client.post(
             "/v1/worker/claims",
             json={"protocol_version": 1, "wait_seconds": wait_seconds},
@@ -55,8 +96,9 @@ class Supervisor:
             self.adapter.bind_transport(self.client, lease_path, lease["fence"])
         # Confirm the lease before starting. Round-trip time consumes the returned allowance.
         deadline = 0.0
+        stop_margin = getattr(self.adapter, "stop_margin_seconds", 0)
 
-        def heartbeat() -> tuple[float, bool]:
+        def heartbeat() -> tuple[float, bool, float]:
             sent_at = time.monotonic()
             remaining = max(0.1, deadline - sent_at) if deadline else 10
             reply = self.client.post(
@@ -68,8 +110,11 @@ class Supervisor:
             payload = reply.json()
             allowance = payload["lease_expires_in_seconds"]
             # A proportionate margin also works with short test/job deadlines.
-            confirmed_until = sent_at + max(0, allowance - min(5, allowance / 4))
-            return confirmed_until, payload["cancel_requested"]
+            confirmed_until = sent_at + max(
+                0, allowance - min(1 if stop_margin else 10, allowance / 4)
+            )
+            stop_at = min(confirmed_until, sent_at + allowance - stop_margin)
+            return confirmed_until, payload["cancel_requested"], stop_at
 
         def background_heartbeat() -> Future:
             future = Future()
@@ -85,11 +130,16 @@ class Supervisor:
             return future
 
         started = False
+        usage_queued = False
         try:
-            deadline, cancelled = heartbeat()
+            deadline, cancelled, stop_at = heartbeat()
             preparation = None
             preparation_error = None
-            if not cancelled and time.monotonic() < deadline:
+            if not cancelled and stop_margin and time.monotonic() >= stop_at:
+                preparation_error = AgentResult(
+                    "FAILED", {}, category="INFRASTRUCTURE", reason="INSUFFICIENT_EXECUTION_TIME"
+                )
+            elif not cancelled and time.monotonic() < deadline:
                 if (
                     job["snapshot"].get("source")
                     and job["kind"] in {"PLAN", "IMPLEMENT", "ASSEMBLE_CANDIDATE"}
@@ -123,10 +173,23 @@ class Supervisor:
             ):
                 now = time.monotonic()
                 if now >= deadline:
-                    self.adapter.cancel()
+                    if not started:
+                        self.adapter.cancel()
                     raise TimeoutError("confirmed lease deadline reached; Agent cancelled")
+                if stop_margin and now >= stop_at:
+                    self.adapter.cancel()
+                    stopped = self.adapter.result()
+                    if not cancelled and stopped.reason != "STOP_UNCONFIRMED":
+                        stopped = replace(
+                            stopped,
+                            outcome="FAILED",
+                            category="INFRASTRUCTURE",
+                            reason="RUNNER_TIMEOUT",
+                        )
+                    preparation_error = stopped
+                    break
                 if pending_heartbeat is not None and pending_heartbeat.done():
-                    deadline, cancelled = pending_heartbeat.result()
+                    deadline, cancelled, stop_at = pending_heartbeat.result()
                     pending_heartbeat = None
                     if cancelled:
                         self.adapter.cancel()
@@ -135,7 +198,7 @@ class Supervisor:
                     preparation is not None
                     and preparation.done()
                     and not cancelled
-                    and time.monotonic() < deadline
+                    and time.monotonic() < stop_at
                 ):
                     try:
                         source = preparation.result()
@@ -166,12 +229,19 @@ class Supervisor:
                 buffered_events.extend(self.adapter.events())
                 if now >= next_heartbeat and pending_heartbeat is None:
                     pending_heartbeat = background_heartbeat()
-                time.sleep(min(0.1, max(0, deadline - time.monotonic())))
+                time.sleep(min(0.1, max(0, stop_at - time.monotonic())))
             result = preparation_error or self.adapter.result()
+            if result.reason == "STOP_UNCONFIRMED":
+                self._quarantined = True
             if time.monotonic() >= deadline:
-                self.adapter.cancel()
+                if not started:
+                    self.adapter.cancel()
                 raise TimeoutError("confirmed lease deadline reached before submission")
             buffered_events.extend(self.adapter.events())
+            # Metering precedes output upload so a later failure cannot erase usage.
+            self._queue_usage(job["attempt_id"], result)
+            usage_queued = True
+            self._flush_usage(deadline)
             artifact_ids = []
             references = {}
             for artifact in result.artifacts:
@@ -278,12 +348,19 @@ class Supervisor:
         except BaseException:
             # Real adapters must make cancel() a bounded process-group stop (future sandbox task).
             if started:
+                # Capture a completed result before cancel() can replace it.
+                result = self.adapter.result()
                 self.adapter.cancel()
+                stopped = self.adapter.result()
+                if stopped and stopped.reason == "STOP_UNCONFIRMED":
+                    self._quarantined = True
+                if not usage_queued:
+                    self._queue_usage(job["attempt_id"], result or stopped)
             raise
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Software Factory Fake Agent worker")
+    parser = argparse.ArgumentParser(description="Software Factory HTTP worker")
     parser.add_argument(
         "--api-url", default=os.environ.get("FACTORY_API_URL", "http://127.0.0.1:8000")
     )
@@ -294,15 +371,40 @@ def main():
     parser.add_argument(
         "--scenario", choices=["success", "infra-fail", "inconclusive"], default="success"
     )
-    parser.add_argument("--adapter", choices=["fake", "pipeline"], default="fake")
+    parser.add_argument("--adapter", choices=["fake", "pipeline", "codex_cli"], default="fake")
+    parser.add_argument("--reviewer", choices=["none", "codex_cli"], default="none")
+    parser.add_argument(
+        "--codex-manifest",
+        default=os.environ.get("FACTORY_CODEX_MANIFEST", "config/codex_cli.json"),
+    )
+    parser.add_argument(
+        "--codex-binary",
+        default=os.environ.get("FACTORY_CODEX_BINARY")
+        or shutil.which("codex")
+        or (
+            "/Applications/ChatGPT.app/Contents/Resources/"
+            "codex-cli/CodexCLI.app/Contents/MacOS/codex"
+        ),
+    )
+    parser.add_argument(
+        "--credential-file", default=os.environ.get("FACTORY_WORKER_CREDENTIAL_FILE")
+    )
     args = parser.parse_args()
     validate_api_url(args.api_url)
     token = os.environ.get("FACTORY_WORKER_TOKEN")
-    if not token:
-        parser.error("FACTORY_WORKER_TOKEN is required")
-    with httpx.Client(
-        base_url=args.api_url, headers={"Authorization": f"Bearer {token}"}
-    ) as client:
+    if bool(token) == bool(args.credential_file):
+        parser.error("Set exactly one of FACTORY_WORKER_TOKEN or --credential-file")
+    credentials = WorkerCredentials(args.credential_file) if args.credential_file else None
+    engine = None
+    if args.adapter == "codex_cli" or args.reviewer == "codex_cli":
+        from .codex_engine import CodexCLI
+
+        engine = CodexCLI.from_file(args.codex_binary, args.codex_manifest)
+    headers = {"Authorization": f"Bearer {token}"} if token else {}
+    with (
+        credentials.lock() if credentials else nullcontext(),
+        httpx.Client(base_url=args.api_url, headers=headers) as client,
+    ):
         if args.adapter == "pipeline":
             from .pipeline_worker import PipelineAdapter
             from .sandbox import DockerRunner
@@ -310,12 +412,23 @@ def main():
             image = os.environ.get("FACTORY_RUNNER_IMAGE_DIGEST")
             if not image:
                 parser.error("FACTORY_RUNNER_IMAGE_DIGEST is required for managed stages")
-            adapter = PipelineAdapter(DockerRunner(image))
+            reviewer = None
+            if args.reviewer == "codex_cli":
+                from .codex_adapter import CodexReviewer
+
+                reviewer = CodexReviewer(engine)
+            adapter = PipelineAdapter(DockerRunner(image), reviewer=reviewer)
+        elif args.adapter == "codex_cli":
+            from .codex_adapter import CodexAdapter
+
+            adapter = CodexAdapter(engine)
         else:
             adapter = FakeAgent(args.scenario)
         supervisor = Supervisor(client, adapter)
         while True:
             try:
+                if credentials:
+                    credentials.prepare(client)
                 result = supervisor.run_once(wait_seconds=0 if args.once or args.drain else 20)
                 if result:
                     print(json.dumps(result, ensure_ascii=False))

@@ -290,7 +290,9 @@ class GateCommands:
             payload=payload,
         )
 
-    def require_publication(self, session, run, candidate_id, gate_id, evidence_digest):
+    def require_publication(
+        self, session, run, candidate_id, gate_id, evidence_digest, *, recovering=False
+    ):
         from .service import DomainError, owned
 
         gate = owned(session, Gate, gate_id, run.workspace_id)
@@ -301,8 +303,11 @@ class GateCommands:
             or gate.stage != "LOCAL"
             or gate.status != "PASS"
             or gate.evidence_digest != evidence_digest
-            or run.status not in {"QUEUED", "RUNNING"}
-            or run.phase != "PUBLISH_DRAFT"
+            or not (
+                (run.status == "WAITING_EXTERNAL" and run.phase == "PUBLISH_UNKNOWN")
+                if recovering
+                else (run.status in {"QUEUED", "RUNNING"} and run.phase == "PUBLISH_DRAFT")
+            )
         ):
             raise DomainError(409, "PUBLICATION_GATE_STALE")
         _, target, _, _, _, current = self.inputs(session, run)
@@ -314,7 +319,7 @@ class GateCommands:
             raise DomainError(409, "PUBLICATION_GATE_STALE")
         return gate
 
-    def begin_ci_wait(self, session, run, gate_id, draft):
+    def begin_ci_wait(self, session, run, gate_id, draft, *, recovering=False):
         from .service import DomainError, event, owned
 
         if (run.wait_context or {}).get("quality_gate"):
@@ -323,7 +328,12 @@ class GateCommands:
             raise DomainError(409, "CI_WAIT_ALREADY_STARTED")
         gate = owned(session, Gate, gate_id, run.workspace_id)
         self.require_publication(
-            session, run, run.current_candidate_id, gate_id, gate.evidence_digest
+            session,
+            run,
+            run.current_candidate_id,
+            gate_id,
+            gate.evidence_digest,
+            recovering=recovering,
         )
         run.wait_context = {
             "kind": "CI",
@@ -333,6 +343,9 @@ class GateCommands:
             "target": gate.target,
             "draft": draft,
             "required_ci": run.snapshot["verification_profile"].get("required_ci_checks", []),
+            "protected_manifest": run.snapshot["verification_profile"].get(
+                "protected_manifest", {}
+            ),
             "checks": [],
         }
         run.status, run.phase = "WAITING_EXTERNAL", "WAIT_CI"
@@ -393,7 +406,12 @@ class GateCommands:
             if local_defects is not None and ci_defects is not None
             else None
         )
-        progress, stop = self.progress(session, run, candidate, "FINAL", defects, decision.status)
+        if decision.reason == "CI_TIMEOUT":
+            progress, stop = {"status": "CI_TIMEOUT"}, None
+        else:
+            progress, stop = self.progress(
+                session, run, candidate, "FINAL", defects, decision.status
+            )
         if stop == "REPAIR_COMPARISON_INCONCLUSIVE":
             decision = replace(decision, status="INCONCLUSIVE", reason=stop)
         existing = session.scalar(
@@ -435,7 +453,7 @@ class GateCommands:
         if stop:
             transition(session, run, "BLOCKED", stop)
         elif decision.status == "PASS":
-            # SF-19 verifies publication reconciliation before assigning Run SUCCEEDED.
+            # The CI poller confirms the current publication before completing the Run.
             run.phase = "FINAL_GATE_READY"
         elif decision.status == "ERROR":
             count = context.get("infra_attempt", 1)

@@ -1,9 +1,11 @@
 import asyncio
+import logging
 import os
 import time
 from contextlib import asynccontextmanager
 from typing import Annotated
 
+import httpx
 from fastapi import Depends, FastAPI, Header, Request, Response
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
@@ -12,6 +14,8 @@ from sqlalchemy import select
 from sqlalchemy.exc import SQLAlchemyError
 from starlette.concurrency import run_in_threadpool
 
+from .ci_poll import CIPoller, configured_read_tokens
+from .ci_webhook import configured_webhooks, webhook_router
 from .contracts import (
     ApprovalSubmission,
     ArtifactFinalize,
@@ -26,15 +30,20 @@ from .contracts import (
     Intervention,
     ProjectCreate,
     PublicationBegin,
+    PublicationReconcile,
     PublicationReport,
     ReplanRequest,
     RepositoryCreate,
     RunStart,
     TaskSpec,
     UsageDelivery,
+    WorkerEnrollmentRequest,
     WorkerEventBatch,
+    WorkerRevocation,
+    WorkspaceExecutionChange,
 )
 from .db import Database
+from .jira_input import configured_jira, jira_router
 from .models import (
     ApprovalRequest,
     Artifact,
@@ -43,17 +52,24 @@ from .models import (
     Check,
     Finding,
     Gate,
+    HistoricalCIObservation,
+    IdempotencyRecord,
     Job,
     JobDependency,
+    OutboxEvent,
     PlanVersion,
+    Repository,
     Run,
     RunEvent,
+    SlackDelivery,
     SpecVersion,
     Task,
-    Worker,
+    VerifiedRunResult,
 )
+from .operations import event_view, operations_router
 from .resolver import SourceResolver
 from .service import DomainError, Service, owned, run_view
+from .slack_delivery import NOTIFICATION
 
 security = HTTPBearer(auto_error=False)
 
@@ -80,11 +96,12 @@ def create_app(
         database or Database(), resolver=resolver, checkpoint=checkpoint, storage=storage
     )
 
+    integrations = configured_webhooks()
+    ci_poller = CIPoller(service, integrations, configured_read_tokens())
+
     @asynccontextmanager
     async def lifespan(app: FastAPI):
         async def reconciliation_loop():
-            import logging
-
             while True:
                 try:
                     await run_in_threadpool(service.reconcile)
@@ -92,15 +109,27 @@ def create_app(
                     logging.getLogger(__name__).error("lease reconciliation failed")
                 await asyncio.sleep(reconcile_interval)
 
-        task = asyncio.create_task(reconciliation_loop())
+        def poll_ci():
+            with httpx.Client(timeout=10, trust_env=False) as client:
+                ci_poller.poll(client)
+
+        async def ci_loop():
+            while True:
+                try:
+                    await run_in_threadpool(poll_ci)
+                except Exception:
+                    logging.getLogger(__name__).error("GitHub CI reconciliation failed")
+                await asyncio.sleep(min(reconcile_interval, 5))
+
+        tasks = [asyncio.create_task(reconciliation_loop())]
+        if ci_poller.bindings:
+            tasks.append(asyncio.create_task(ci_loop()))
         try:
             yield
         finally:
-            task.cancel()
-            try:
-                await task
-            except asyncio.CancelledError:
-                pass
+            for task in tasks:
+                task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
 
     app = FastAPI(
         title="Software Factory Control Plane",
@@ -113,6 +142,10 @@ def create_app(
         ),
     )
     app.state.service = service
+    app.include_router(webhook_router(service, integrations))
+    if jira := configured_jira():
+        app.include_router(jira_router(service, *jira))
+    app.include_router(operations_router(service, Token))
 
     @app.exception_handler(DomainError)
     async def domain_error(request: Request, error: DomainError):
@@ -147,7 +180,13 @@ def create_app(
             return service.create_project(session, actor, data)
 
         return service.write(
-            token, "USER", f"projects:{workspace_id}", key, data.model_dump(), command
+            token,
+            "USER",
+            f"projects:{workspace_id}",
+            key,
+            data.model_dump(),
+            command,
+            user_access="ADMIN",
         )
 
     @app.post("/v1/projects/{project_id}/repositories", status_code=201, tags=["Projects"])
@@ -159,6 +198,7 @@ def create_app(
             key,
             data.model_dump(),
             lambda s, a: service.create_repository(s, a, project_id, data),
+            user_access="ADMIN",
         )
 
     @app.post("/v1/projects/{project_id}/tasks", status_code=201, tags=["Tasks"])
@@ -223,6 +263,71 @@ def create_app(
     @app.get("/v1/runs/{run_id}", tags=["Runs"])
     def run_get(run_id: str, token: Token):
         return service.read(token, lambda s, a: run_view(owned(s, Run, run_id, a.workspace_id)))
+
+    def verified_result(session, actor, run_id):
+        run = owned(session, Run, run_id, actor.workspace_id)
+        result = session.scalar(
+            select(VerifiedRunResult).where(
+                VerifiedRunResult.workspace_id == run.workspace_id,
+                VerifiedRunResult.run_id == run.id,
+            )
+        )
+        if result is None:
+            raise DomainError(404, "NOT_FOUND")
+        return run, result
+
+    @app.get("/v1/runs/{run_id}/result", tags=["Runs"])
+    def run_result(run_id: str, token: Token):
+        def query(session, actor):
+            _, result = verified_result(session, actor, run_id)
+            return {"result_id": result.id, "verified_at": result.created_at, **result.body}
+
+        return service.read(token, query)
+
+    @app.get("/v1/runs/{run_id}/result/current-pr", tags=["Runs"])
+    def run_result_current_pr(run_id: str, token: Token, response: Response):
+        def query(session, actor):
+            run, result = verified_result(session, actor, run_id)
+            repo = owned(session, Repository, run.repository_id, actor.workspace_id)
+            binding = ci_poller.bindings.get((run.workspace_id, run.repository_id))
+            if not repo.active or (binding and not ci_poller.matches_repository(repo, binding[1])):
+                return None, result.body["draft_pr"]
+            return binding, result.body["draft_pr"]
+
+        binding, draft = service.read(token, query)
+        response.headers["Cache-Control"] = "no-store"
+        with httpx.Client(timeout=5, trust_env=False) as client:
+            return ci_poller.observe_result_pr(client, binding, draft)
+
+    @app.get("/v1/runs/{run_id}/notifications", tags=["Integrations"])
+    def run_notifications(run_id: str, token: Token):
+        def query(session, actor):
+            run = owned(session, Run, run_id, actor.workspace_id)
+            rows = session.execute(
+                select(OutboxEvent, SlackDelivery)
+                .outerjoin(SlackDelivery, SlackDelivery.outbox_id == OutboxEvent.id)
+                .where(
+                    OutboxEvent.workspace_id == run.workspace_id,
+                    OutboxEvent.run_id == run.id,
+                    OutboxEvent.kind == NOTIFICATION,
+                )
+                .order_by(OutboxEvent.created_at, OutboxEvent.id)
+            )
+            return {
+                "notifications": [
+                    {
+                        "delivery_key": outbox.id,
+                        "run_status": outbox.body["status"],
+                        "state": delivery.state if delivery else "PENDING",
+                        "attempts": delivery.attempts if delivery else 0,
+                        "message_id": delivery.message_id if delivery else None,
+                        "reason": delivery.reason if delivery else None,
+                    }
+                    for outbox, delivery in rows
+                ]
+            }
+
+        return service.read(token, query)
 
     @app.get("/v1/runs/{run_id}/plan", tags=["Runs"])
     def plan_get(run_id: str, token: Token):
@@ -344,6 +449,23 @@ def create_app(
             lambda s, a: service.publications.begin(s, a, job_id, data),
         )
 
+    @app.get("/v1/publisher/reconciliations", tags=["Publisher"])
+    def publication_reconciliations(token: Token):
+        return service.read(token, service.publications.reconciliation_queue, role="PUBLISHER")
+
+    @app.post("/v1/publisher/operations/{operation_id}/reconcile", tags=["Publisher"])
+    def publication_reconcile(
+        operation_id: str, data: PublicationReconcile, token: Token, key: Key = None
+    ):
+        return service.write(
+            token,
+            "PUBLISHER",
+            f"publication:{operation_id}:reconcile",
+            key,
+            data.model_dump(),
+            lambda s, a: service.publications.claim_reconciliation(s, a, operation_id, data),
+        )
+
     @app.get("/v1/publisher/operations/{operation_id}/inputs", tags=["Publisher"])
     def publication_inputs(operation_id: str, token: Token):
         return service.read(
@@ -359,7 +481,7 @@ def create_app(
             "PUBLISHER",
             f"publication:{operation_id}:report",
             key,
-            data.model_dump(),
+            data.payload(),
             lambda s, a: service.publications.report(s, a, operation_id, data),
         )
 
@@ -508,6 +630,22 @@ def create_app(
 
         return service.read(token, query)
 
+    @app.get("/v1/candidates/{candidate_id}/ci-history", tags=["Candidates"])
+    def candidate_ci_history(candidate_id: str, token: Token):
+        def query(session, actor):
+            owned(session, Candidate, candidate_id, actor.workspace_id)
+            rows = session.scalars(
+                select(HistoricalCIObservation)
+                .where(
+                    HistoricalCIObservation.workspace_id == actor.workspace_id,
+                    HistoricalCIObservation.candidate_id == candidate_id,
+                )
+                .order_by(HistoricalCIObservation.received_at, HistoricalCIObservation.id)
+            )
+            return {"observations": [row.body | {"received_at": row.received_at} for row in rows]}
+
+        return service.read(token, query)
+
     @app.get("/v1/candidates/{candidate_id}/verification", tags=["Candidates"])
     def verification_get(candidate_id: str, token: Token):
         from .evidence import check_view, finding_view
@@ -651,17 +789,7 @@ def create_app(
                 .order_by(RunEvent.revision)
                 .limit(1000)
             )
-            return {
-                "events": [
-                    {
-                        "revision": e.revision,
-                        "kind": e.kind,
-                        "body": e.body,
-                        "created_at": e.created_at,
-                    }
-                    for e in events
-                ]
-            }
+            return {"events": [event_view(item) for item in events]}
 
         return service.read(token, query)
 
@@ -676,24 +804,63 @@ def create_app(
             lambda s, a: service.cancel(s, a, run_id, data),
         )
 
-    @app.get("/v1/workspaces/{workspace_id}/workers", tags=["Operations"])
-    def workers_get(workspace_id: str, token: Token):
-        def query(session, actor):
-            if workspace_id != actor.workspace_id:
-                raise DomainError(404, "NOT_FOUND")
-            workers = session.scalars(select(Worker).where(Worker.workspace_id == workspace_id))
-            return {
-                "workers": [
-                    {"worker_id": w.id, "name": w.name, "capabilities": w.capabilities}
-                    for w in workers
-                ]
-            }
+    @app.get("/v1/workspaces/{workspace_id}/execution-control", tags=["Operations"])
+    def execution_control_get(workspace_id: str, token: Token):
+        return service.read(token, lambda s, a: service.execution_control(s, a, workspace_id))
 
-        return service.read(token, query)
+    @app.post("/v1/workspaces/{workspace_id}/execution-control", tags=["Operations"])
+    def execution_control_post(
+        workspace_id: str, data: WorkspaceExecutionChange, token: Token, key: Key = None
+    ):
+        return service.write(
+            token,
+            "USER",
+            f"execution-control:{workspace_id}",
+            key,
+            data.model_dump(),
+            lambda s, a: service.set_execution_control(s, a, workspace_id, data),
+            user_access="ADMIN",
+        )
+
+    @app.post(
+        "/v1/workspaces/{workspace_id}/worker-enrollments", status_code=201, tags=["Operations"]
+    )
+    def worker_enrollment(
+        workspace_id: str, data: WorkerEnrollmentRequest, token: Token, response: Response
+    ):
+        response.headers["Cache-Control"] = "no-store"
+        return service.issue_worker_enrollment(token, workspace_id, data)
+
+    @app.post("/v1/workspaces/{workspace_id}/workers/{worker_id}/revoke", tags=["Operations"])
+    def worker_revoke(
+        workspace_id: str, worker_id: str, data: WorkerRevocation, token: Token, key: Key = None
+    ):
+        return service.write(
+            token,
+            "USER",
+            f"workers:{workspace_id}:{worker_id}:revoke",
+            key,
+            data.model_dump(),
+            lambda s, a: service.revoke_worker(s, a, workspace_id, worker_id, data.reason),
+            user_access="ADMIN",
+        )
 
     @app.post("/v1/worker/enroll", status_code=201, tags=["Worker"])
-    def enroll(data: Enroll):
+    def enroll(data: Enroll, response: Response):
+        response.headers["Cache-Control"] = "no-store"
         return service.enroll(data.token, data.name)
+
+    @app.get("/v1/worker/credentials", tags=["Worker"])
+    def worker_credential_metadata(token: Token, response: Response):
+        response.headers["Cache-Control"] = "no-store"
+        return service.read(
+            token, lambda s, a: service.worker_credential_metadata(s, a, token), role="WORKER"
+        )
+
+    @app.post("/v1/worker/credentials/rotate", tags=["Worker"])
+    def rotate_worker_credential(token: Token, response: Response, key: Key = None):
+        response.headers["Cache-Control"] = "no-store"
+        return service.rotate_worker_token(token, key)
 
     @app.post("/v1/worker/claims", tags=["Worker"])
     def claim(data: Claim, token: Token):
@@ -738,6 +905,21 @@ def create_app(
         def authorize():
             with service.db.transaction() as s:
                 actor = service.principal(s, token, "WORKER")
+                receipt = (
+                    s.scalar(
+                        select(IdempotencyRecord.id).where(
+                            IdempotencyRecord.workspace_id == actor.workspace_id,
+                            IdempotencyRecord.principal_id == actor.id,
+                            IdempotencyRecord.operation == f"artifact.upload:{artifact_id}",
+                            IdempotencyRecord.key == key,
+                            IdempotencyRecord.retired_lease_id == lease_id,
+                        )
+                    )
+                    if key
+                    else None
+                )
+                if receipt is not None:
+                    return
                 item = owned(s, Artifact, artifact_id, actor.workspace_id)
                 attempt = s.scalar(
                     select(Attempt).where(

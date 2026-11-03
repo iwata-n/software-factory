@@ -127,3 +127,19 @@ def test_incomplete_atomic_write_is_replaced_safely_after_restart(tmp_path):
         temporary.chmod(0o600)
         journal.save({"phase": "RESULT"})
     assert journal.read() == {"phase": "RESULT"} and not temporary.exists()
+
+
+def test_emergency_stop_after_lost_begin_response_sends_no_provider_requests(publication, tmp_path):
+    agent, trace = supervisor(publication, tmp_path / "publisher-state", lose="/begin")
+    with pytest.raises(PublisherUnavailable):
+        agent.run_once()
+    world = publication.world
+    response = world.post(
+        f"/v1/workspaces/{world.workspace_id}/execution-control",
+        {"stopped": True, "expected_revision": 0, "reason": "stop before dispatch"},
+    )
+    assert response.status_code == 200
+    assert agent.run_once()["state"] == "BLOCKED"
+    assert trace["calls"] == 0
+    assert agent.journal.read() is None
+    assert world.run()["status"] == "CANCELLED"

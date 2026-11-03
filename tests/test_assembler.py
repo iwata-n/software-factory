@@ -113,3 +113,99 @@ def test_real_assembler_refuses_untrusted_changes(source_bundle, runner, attack)
     with pytest.raises(RunnerError) as failed:
         runner.execute(request(source_bundle, patch))
     assert failed.value.category == "POLICY"
+
+
+def test_unconfirmed_cleanup_quarantines_real_managed_runner(source_bundle, runner, monkeypatch):
+    isolated = DockerRunner(runner.image_digest)
+    docker = isolated.docker
+    pending = []
+
+    def lose_remove(*args, **kwargs):
+        if args[:2] == ("rm", "--force"):
+            name = args[2]
+            inspect = docker("inspect", name, "--format", "{{.State.Status}}", timeout=5)
+            assert inspect.returncode == 0 and inspect.stdout.strip() == b"exited"
+            pending.append(name)
+            return subprocess.CompletedProcess(args, 1, b"", b"injected Docker remove failure")
+        return docker(*args, **kwargs)
+
+    monkeypatch.setattr(isolated, "docker", lose_remove)
+    try:
+        with pytest.raises(RunnerError, match="^STOP_UNCONFIRMED$"):
+            isolated.execute(request(source_bundle, PATCH))
+        assert len(pending) == 1
+        with pytest.raises(RunnerError, match="^STOP_UNCONFIRMED$"):
+            isolated.execute(request(source_bundle, PATCH))
+        assert len(pending) == 1
+    finally:
+        for name in pending:
+            assert docker("rm", "--force", name, timeout=7).returncode == 0
+
+
+def test_restart_refuses_uninspectable_managed_container(runner, tmp_path, monkeypatch):
+    monkeypatch.setenv("FACTORY_RUNNER_STATE_ROOT", str(tmp_path / "state"))
+    previous = DockerRunner(runner.image_digest)
+    docker = DockerRunner.docker
+    started = docker(
+        "run",
+        "--detach",
+        "--network",
+        "none",
+        "--label",
+        f"factory.namespace={previous.namespace}",
+        "--label",
+        f"factory.owner={previous.owner}",
+        "--entrypoint",
+        "sleep",
+        runner.image_digest,
+        "60",
+        timeout=10,
+    )
+    assert started.returncode == 0, started.stderr.decode()
+    container = started.stdout.decode().strip()
+    del previous
+
+    def lose_inspect(*args, **kwargs):
+        if args[0] == "inspect" and container.startswith(args[1]):
+            return subprocess.CompletedProcess(args, 1, b"", b"injected inspect failure")
+        return docker(*args, **kwargs)
+
+    try:
+        with monkeypatch.context() as fault:
+            fault.setattr(DockerRunner, "docker", staticmethod(lose_inspect))
+            with pytest.raises(RunnerError, match="^ORPHAN_STOP_UNCONFIRMED$"):
+                DockerRunner(runner.image_digest)
+        DockerRunner(runner.image_digest)
+        listing = docker("ps", "-aq", "--filter", f"id={container}", timeout=5)
+        assert listing.returncode == 0 and not listing.stdout.strip()
+    finally:
+        docker("rm", "--force", container, timeout=7)
+
+
+def test_candidate_cleanup_does_not_mask_unconfirmed_stop(source_bundle, runner, monkeypatch):
+    isolated = DockerRunner(runner.image_digest)
+    docker = isolated.docker
+    containers = []
+    volumes = []
+
+    def fail_cleanup(*args, **kwargs):
+        if args[:2] == ("rm", "--force") and not args[2].startswith("factory-volume-"):
+            containers.append(args[2])
+            return subprocess.CompletedProcess(args, 1, b"", b"injected Docker remove failure")
+        if args[:2] == ("volume", "rm"):
+            volumes.append(args[2])
+        return docker(*args, **kwargs)
+
+    monkeypatch.setattr(isolated, "docker", fail_cleanup)
+    try:
+        with pytest.raises(RunnerError, match="^STOP_UNCONFIRMED$"):
+            isolated.execute_candidate(
+                request(source_bundle, PATCH), base64.b64decode(source_bundle["archive"])
+            )
+        assert len(containers) == len(volumes) == 1
+        assert docker("volume", "inspect", volumes[0], timeout=5).returncode == 0
+    finally:
+        for name in containers:
+            assert docker("rm", "--force", name, timeout=7).returncode == 0
+        for volume in volumes:
+            assert docker("volume", "rm", volume, timeout=7).returncode == 0

@@ -2,13 +2,13 @@
   "schema_version": 1,
   "github_repository": "iwata-n/software-factory",
   "jira": {
-    "site": "https://pokeca-chips.atlassian.net",
-    "project_key": "SWF",
-    "board_id": 34
+    "site": null,
+    "project_key": null,
+    "board_id": null
   },
   "slack": {
-    "workspace": "iwata-home",
-    "channel_id": "C0B4FJX81TM"
+    "workspace": null,
+    "channel_id": null
   },
   "agent": {
     "engine": "codex-cli",

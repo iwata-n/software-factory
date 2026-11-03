@@ -7,7 +7,7 @@ from collections.abc import Callable
 from contextvars import ContextVar
 from typing import TypeVar
 
-from sqlalchemy import select
+from sqlalchemy import and_, or_, select
 from sqlalchemy.orm import Session
 
 from .contracts import (
@@ -36,6 +36,7 @@ from .models import (
     PlanVersion,
     Principal,
     Project,
+    PublicationOperation,
     Repository,
     Run,
     RunEvent,
@@ -55,8 +56,12 @@ from .resolver import (
     valid_sha,
 )
 from .security import redact
+from .slack_delivery import enqueue_result
+from .worker_credentials import rotated_token
 
 LEASE_SECONDS = 90
+WORKER_TOKEN_SECONDS = 24 * 60 * 60
+WORKER_ROTATION_GRACE_SECONDS = 60
 T = TypeVar("T")
 request_secrets: ContextVar[tuple[str, ...]] = ContextVar("request_secrets", default=())
 
@@ -109,6 +114,8 @@ def run_view(run: Run) -> dict:
         "phase": run.phase,
         "state_revision": run.state_revision,
         "stop_reason": run.stop_reason,
+        "finished_at": run.finished_at,
+        "evidence_expired_at": run.evidence_expired_at,
         "base_sha": run.base_sha,
         "snapshot": run.snapshot,
         "budget_microusd": run.budget_microusd,
@@ -122,17 +129,19 @@ def run_view(run: Run) -> dict:
     }
 
 
-def event(session: Session, run: Run, kind: str, body: dict) -> None:
+def event(session: Session, run: Run, kind: str, body: dict) -> float:
     run.state_revision += 1
+    created_at = db_now(session)
     fields = dict(
         workspace_id=run.workspace_id,
         run_id=run.id,
         kind=kind,
         body=scrub(body),
-        created_at=db_now(session),
+        created_at=created_at,
     )
     session.add(RunEvent(**fields, revision=run.state_revision))
     session.add(OutboxEvent(**fields))
+    return created_at
 
 
 def enqueue(
@@ -186,6 +195,7 @@ def transition(
     depends_on=None,
 ) -> None:
     previous_phase = run.phase
+    previous_status = run.status
     decision = decide(
         RunSnapshot(run.status, run.phase, run.stop_reason), DomainEvent(kind, reason)
     )
@@ -210,7 +220,11 @@ def transition(
             payload=payload,
             step_key=step_key,
         )
-    event(session, run, kind, {"reason": decision.reason, "phase": run.phase})
+    recorded_at = event(session, run, kind, {"reason": decision.reason, "phase": run.phase})
+    if run.status in TERMINAL and previous_status not in TERMINAL:
+        run.finished_at = recorded_at
+    if run.status != previous_status and run.status in {"FAILED", "BLOCKED"}:
+        enqueue_result(session, run)
 
 
 class Service:
@@ -253,18 +267,121 @@ class Service:
         self.publications = PublicationCommands(self)
 
     def principal(self, session: Session, token: str, role: str) -> Principal:
-        actor = session.scalar(select(Principal).where(Principal.token_hash == token_hash(token)))
+        hashed = token_hash(token)
+        actor = session.scalar(
+            select(Principal)
+            .where(or_(Principal.token_hash == hashed, Principal.previous_token_hash == hashed))
+            .execution_options(populate_existing=True)
+        )
         if actor is None or not actor.active:
+            raise DomainError(401, "UNAUTHENTICATED")
+        expiry = (
+            actor.token_expires_at
+            if actor.token_hash == hashed
+            else actor.previous_token_expires_at
+        )
+        if expiry is not None and db_now(session) >= expiry:
             raise DomainError(401, "UNAUTHENTICATED")
         if actor.role != role:
             raise DomainError(403, "PRINCIPAL_ROLE_DENIED")
         return actor
+
+    @staticmethod
+    def require_user_access(actor: Principal, access: str) -> None:
+        if actor.role != "USER" or actor.user_access not in (
+            {"ADMIN"} if access == "ADMIN" else {"ADMIN", "OPERATOR"}
+        ):
+            raise DomainError(403, "USER_ACCESS_DENIED")
 
     def lock_workspace(self, session: Session, workspace_id: str) -> None:
         # Initial single-slot deployment deliberately serializes tenant mutations.
         # This mutex covers idempotency, worker slots, run slots and reservations.
         # Replace it with finer locks only together with equivalent concurrency tests.
         session.scalar(select(Workspace).where(Workspace.id == workspace_id).with_for_update())
+
+    def locked_principal(self, session: Session, token: str, role: str) -> Principal:
+        actor = self.principal(session, token, role)
+        self.lock_workspace(session, actor.workspace_id)
+        # Recheck the credential itself after waiting for revocation or rotation.
+        return self.principal(session, token, role)
+
+    @staticmethod
+    def execution_control(session, actor, workspace_id):
+        if workspace_id != actor.workspace_id:
+            raise DomainError(404, "NOT_FOUND")
+        workspace = session.get(Workspace, workspace_id)
+        return {
+            "workspace_id": workspace.id,
+            "stopped": workspace.execution_stopped,
+            "revision": workspace.execution_stop_revision,
+        }
+
+    def set_execution_control(self, session, actor, workspace_id, data):
+        current = self.execution_control(session, actor, workspace_id)
+        if data.expected_revision != current["revision"]:
+            raise DomainError(409, "EXECUTION_CONTROL_REVISION_CONFLICT")
+        if data.stopped == current["stopped"]:
+            raise DomainError(409, "EXECUTION_CONTROL_ALREADY_SET")
+        workspace = session.get(Workspace, workspace_id)
+        if not data.stopped and workspace.restore_reconciliation_required:
+            unresolved = session.scalar(
+                select(PublicationOperation.id)
+                .where(
+                    PublicationOperation.workspace_id == workspace_id,
+                    PublicationOperation.state.in_(["IN_FLIGHT", "UNKNOWN", "RECONCILING"]),
+                )
+                .limit(1)
+            )
+            if unresolved:
+                raise DomainError(409, "RESTORE_RECONCILIATION_REQUIRED")
+            workspace.restore_reconciliation_required = False
+        workspace.execution_stopped = data.stopped
+        workspace.execution_stop_revision += 1
+        if data.stopped:
+            dispatched = select(Job.run_id).where(
+                Job.workspace_id == workspace_id, Job.state == "DISPATCHING"
+            )
+            active = list(
+                session.scalars(
+                    select(Run).where(
+                        Run.workspace_id == workspace_id,
+                        Run.status.not_in([*TERMINAL, "CANCELLING"]),
+                        or_(
+                            Run.status == "RUNNING",
+                            and_(
+                                Run.status == "WAITING_EXTERNAL",
+                                Run.phase.in_(["WAIT_CI", "FINAL_GATE_READY", "PUBLISH_UNKNOWN"]),
+                            ),
+                            Run.id.in_(dispatched),
+                        ),
+                    )
+                )
+            )
+            for run in active:
+                self.cancel(
+                    session,
+                    actor,
+                    run.id,
+                    Cancel(expected_run_revision=run.state_revision, reason=data.reason),
+                    emergency=True,
+                )
+        session.add(
+            AuditEvent(
+                workspace_id=workspace_id,
+                actor_id=actor.id,
+                operation="workspace.execution.stop"
+                if data.stopped
+                else "workspace.execution.release",
+                body={
+                    "workspace_id": workspace_id,
+                    "reason": data.reason,
+                    "before_revision": current["revision"],
+                    "after_revision": workspace.execution_stop_revision,
+                },
+                created_at=db_now(session),
+            )
+        )
+        return self.execution_control(session, actor, workspace_id)
 
     def read(self, token: str, fn: Callable[[Session, Principal], dict], *, role="USER") -> dict:
         with self.db.transaction() as session:
@@ -279,15 +396,20 @@ class Service:
         key: str | None,
         body: dict,
         fn: Callable[[Session, Principal], dict],
+        *,
+        user_access: str = "OPERATOR",
+        replay_check: Callable[[dict], None] | None = None,
     ) -> dict:
         with self.db.transaction() as session:
             actor = self.principal(session, token, role)
+            if role == "USER":
+                self.require_user_access(actor, user_access)
             if not key or len(key) > 200 or redact(key, (token,)) != key:
                 raise DomainError(422, "IDEMPOTENCY_KEY_REQUIRED")
             self.lock_workspace(session, actor.workspace_id)
-            session.refresh(actor)  # Revocation wins even if it raced the initial lookup.
-            if not actor.active:
-                raise DomainError(401, "UNAUTHENTICATED")
+            actor = self.principal(session, token, role)
+            if role == "USER":
+                self.require_user_access(actor, user_access)
             if role in {"USER", "PUBLISHER"}:
                 cleaned = (
                     scrub_project_body(body, (token,))
@@ -306,6 +428,8 @@ class Service:
                 )
             )
             if previous:
+                if replay_check:
+                    replay_check(previous.response)
                 if previous.request_hash != request_hash:
                     raise DomainError(409, "IDEMPOTENCY_CONFLICT")
                 return previous.response
@@ -420,6 +544,7 @@ class Service:
             )
         )
         task.latest_spec_version = version
+        task.retention_touched_at = db_now(session)
         return {"task_id": task.id, "spec_version": version, "spec_hash": digest(body)}
 
     def new_spec(
@@ -439,6 +564,7 @@ class Service:
         operation, body = f"runs:{task_id}", data.model_dump()
         with self.db.transaction() as session:
             actor = self.principal(session, token, "USER")
+            self.require_user_access(actor, "OPERATOR")
             if not key or len(key) > 200 or redact(key, (token,)) != key:
                 raise DomainError(422, "IDEMPOTENCY_KEY_REQUIRED")
             previous = session.scalar(
@@ -594,6 +720,7 @@ class Service:
                         if name in source_details
                     }
                 )
+        task.retention_touched_at = db_now(session)
         run = Run(
             workspace_id=actor.workspace_id,
             task_id=task.id,
@@ -648,6 +775,58 @@ class Service:
             elif job.state == "PENDING":
                 job.state = "READY"
 
+    def issue_worker_enrollment(self, token, workspace_id, data):
+        with self.db.transaction() as session:
+            actor = self.locked_principal(session, token, "USER")
+            self.require_user_access(actor, "ADMIN")
+            if workspace_id != actor.workspace_id:
+                raise DomainError(404, "NOT_FOUND")
+            now = db_now(session)
+            secret = issue_token()
+            enrollment = Enrollment(
+                workspace_id=workspace_id,
+                token_hash=token_hash(secret),
+                capabilities=[*data.kinds, f"adapter:{data.adapter}"]
+                + (["usage:trusted"] if data.usage_authority else []),
+                managed=data.managed,
+                expires_at=now + data.ttl_seconds,
+            )
+            session.add(enrollment)
+            session.flush()
+            session.add(
+                AuditEvent(
+                    workspace_id=workspace_id,
+                    actor_id=actor.id,
+                    operation="worker.enrollment.issued",
+                    body={"enrollment_id": enrollment.id, "expires_at": enrollment.expires_at},
+                    created_at=now,
+                )
+            )
+            return {"enrollment_token": secret, "expires_at": enrollment.expires_at}
+
+    def revoke_worker(self, session, actor, workspace_id, worker_id, reason):
+        if workspace_id != actor.workspace_id:
+            raise DomainError(404, "NOT_FOUND")
+        owned(session, Worker, worker_id, workspace_id)
+        principal = owned(session, Principal, worker_id, workspace_id)
+        before = principal.active
+        principal.active = False
+        session.add(
+            AuditEvent(
+                workspace_id=workspace_id,
+                actor_id=actor.id,
+                operation="worker.credential.revoke",
+                body={
+                    "worker_id": worker_id,
+                    "before_active": before,
+                    "after_active": False,
+                    "reason": reason,
+                },
+                created_at=db_now(session),
+            )
+        )
+        return {"worker_id": worker_id, "revoked": True}
+
     def enroll(self, enrollment_token: str, name: str) -> dict:
         with self.db.transaction() as session:
             enrollment = session.scalar(
@@ -667,6 +846,7 @@ class Service:
                     workspace_id=enrollment.workspace_id,
                     role="WORKER",
                     token_hash=token_hash(secret),
+                    token_expires_at=now + WORKER_TOKEN_SECONDS,
                 )
             )
             session.flush()
@@ -680,17 +860,71 @@ class Service:
                 )
             )
             enrollment.consumed_at = now
-            return {"worker_id": worker_id, "worker_token": secret, "protocol_version": 1}
+            return {
+                "worker_id": worker_id,
+                "worker_token": secret,
+                "token_expires_at": now + WORKER_TOKEN_SECONDS,
+                "protocol_version": 1,
+            }
+
+    def worker_credential_metadata(self, session, actor, token):
+        current = actor.token_hash == token_hash(token)
+        expires = actor.token_expires_at if current else actor.previous_token_expires_at
+        return {
+            "worker_id": actor.id,
+            "current": current,
+            "expires_in_seconds": max(0, expires - db_now(session)) if expires is not None else 0,
+        }
+
+    def rotate_worker_token(self, token: str, key: str | None) -> dict:
+        with self.db.transaction() as session:
+            actor = self.locked_principal(session, token, "WORKER")
+            if not key or len(key) > 200 or redact(key, (token,)) != key:
+                raise DomainError(422, "IDEMPOTENCY_KEY_REQUIRED")
+            # A lost response can be replayed during grace without storing either secret.
+            secret = rotated_token(token, key)
+            if actor.token_hash != token_hash(token):
+                if actor.token_hash != token_hash(secret):
+                    raise DomainError(409, "WORKER_ROTATION_REQUIRES_CURRENT_TOKEN")
+                return self.worker_credential(actor, secret)
+            now = db_now(session)
+            if (actor.previous_token_expires_at or 0) > now:
+                raise DomainError(409, "WORKER_ROTATION_GRACE_ACTIVE")
+            actor.previous_token_hash = actor.token_hash
+            actor.previous_token_expires_at = now + WORKER_ROTATION_GRACE_SECONDS
+            actor.token_hash = token_hash(secret)
+            actor.token_expires_at = now + WORKER_TOKEN_SECONDS
+            session.add(
+                AuditEvent(
+                    workspace_id=actor.workspace_id,
+                    actor_id=actor.id,
+                    operation="worker.credential.rotate",
+                    body={
+                        "worker_id": actor.id,
+                        "previous_token_expires_at": actor.previous_token_expires_at,
+                        "token_expires_at": actor.token_expires_at,
+                    },
+                    created_at=now,
+                )
+            )
+            return self.worker_credential(actor, secret)
+
+    @staticmethod
+    def worker_credential(actor: Principal, secret: str) -> dict:
+        return {
+            "worker_id": actor.id,
+            "worker_token": secret,
+            "token_expires_at": actor.token_expires_at,
+            "previous_token_expires_at": actor.previous_token_expires_at,
+        }
 
     def claim(self, token: str) -> dict | None:
         with self.db.transaction() as session:
-            actor = self.principal(session, token, "WORKER")
-            self.lock_workspace(session, actor.workspace_id)
-            session.refresh(actor)
-            if not actor.active:
-                raise DomainError(401, "UNAUTHENTICATED")
+            actor = self.locked_principal(session, token, "WORKER")
             worker = owned(session, Worker, actor.id, actor.workspace_id)
             self.reconcile_workspace(session, actor.workspace_id)
+            if session.get(Workspace, actor.workspace_id).execution_stopped:
+                return None
             self.refresh_dependencies(session, actor.workspace_id)
             now = db_now(session)
             busy = session.scalar(
@@ -869,11 +1103,7 @@ class Service:
 
     def heartbeat(self, token: str, lease_id: str, fence: int) -> dict:
         with self.db.transaction() as session:
-            actor = self.principal(session, token, "WORKER")
-            self.lock_workspace(session, actor.workspace_id)
-            session.refresh(actor)
-            if not actor.active:
-                raise DomainError(401, "UNAUTHENTICATED")
+            actor = self.locked_principal(session, token, "WORKER")
             attempt, _, run = self.lease(session, actor, lease_id, fence)
             now = db_now(session)
             attempt.heartbeat_at = now
@@ -934,7 +1164,7 @@ class Service:
             attempt.stop_confirmation = "WORKER_REPORTED_STOP"
             attempt.result = scrub(data.model_dump())
             if run.status == RunStatus.CANCELLING:
-                transition(session, run, "EXECUTION_RIGHT_ENDED")
+                self.finish_cancellation(session, run)
             return {"accepted": True, "attempt_id": attempt.id, "run": run_view(run)}
         if run.status not in {RunStatus.RUNNING, RunStatus.CANCELLING}:
             raise DomainError(409, "INVALID_RUN_STATE")
@@ -960,7 +1190,7 @@ class Service:
         attempt.stop_confirmation = "WORKER_REPORTED_STOP"
         if run.status == RunStatus.CANCELLING:
             attempt.state, job.state = "CANCELLED", "CANCELLED"
-            transition(session, run, "EXECUTION_RIGHT_ENDED")
+            self.finish_cancellation(session, run)
         else:
             attempt.state, job.state = "SUCCEEDED", "SUCCEEDED"
             if not usage_known:
@@ -1052,14 +1282,22 @@ class Service:
         attempt, job, run = self.lease(session, actor, lease_id, data.fence)
         attempt.state = "FAILED"
         attempt.result = scrub(data.model_dump())
-        attempt.stop_confirmation = "WORKER_REPORTED_STOP"
+        stop_unconfirmed = data.reason == "STOP_UNCONFIRMED"
+        attempt.stop_confirmation = (
+            "STOP_UNCONFIRMED" if stop_unconfirmed else "WORKER_REPORTED_STOP"
+        )
+        if stop_unconfirmed:
+            self.revoke_worker(session, actor, actor.workspace_id, actor.id, data.reason)
         usage_known = self.settle(session, run, attempt, data.usage_microusd)
         allowed = self.repository_allowed(session, run)
         if run.status == RunStatus.CANCELLING:
             job.state = "CANCELLED"
-            transition(session, run, "EXECUTION_RIGHT_ENDED")
+            self.finish_cancellation(session, run)
         elif not allowed:
             job.state = "CANCELLED"
+        elif stop_unconfirmed:
+            job.state = "FAILED"
+            transition(session, run, "BLOCKED", "STOP_UNCONFIRMED")
         elif not usage_known:
             job.state = "BLOCKED"
             run.wait_context = {"kind": "COST_BLOCKED", "job_id": job.id, "cause": "USAGE_UNKNOWN"}
@@ -1087,12 +1325,25 @@ class Service:
             transition(session, run, "BLOCKED", scrub(f"{data.category}: {data.reason}"))
         return {"accepted": True, "attempt_id": attempt.id, "run": run_view(run)}
 
+    @staticmethod
+    def finish_cancellation(session, run):
+        if not session.scalar(
+            select(Job.id)
+            .where(
+                Job.workspace_id == run.workspace_id, Job.run_id == run.id, Job.state == "LEASED"
+            )
+            .limit(1)
+        ):
+            transition(session, run, "EXECUTION_RIGHT_ENDED")
+
     def cancel(
         self,
         session: Session,
         actor: Principal,
         run_id: str,
         data: Cancel,
+        *,
+        emergency: bool = False,
     ) -> dict:
         run = owned(session, Run, run_id, actor.workspace_id)
         if run.state_revision != data.expected_run_revision:
@@ -1116,21 +1367,17 @@ class Service:
             )
         ):
             request.status = "INVALIDATED"
-        transition(session, run, "CANCEL_REQUESTED")
+        transition(session, run, "EMERGENCY_STOP_REQUESTED" if emergency else "CANCEL_REQUESTED")
         event(session, run, "USER_CANCEL_REASON", {"principal_id": actor.id, "reason": data.reason})
-        active = False
         for job in session.scalars(
             select(Job).where(
                 Job.workspace_id == actor.workspace_id,
                 Job.run_id == run.id,
             )
         ):
-            if job.state == "LEASED":
-                active = True
-            elif job.state in {"READY", "RETRY_WAIT", "PENDING"}:
+            if job.state in {"READY", "RETRY_WAIT", "PENDING"}:
                 job.state = "CANCELLED"
-        if not active:
-            transition(session, run, "EXECUTION_RIGHT_ENDED")
+        self.finish_cancellation(session, run)
         session.add(
             AuditEvent(
                 workspace_id=actor.workspace_id,
@@ -1180,7 +1427,7 @@ class Service:
             )
             if run.status == RunStatus.CANCELLING:
                 job.state = "CANCELLED"
-                transition(session, run, "EXECUTION_RIGHT_ENDED")
+                self.finish_cancellation(session, run)
             elif self.repository_allowed(session, run) and run.status not in TERMINAL:
                 self.retry_or_fail(session, job, run)
             else:
@@ -1207,11 +1454,7 @@ class Service:
 
     def worker_events(self, token: str, lease_id: str, data: WorkerEventBatch) -> dict:
         with self.db.transaction() as session:
-            actor = self.principal(session, token, "WORKER")
-            self.lock_workspace(session, actor.workspace_id)
-            session.refresh(actor)
-            if not actor.active:
-                raise DomainError(401, "UNAUTHENTICATED")
+            actor = self.locked_principal(session, token, "WORKER")
             attempt, _, run = self.lease(session, actor, lease_id, data.fence)
             receipts = []
             for item in data.events:

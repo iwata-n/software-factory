@@ -1,4 +1,5 @@
 import copy
+import json
 import subprocess
 from pathlib import Path
 
@@ -99,6 +100,7 @@ def backend(publication, tmp_path):
         return {
             "id": 2345,
             "number": number,
+            "body": state.get("body"),
             "draft": True,
             "state": "open",
             "html_url": "https://github.com/iwata-n/software-factory/pull/123",
@@ -128,6 +130,9 @@ def backend(publication, tmp_path):
             if request.method == "POST":
                 assert not state["pulls"]
                 state["pulls"].append(123)
+                state["body"] = json.loads(request.content)["body"]
+                if state.get("crash_after_create"):
+                    raise RuntimeError("Publisher stopped after PR creation")
                 return httpx.Response(201, json=pull(123))
             return httpx.Response(200, json=[pull(n) for n in state["pulls"]])
         if request.url.path == prefix + "/pulls/123":

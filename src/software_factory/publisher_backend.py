@@ -16,6 +16,7 @@ import httpx
 
 from .candidate_mount import readonly_tar
 from .contracts import PublishedDraft, digest, path_within
+from .resolver import valid_sha
 from .sandbox import RunnerError
 from .source_runner import SourcePolicy
 
@@ -23,7 +24,8 @@ from .source_runner import SourcePolicy
 class PublicationError(Exception):
     def __init__(self, reason, *, unknown=False, observed_head=None):
         super().__init__(reason)
-        self.reason, self.unknown, self.observed_head = reason, unknown, observed_head
+        self.reason, self.unknown = reason, unknown
+        self.observed_head = observed_head if valid_sha(observed_head) else None
 
 
 def publication_target(operation, policy):
@@ -385,6 +387,57 @@ class GitHubDraftPublisher:
                     ) from None
             time.sleep(2**attempt)
 
+    def _operation_marker(self, operation):
+        return "<!-- factory-operation:" + operation["operation_key"] + " -->"
+
+    def _run_marker(self, target):
+        return "<!-- factory-run:" + target["run_id"] + " -->"
+
+    def _require_pull_identity(self, value, operation):
+        target = operation["target"]
+        markers = (value.get("body") or "").splitlines()
+        if target["pull_request_number"] is not None:
+            matches = value["number"] == target["pull_request_number"] and str(
+                value["id"]
+            ) == target.get("pull_request_external_id")
+        else:
+            matches = markers.count(self._operation_marker(operation)) == 1
+        if not matches or markers.count(self._run_marker(target)) != 1:
+            raise PublicationError("PR_CONFLICT")
+
+    def reconcile(self, operation):
+        """Resolve an uncertain write with one bounded, read-only provider probe."""
+        self.trace.clear()
+        target = publication_target(operation, self.policy)
+        pulls = self._request(
+            "GET",
+            target,
+            "/pulls",
+            params={
+                "state": "all",
+                "head": target["repository"].split("/")[0] + ":" + target["head_ref"],
+                "per_page": 100,
+            },
+        )
+        if not isinstance(pulls, list) or len(pulls) != 1:
+            raise PublicationError("PUBLISH_UNKNOWN", unknown=True)
+        number = pulls[0]["number"]
+        if type(number) is not int or number < 1:
+            raise PublicationError("PR_CONFLICT")
+        pull = self._request("GET", target, "/pulls/" + str(number))
+        if pull["id"] != pulls[0]["id"] or pull["number"] != number:
+            raise PublicationError("PR_CONFLICT")
+        self._require_pull_identity(pull, operation)
+        result = self._normalize(pull, target)
+        if result["url"] != f"https://github.com/{result['repository']}/pull/{number}":
+            raise PublicationError("PR_CONFLICT")
+        if self.ref(target, target["base_ref"]) != result["base_sha"]:
+            raise PublicationError("BASE_CHANGED")
+        observed = self.ref(target, target["head_ref"])
+        if observed != result["head_sha"]:
+            raise PublicationError("REMOTE_HEAD_CONFLICT", observed_head=observed)
+        return result
+
     def publish(self, inputs):
         self.trace.clear()
         operation = inputs["operation"]
@@ -415,6 +468,8 @@ class GitHubDraftPublisher:
             raise PublicationError("PR_CONFLICT")
         if pulls and (pulls[0].get("draft") is not True or pulls[0].get("state") != "open"):
             raise PublicationError("PR_CONFLICT")
+        if pulls:
+            self._require_pull_identity(pulls[0], operation)
         with self.git.prepare(inputs) as root:
             if head != target["candidate"]["head_sha"]:
                 self.git.push(root, operation)
@@ -440,7 +495,9 @@ class GitHubDraftPublisher:
                     + "Candidate `"
                     + target["candidate"]["head_sha"]
                     + "` passed Local Gate.\n\n"
-                    "<!-- factory-run:" + target["run_id"] + " -->",
+                    + self._run_marker(target)
+                    + "\n"
+                    + self._operation_marker(operation),
                 },
             )
             number = result["number"]
