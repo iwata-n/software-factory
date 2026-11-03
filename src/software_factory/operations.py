@@ -79,8 +79,8 @@ def worker_view(worker, credential, attempt, now):
                 if now - attempt.heartbeat_at >= HEARTBEAT_STALE_SECONDS
                 else "LEASED"
             )
-        elif attempt.stop_confirmation == "WORKER_REPORTED_STOP":
-            lease_status = "WORKER_REPORTED_STOP"
+        elif attempt.stop_confirmation in {"WORKER_REPORTED_STOP", "STOP_UNCONFIRMED"}:
+            lease_status = attempt.stop_confirmation
         else:
             lease_status = "LEASE_ENDED"
     return {

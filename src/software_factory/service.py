@@ -1282,7 +1282,12 @@ class Service:
         attempt, job, run = self.lease(session, actor, lease_id, data.fence)
         attempt.state = "FAILED"
         attempt.result = scrub(data.model_dump())
-        attempt.stop_confirmation = "WORKER_REPORTED_STOP"
+        stop_unconfirmed = data.reason == "STOP_UNCONFIRMED"
+        attempt.stop_confirmation = (
+            "STOP_UNCONFIRMED" if stop_unconfirmed else "WORKER_REPORTED_STOP"
+        )
+        if stop_unconfirmed:
+            self.revoke_worker(session, actor, actor.workspace_id, actor.id, data.reason)
         usage_known = self.settle(session, run, attempt, data.usage_microusd)
         allowed = self.repository_allowed(session, run)
         if run.status == RunStatus.CANCELLING:
@@ -1290,6 +1295,9 @@ class Service:
             self.finish_cancellation(session, run)
         elif not allowed:
             job.state = "CANCELLED"
+        elif stop_unconfirmed:
+            job.state = "FAILED"
+            transition(session, run, "BLOCKED", "STOP_UNCONFIRMED")
         elif not usage_known:
             job.state = "BLOCKED"
             run.wait_context = {"kind": "COST_BLOCKED", "job_id": job.id, "cause": "USAGE_UNKNOWN"}

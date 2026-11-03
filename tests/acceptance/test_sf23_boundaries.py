@@ -474,3 +474,38 @@ def test_worker_recovers_rotation_after_lost_response_and_grace_expiry(world, cl
         assert len(rotations) == 1
     assert world.claim(token=rotations[0]).status_code == 200
     assert path.stat().st_mode & 0o777 == 0o600
+
+
+@pytest.mark.ac("SF-21-AC05", "SF-23-AC02")
+def test_unconfirmed_stop_revokes_worker_across_control_plane_restart(world):
+    lease = world.claim().json()["lease"]
+    result = world.post(
+        f"/v1/worker/leases/{lease['id']}/fail",
+        {"fence": lease["fence"], "category": "INFRASTRUCTURE", "reason": "STOP_UNCONFIRMED"},
+        token=world.worker_token,
+    )
+    assert result.status_code == 200, result.text
+    assert result.json()["run"]["status"] == "BLOCKED"
+    assert result.json()["run"]["stop_reason"] == "STOP_UNCONFIRMED"
+    with TestClient(create_app(world.database)) as restarted:
+        assert (
+            restarted.post(
+                "/v1/worker/claims",
+                json={"protocol_version": 1, "wait_seconds": 0},
+                headers={"Authorization": f"Bearer {world.worker_token}"},
+            ).status_code
+            == 401
+        )
+        response = restarted.get(
+            f"/v1/workspaces/{world.workspace_id}/workers",
+            headers={"Authorization": f"Bearer {world.user_token}"},
+        )
+    (worker,) = response.json()["workers"]
+    assert worker["credential_status"] == "REVOKED"
+    assert worker["lease_status"] == worker["stop_confirmation"] == "STOP_UNCONFIRMED"
+    with world.database.transaction() as session:
+        record = session.scalar(
+            select(AuditEvent).where(AuditEvent.operation == "worker.credential.revoke")
+        )
+        assert record.actor_id == worker["worker_id"]
+        assert record.body["reason"] == "STOP_UNCONFIRMED"

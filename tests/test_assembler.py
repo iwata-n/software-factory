@@ -113,3 +113,30 @@ def test_real_assembler_refuses_untrusted_changes(source_bundle, runner, attack)
     with pytest.raises(RunnerError) as failed:
         runner.execute(request(source_bundle, patch))
     assert failed.value.category == "POLICY"
+
+
+def test_unconfirmed_cleanup_quarantines_real_managed_runner(source_bundle, runner, monkeypatch):
+    isolated = DockerRunner(runner.image_digest)
+    docker = isolated.docker
+    pending = []
+
+    def lose_remove(*args, **kwargs):
+        if args[:2] == ("rm", "--force"):
+            name = args[2]
+            inspect = docker("inspect", name, "--format", "{{.State.Status}}", timeout=5)
+            assert inspect.returncode == 0 and inspect.stdout.strip() == b"exited"
+            pending.append(name)
+            return subprocess.CompletedProcess(args, 1, b"", b"injected Docker remove failure")
+        return docker(*args, **kwargs)
+
+    monkeypatch.setattr(isolated, "docker", lose_remove)
+    try:
+        with pytest.raises(RunnerError, match="^STOP_UNCONFIRMED$"):
+            isolated.execute(request(source_bundle, PATCH))
+        assert len(pending) == 1
+        with pytest.raises(RunnerError, match="^STOP_UNCONFIRMED$"):
+            isolated.execute(request(source_bundle, PATCH))
+        assert len(pending) == 1
+    finally:
+        for name in pending:
+            assert docker("rm", "--force", name, timeout=7).returncode == 0
