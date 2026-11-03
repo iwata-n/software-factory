@@ -35,6 +35,8 @@ class Workspace(Base):
     __tablename__ = "workspaces"
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
     name: Mapped[str] = mapped_column(String(200))
+    execution_stopped: Mapped[bool] = mapped_column(Boolean, default=False, server_default="false")
+    execution_stop_revision: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
 
 
 class Principal(Tenant, Base):

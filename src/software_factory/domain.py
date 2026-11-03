@@ -58,8 +58,11 @@ def decide(
         raise ValueError("unsupported workflow version")
     if run.status in TERMINAL:
         return Decision(run.status, run.phase, run.reason)
+    if event.kind == "EMERGENCY_STOP_REQUESTED":
+        return Decision(RunStatus.CANCELLING, run.phase, "WORKSPACE_EMERGENCY_STOP")
     if event.kind == "CANCEL_REQUESTED":
-        return Decision(RunStatus.CANCELLING, run.phase, "CANCEL_REQUESTED")
+        reason = run.reason if run.reason == "WORKSPACE_EMERGENCY_STOP" else "CANCEL_REQUESTED"
+        return Decision(RunStatus.CANCELLING, run.phase, reason)
     if event.kind == "SPEC_CHANGE_REQUESTED":
         return Decision(RunStatus.CANCELLING, run.phase, "SPEC_CHANGE_REQUIRED")
     if event.kind == "BUDGET_STOP_REQUESTED":
@@ -68,7 +71,10 @@ def decide(
         if event.kind == "EXECUTION_RIGHT_ENDED":
             if run.reason in {"SPEC_CHANGE_REQUIRED", "BUDGET_EXCEEDED", "USAGE_UNKNOWN"}:
                 return Decision(RunStatus.BLOCKED, run.phase, run.reason)
-            return Decision(RunStatus.CANCELLED, run.phase, "EXECUTION_RIGHT_ENDED")
+            reason = (
+                run.reason if run.reason == "WORKSPACE_EMERGENCY_STOP" else "EXECUTION_RIGHT_ENDED"
+            )
+            return Decision(RunStatus.CANCELLED, run.phase, reason)
         return Decision(run.status, run.phase, "CANCEL_REQUESTED")
     if event.kind == "ATTEMPTS_EXHAUSTED":
         return Decision(RunStatus.FAILED, run.phase, "INFRA_ATTEMPTS_EXHAUSTED")

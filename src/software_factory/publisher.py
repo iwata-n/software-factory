@@ -187,29 +187,37 @@ class PublisherSupervisor:
                 response = self.request(
                     "GET", f"/v1/publisher/operations/{operation['operation_id']}/inputs"
                 )
-                self.accept(response)
-                inputs = response.json()
-                # Durable before any provider call. A crash from this point recovers
-                # through read-only reconciliation, never by blindly repeating a write.
-                pending["phase"] = "STARTED"
-                self.journal.save(pending)
-                self.checkpoint("publisher.before_external")
-                try:
-                    pull = self.backend.publish(inputs)
-                    report = {"status": "SUCCEEDED", "pull_request": pull}
-                except PublicationError as error:
-                    report = {
-                        "status": "UNKNOWN" if error.unknown else "CONFLICT",
-                        "reason": error.reason,
-                        "observed_head_sha": error.observed_head,
-                    }
-                except (ValueError, KeyError, TypeError):
-                    report = {"status": "UNKNOWN", "reason": "PROVIDER_UNAVAILABLE"}
+                if (
+                    response.status_code == 409
+                    and response.json().get("code") == "WORKSPACE_EXECUTION_STOPPED"
+                ):
+                    report = {"status": "CONFLICT", "reason": "PUBLISH_POLICY_DENIED"}
+                    provider_requests = []
+                else:
+                    self.accept(response)
+                    inputs = response.json()
+                    # Durable before any provider call. A crash from this point recovers
+                    # through read-only reconciliation, never by blindly repeating a write.
+                    pending["phase"] = "STARTED"
+                    self.journal.save(pending)
+                    self.checkpoint("publisher.before_external")
+                    try:
+                        pull = self.backend.publish(inputs)
+                        report = {"status": "SUCCEEDED", "pull_request": pull}
+                    except PublicationError as error:
+                        report = {
+                            "status": "UNKNOWN" if error.unknown else "CONFLICT",
+                            "reason": error.reason,
+                            "observed_head_sha": error.observed_head,
+                        }
+                    except (ValueError, KeyError, TypeError):
+                        report = {"status": "UNKNOWN", "reason": "PROVIDER_UNAVAILABLE"}
+                    provider_requests = getattr(self.backend, "trace", [])
                 pending["report"] = {
                     "delivery_id": "publish-result:" + operation["operation_id"],
                     "target_hash": operation["target_hash"],
                     **report,
-                    "provider_requests": getattr(self.backend, "trace", []),
+                    "provider_requests": provider_requests,
                 }
                 pending["phase"] = "RESULT"
                 self.journal.save(pending)

@@ -203,3 +203,30 @@ def test_user_worker_other_tenant_and_ungranted_publisher_cannot_dispatch(public
     before = dump(world.database)
     assert pub.begin().status_code == 404
     assert dump(world.database) == before
+
+
+@pytest.mark.parametrize("authorized", [False, True])
+def test_emergency_stop_blocks_unstarted_publication_but_preserves_external_report(
+    publication, authorized
+):
+    pub = publication
+    world = pub.world
+    operation = pub.begin().json() if authorized else None
+    stop_path = f"/v1/workspaces/{world.workspace_id}/execution-control"
+    assert (
+        world.post(
+            stop_path, {"stopped": True, "expected_revision": 0, "reason": "publication stop"}
+        ).status_code
+        == 200
+    )
+    assert world.get("/v1/publisher/queue", token=pub.secret).json() == {"operations": []}
+    if operation is None:
+        assert pub.begin().json()["code"] == "WORKSPACE_EXECUTION_STOPPED"
+        assert world.run()["phase"] == "PUBLISH_DRAFT"
+        return
+    inputs = f"/v1/publisher/operations/{operation['operation_id']}/inputs"
+    assert world.get(inputs, token=pub.secret).json()["code"] == "WORKSPACE_EXECUTION_STOPPED"
+    assert pub.report(operation, pub.success(operation)).status_code == 200
+    record = world.get(f"/v1/runs/{world.run_id}/publication").json()
+    assert record["pull_request"]["number"] == 123
+    assert world.run()["status"] == "CANCELLED"

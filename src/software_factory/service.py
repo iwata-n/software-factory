@@ -9,7 +9,7 @@ from collections.abc import Callable
 from contextvars import ContextVar
 from typing import TypeVar
 
-from sqlalchemy import or_, select
+from sqlalchemy import and_, or_, select
 from sqlalchemy.orm import Session
 
 from .contracts import (
@@ -298,6 +298,72 @@ class Service:
         self.lock_workspace(session, actor.workspace_id)
         # Recheck the credential itself after waiting for revocation or rotation.
         return self.principal(session, token, role)
+
+    @staticmethod
+    def execution_control(session, actor, workspace_id):
+        if workspace_id != actor.workspace_id:
+            raise DomainError(404, "NOT_FOUND")
+        workspace = session.get(Workspace, workspace_id)
+        return {
+            "workspace_id": workspace.id,
+            "stopped": workspace.execution_stopped,
+            "revision": workspace.execution_stop_revision,
+        }
+
+    def set_execution_control(self, session, actor, workspace_id, data):
+        current = self.execution_control(session, actor, workspace_id)
+        if data.expected_revision != current["revision"]:
+            raise DomainError(409, "EXECUTION_CONTROL_REVISION_CONFLICT")
+        if data.stopped == current["stopped"]:
+            raise DomainError(409, "EXECUTION_CONTROL_ALREADY_SET")
+        workspace = session.get(Workspace, workspace_id)
+        workspace.execution_stopped = data.stopped
+        workspace.execution_stop_revision += 1
+        if data.stopped:
+            dispatched = select(Job.run_id).where(
+                Job.workspace_id == workspace_id, Job.state == "DISPATCHING"
+            )
+            active = list(
+                session.scalars(
+                    select(Run).where(
+                        Run.workspace_id == workspace_id,
+                        Run.status.not_in([*TERMINAL, "CANCELLING"]),
+                        or_(
+                            Run.status == "RUNNING",
+                            and_(
+                                Run.status == "WAITING_EXTERNAL",
+                                Run.phase.in_(["WAIT_CI", "FINAL_GATE_READY", "PUBLISH_UNKNOWN"]),
+                            ),
+                            Run.id.in_(dispatched),
+                        ),
+                    )
+                )
+            )
+            for run in active:
+                self.cancel(
+                    session,
+                    actor,
+                    run.id,
+                    Cancel(expected_run_revision=run.state_revision, reason=data.reason),
+                    emergency=True,
+                )
+        session.add(
+            AuditEvent(
+                workspace_id=workspace_id,
+                actor_id=actor.id,
+                operation="workspace.execution.stop"
+                if data.stopped
+                else "workspace.execution.release",
+                body={
+                    "workspace_id": workspace_id,
+                    "reason": data.reason,
+                    "before_revision": current["revision"],
+                    "after_revision": workspace.execution_stop_revision,
+                },
+                created_at=db_now(session),
+            )
+        )
+        return self.execution_control(session, actor, workspace_id)
 
     def read(self, token: str, fn: Callable[[Session, Principal], dict], *, role="USER") -> dict:
         with self.db.transaction() as session:
@@ -828,6 +894,8 @@ class Service:
             actor = self.locked_principal(session, token, "WORKER")
             worker = owned(session, Worker, actor.id, actor.workspace_id)
             self.reconcile_workspace(session, actor.workspace_id)
+            if session.get(Workspace, actor.workspace_id).execution_stopped:
+                return None
             self.refresh_dependencies(session, actor.workspace_id)
             now = db_now(session)
             busy = session.scalar(
@@ -1067,7 +1135,7 @@ class Service:
             attempt.stop_confirmation = "WORKER_REPORTED_STOP"
             attempt.result = scrub(data.model_dump())
             if run.status == RunStatus.CANCELLING:
-                transition(session, run, "EXECUTION_RIGHT_ENDED")
+                self.finish_cancellation(session, run)
             return {"accepted": True, "attempt_id": attempt.id, "run": run_view(run)}
         if run.status not in {RunStatus.RUNNING, RunStatus.CANCELLING}:
             raise DomainError(409, "INVALID_RUN_STATE")
@@ -1093,7 +1161,7 @@ class Service:
         attempt.stop_confirmation = "WORKER_REPORTED_STOP"
         if run.status == RunStatus.CANCELLING:
             attempt.state, job.state = "CANCELLED", "CANCELLED"
-            transition(session, run, "EXECUTION_RIGHT_ENDED")
+            self.finish_cancellation(session, run)
         else:
             attempt.state, job.state = "SUCCEEDED", "SUCCEEDED"
             if not usage_known:
@@ -1190,7 +1258,7 @@ class Service:
         allowed = self.repository_allowed(session, run)
         if run.status == RunStatus.CANCELLING:
             job.state = "CANCELLED"
-            transition(session, run, "EXECUTION_RIGHT_ENDED")
+            self.finish_cancellation(session, run)
         elif not allowed:
             job.state = "CANCELLED"
         elif not usage_known:
@@ -1220,12 +1288,25 @@ class Service:
             transition(session, run, "BLOCKED", scrub(f"{data.category}: {data.reason}"))
         return {"accepted": True, "attempt_id": attempt.id, "run": run_view(run)}
 
+    @staticmethod
+    def finish_cancellation(session, run):
+        if not session.scalar(
+            select(Job.id)
+            .where(
+                Job.workspace_id == run.workspace_id, Job.run_id == run.id, Job.state == "LEASED"
+            )
+            .limit(1)
+        ):
+            transition(session, run, "EXECUTION_RIGHT_ENDED")
+
     def cancel(
         self,
         session: Session,
         actor: Principal,
         run_id: str,
         data: Cancel,
+        *,
+        emergency: bool = False,
     ) -> dict:
         run = owned(session, Run, run_id, actor.workspace_id)
         if run.state_revision != data.expected_run_revision:
@@ -1249,21 +1330,17 @@ class Service:
             )
         ):
             request.status = "INVALIDATED"
-        transition(session, run, "CANCEL_REQUESTED")
+        transition(session, run, "EMERGENCY_STOP_REQUESTED" if emergency else "CANCEL_REQUESTED")
         event(session, run, "USER_CANCEL_REASON", {"principal_id": actor.id, "reason": data.reason})
-        active = False
         for job in session.scalars(
             select(Job).where(
                 Job.workspace_id == actor.workspace_id,
                 Job.run_id == run.id,
             )
         ):
-            if job.state == "LEASED":
-                active = True
-            elif job.state in {"READY", "RETRY_WAIT", "PENDING"}:
+            if job.state in {"READY", "RETRY_WAIT", "PENDING"}:
                 job.state = "CANCELLED"
-        if not active:
-            transition(session, run, "EXECUTION_RIGHT_ENDED")
+        self.finish_cancellation(session, run)
         session.add(
             AuditEvent(
                 workspace_id=actor.workspace_id,
@@ -1313,7 +1390,7 @@ class Service:
             )
             if run.status == RunStatus.CANCELLING:
                 job.state = "CANCELLED"
-                transition(session, run, "EXECUTION_RIGHT_ENDED")
+                self.finish_cancellation(session, run)
             elif self.repository_allowed(session, run) and run.status not in TERMINAL:
                 self.retry_or_fail(session, job, run)
             else:

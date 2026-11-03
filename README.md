@@ -287,6 +287,10 @@ factory-publisher --publisher-token-file .local/publisher.token \
 
 Worker登録用の単回トークンは `POST /v1/workspaces/{id}/worker-enrollments` で発行します。Workerはこれを使い従来どおり `POST /v1/worker/enroll` で登録します。失効は `POST /v1/workspaces/{id}/workers/{worker_id}/revoke` に理由と `Idempotency-Key` を付けて実行します。発行したトークンは発行応答で受け取り、Worker一覧は資格情報を返さない設計です。
 
+### 緊急停止と解除
+
+`GET /v1/workspaces/{id}/execution-control` で現在の状態とrevisionを確認します。管理者が同じパスに `stopped`、`expected_revision`、`reason` を指定し、`Idempotency-Key` 付きでPOSTすると停止・解除できます。停止中は新規Claimと公開開始が保留され、稼働中のWorkerにはHeartbeatで停止を要求します。解除には現在のrevisionが必要です。
+
 ## GitHub CIのWebhook受信
 
 `alembic upgrade head` でInboxを追加します。Control Planeの起動時に、環境変数 `FACTORY_GITHUB_WEBHOOKS` にIntegration UUIDをキーとするJSONオブジェクトを渡すと受信を有効化できます。各エントリの項目は `workspace_id`、`repository_id`、`github_repository_id`（GitHubの数値ID）、`github_repository`（owner/repo）、`secret`（32文字以上）です。署名用secretはローカルの秘密設定から渡します。

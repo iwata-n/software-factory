@@ -18,6 +18,7 @@ from .models import (
     PublisherGrant,
     Repository,
     Run,
+    Workspace,
     new_id,
 )
 from .source_runner import SourcePolicyDenied, canonical_remote
@@ -141,6 +142,8 @@ class PublicationCommands:
         }
 
     def queue(self, session, actor):
+        if session.get(Workspace, actor.workspace_id).execution_stopped:
+            return {"operations": []}
         values = []
         for job, run in session.execute(
             select(Job, Run)
@@ -170,6 +173,8 @@ class PublicationCommands:
     def begin(self, session, actor, job_id, data):
         from .service import DomainError, event, owned
 
+        if session.get(Workspace, actor.workspace_id).execution_stopped:
+            raise DomainError(409, "WORKSPACE_EXECUTION_STOPPED")
         job = owned(session, Job, job_id, actor.workspace_id)
         run = owned(session, Run, job.run_id, actor.workspace_id)
         self.grant(session, actor, run.repository_id)
@@ -315,9 +320,19 @@ class PublicationCommands:
     def inputs(self, session, actor, operation_id):
         from .service import DomainError, owned
 
+        self.service.lock_workspace(session, actor.workspace_id)
+        session.refresh(actor)
+        if not actor.active:
+            raise DomainError(401, "UNAUTHENTICATED")
         item = self.assigned(session, actor, operation_id)
         if item.state != "IN_FLIGHT":
             raise DomainError(409, "PUBLICATION_NOT_IN_FLIGHT")
+        run = owned(session, Run, item.run_id, actor.workspace_id)
+        if (
+            run.stop_reason == "WORKSPACE_EMERGENCY_STOP"
+            or session.get(Workspace, actor.workspace_id).execution_stopped
+        ):
+            raise DomainError(409, "WORKSPACE_EXECUTION_STOPPED")
         owned(session, Repository, item.repository_id, actor.workspace_id)
         chain, current = [], item.candidate_id
         while current:

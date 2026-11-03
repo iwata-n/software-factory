@@ -40,6 +40,7 @@ from .contracts import (
     WorkerEnrollmentRequest,
     WorkerEventBatch,
     WorkerRevocation,
+    WorkspaceExecutionChange,
 )
 from .db import Database
 from .jira_input import configured_jira, jira_router
@@ -784,6 +785,24 @@ def create_app(
             key,
             data.model_dump(),
             lambda s, a: service.cancel(s, a, run_id, data),
+        )
+
+    @app.get("/v1/workspaces/{workspace_id}/execution-control", tags=["Operations"])
+    def execution_control_get(workspace_id: str, token: Token):
+        return service.read(token, lambda s, a: service.execution_control(s, a, workspace_id))
+
+    @app.post("/v1/workspaces/{workspace_id}/execution-control", tags=["Operations"])
+    def execution_control_post(
+        workspace_id: str, data: WorkspaceExecutionChange, token: Token, key: Key = None
+    ):
+        return service.write(
+            token,
+            "USER",
+            f"execution-control:{workspace_id}",
+            key,
+            data.model_dump(),
+            lambda s, a: service.set_execution_control(s, a, workspace_id, data),
+            user_access="ADMIN",
         )
 
     @app.get("/v1/workspaces/{workspace_id}/workers", tags=["Operations"])

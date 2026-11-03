@@ -293,3 +293,98 @@ def test_workspace_user_access_separates_read_run_operations_and_worker_administ
     assert world.post(revoke_path, {"reason": "evaluation"}).status_code == 200
     assert world.claim().status_code == 401
     assert world.claim(token=new_worker.json()["worker_token"]).status_code == 204
+
+
+def test_emergency_stop_survives_restart_and_requires_current_workspace_revision(world):
+    path = f"/v1/workspaces/{world.workspace_id}/execution-control"
+    stop = {"stopped": True, "expected_revision": 0, "reason": "exercise stop"}
+    assert world.post(path, stop, token=world.other_user_token).status_code == 404
+    operator = issue_token()
+    with world.database.transaction() as session:
+        session.add(
+            Principal(
+                workspace_id=world.workspace_id,
+                role="USER",
+                user_access="OPERATOR",
+                token_hash=token_hash(operator),
+            )
+        )
+    assert world.post(path, stop, token=operator).status_code == 403
+    assert world.post(path, stop, key="stop").json()["revision"] == 1
+    assert world.post(path, stop, key="stop").json()["revision"] == 1
+    client = TestClient(create_app(world.database))
+    headers = {"Authorization": f"Bearer {world.user_token}"}
+    assert client.get(path, headers=headers).json()["stopped"] is True
+    assert world.claim().status_code == 204
+    release = {"stopped": False, "expected_revision": 0, "reason": "release rehearsal"}
+    assert world.post(path, release).status_code == 409
+    assert world.post(path, release | {"expected_revision": 1}).json()["revision"] == 2
+    assert world.claim().status_code == 200
+    with world.database.transaction() as session:
+        events = list(
+            session.scalars(
+                select(AuditEvent).where(AuditEvent.operation.like("workspace.execution.%"))
+            )
+        )
+        assert {item.operation for item in events} == {
+            "workspace.execution.stop",
+            "workspace.execution.release",
+        }
+        assert sorted(
+            (item.body["before_revision"], item.body["after_revision"]) for item in events
+        ) == [(0, 1), (1, 2)]
+
+
+def test_emergency_stop_requests_running_worker_stop_and_preserves_outcome(world):
+    assignment = world.claim().json()
+    lease = assignment["lease"]
+    path = f"/v1/workspaces/{world.workspace_id}/execution-control"
+    stop = {"stopped": True, "expected_revision": 0, "reason": "active worker rehearsal"}
+    assert world.post(path, stop).status_code == 200
+    assert world.run()["status"] == "CANCELLING"
+    lease_root = f"/v1/worker/leases/{lease['id']}"
+    response = world.post(
+        f"{lease_root}/heartbeat", {"fence": lease["fence"]}, token=world.worker_token
+    )
+    assert response.json()["cancel_requested"] is True
+    completed = world.post(
+        f"{lease_root}/complete",
+        {"fence": lease["fence"], "outcome": "CANCELLED"},
+        token=world.worker_token,
+    )
+    assert completed.status_code == 200
+    assert world.run()["status"] == "CANCELLED"
+    assert world.run()["stop_reason"] == "WORKSPACE_EMERGENCY_STOP"
+
+
+def test_claim_racing_workspace_stop_is_either_denied_or_cancelled(world):
+    barrier = Barrier(2)
+
+    def claim():
+        barrier.wait(timeout=5)
+        return world.claim()
+
+    def stop():
+        barrier.wait(timeout=5)
+        return world.post(
+            f"/v1/workspaces/{world.workspace_id}/execution-control",
+            {"stopped": True, "expected_revision": 0, "reason": "concurrent claim"},
+        )
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        claim_result = pool.submit(claim)
+        stop_result = pool.submit(stop)
+        assert stop_result.result(timeout=10).status_code == 200
+        result = claim_result.result(timeout=10)
+    assert world.claim().status_code == 204
+    if result.status_code == 200:
+        lease = result.json()["lease"]
+        heartbeat = world.post(
+            f"/v1/worker/leases/{lease['id']}/heartbeat",
+            {"fence": lease["fence"]},
+            token=world.worker_token,
+        )
+        assert heartbeat.json()["cancel_requested"] is True
+    else:
+        assert result.status_code == 204
+        assert world.run()["status"] == "QUEUED"

@@ -538,6 +538,12 @@ class Fail(Contract):
     usage_microusd: MicroUSD | None = 0
 
 
+class WorkspaceExecutionChange(Contract):
+    stopped: bool = Field(strict=True)
+    expected_revision: int = Field(ge=0, strict=True)
+    reason: Annotated[str, Field(min_length=1, max_length=2000)]
+
+
 class Cancel(Contract):
     expected_run_revision: int = Field(ge=1, strict=True)
     reason: Annotated[str, Field(min_length=1, max_length=2000)]

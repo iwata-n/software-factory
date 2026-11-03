@@ -405,7 +405,7 @@ Gateは必須Jobが処理中なら待機を続ける。全必須Jobが終端ま�
 
 `GET /v1/runs/{id}/events` は永続Run revisionを `<run-id>:<revision>` のSSE IDとして配信する。Run詳細は切断後に最後に表示したIDを送信し、再送を排除する。別RunのIDは404、保持済み履歴との間に欠落がある場合は410と再取得先を返す。PostgreSQLの試験では別アプリ起動後の再開と削除境界を、Chromeの1440px/375pxではfixture応答による再接続・重複排除・履歴再取得を確認した。実運用での履歴回収はSF-24で追跡する。
 
-0016でWorkerトークンに24時間の期限を設定し、更新後の旧トークンに60秒の猶予を設けた。明示失効は現・旧双方に適用される。更新はWorker IDとLeaseを維持し、同一キーの再送で追加発行しない。更新・失効は追記専用の監査に残す。0017でUserをVIEWER・OPERATOR・ADMINに分け、Workspace内のWorker登録と失効をADMIN限定にした。既存UserはADMINに移行する。APIの操作権限と越境拒否をPostgreSQLで検証した。Worker実行プロセスの自動更新、運用画面を含む権限別の通し検証、緊急停止は引き続き追跡する。
+0016でWorkerトークンに24時間の期限を設定し、更新後の旧トークンに60秒の猶予を設けた。明示失効は現・旧双方に適用される。更新はWorker IDとLeaseを維持し、同一キーの再送で追加発行しない。更新・失効は追記専用の監査に残す。0017でUserをVIEWER・OPERATOR・ADMINに分け、Workspace内のWorker登録と失効をADMIN限定にした。既存UserはADMINに移行する。APIの操作権限と越境拒否をPostgreSQLで検証した。Worker実行プロセスの自動更新と運用画面を含む権限別の通し検証は引き続き追跡する。
 
 | AC ID | 前提と操作 | 合格となる期待結果 | 検証方法と証拠 |
 |---|---|---|---|
@@ -415,6 +415,8 @@ Gateは必須Jobが処理中なら待機を続ける。全必須Jobが終端ま�
 | SF-23-AC04 | Worker資格情報を24時間内に更新、60秒猶予後と明示失効後に旧Tokenを使う | Worker ID/slotは不変。猶予後旧Token401、明示失効は次要求401。更新・失効が監査に残る | CT/IT：期限境界と更新/Claim/Heartbeatの競合、Principal/credential行 |
 | SF-23-AC05 | read-only Userが変更/承認、運用UserがWorker管理、WorkerがUser操作を要求 | 操作権限表に従い403。Workspace管理権限だけが登録/失効を実行でき、ID変更やpool再利用で越境不可 | CT/UI E2E：全API/操作×権限の表、A/B切替、秘密非表示を確認 |
 | SF-23-AC06 | 緊急停止・解除・承認・予算変更・Worker失効を行い、監査改変も試す | 緊急停止は新Claim/未開始公開を抑止し、実行中へ停止要求。解除は対象固定の明示操作のみ。監査は追記専用でactor/理由/時刻/前後revisionを保存 | IT/UI E2E：各競合と送信0、監査更新拒否、再起動後の停止継続 |
+
+0018でWorkspaceの緊急停止状態とrevisionを永続化した。ADMINが現在revisionと理由を指定して停止・解除する。停止中は新規Claimと公開開始を拒否し、実行中Runは既存LeaseのHeartbeatで停止要求を受ける。公開準備中はPublisherの入力取得を拒否し、既に外部送信された結果の照合・履歴記録は受け付ける。解除後は待機中のJobが再び割り当て可能になる。停止・解除の画面操作と実運用演習は追跡中。
 
 ### SF-24 保持と復元とMVP総合受け入れ
 
