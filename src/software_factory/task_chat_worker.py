@@ -1,5 +1,6 @@
 """Protocol and isolated Codex worker for task conversations."""
 
+import json
 import time
 from threading import Event
 from typing import Annotated, Literal
@@ -17,6 +18,24 @@ Answer = Annotated[str, Field(min_length=1, max_length=8000)]
 
 class TaskChatReply(Contract):
     answer: Answer
+
+
+class QuestionOptions(Contract):
+    question_number: Annotated[int, Field(ge=1, le=8, strict=True)]
+    options: list[Annotated[str, Field(min_length=1, max_length=200)]] = Field(
+        min_length=1, max_length=3
+    )
+
+
+class TaskAnswerOptions(Contract):
+    questions: list[QuestionOptions] = Field(max_length=8)
+
+    @model_validator(mode="after")
+    def distinct_questions(self):
+        numbers = [question.question_number for question in self.questions]
+        if len(numbers) != len(set(numbers)):
+            raise ValueError("Question numbers must be unique")
+        return self
 
 
 class TaskChatOutcome(Contract):
@@ -44,9 +63,15 @@ def claim_chat(client, engine):
         result = TaskChatOutcome(error="CODEX_AUTH_OR_POLICY")
     else:
         try:
-            reply = engine.run(job["context"], TaskChatReply, Event(), timeout=CHAT_TIMEOUT)
+            schema = TaskAnswerOptions if job.get("answer_options") else TaskChatReply
+            reply = engine.run(job["context"], schema, Event(), timeout=CHAT_TIMEOUT)
+            answer = (
+                json.dumps(reply.value, ensure_ascii=False)
+                if job.get("answer_options")
+                else reply.value["answer"]
+            )
             result = (
-                TaskChatOutcome(answer=reply.value["answer"], usage=reply.usage)
+                TaskChatOutcome(answer=answer, usage=reply.usage)
                 if reply.usage is not None
                 else TaskChatOutcome(error="CODEX_NO_USAGE")
             )

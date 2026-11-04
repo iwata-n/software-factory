@@ -117,7 +117,7 @@ def operations_router(service, token_type):
 
     @router.get("/operations/{asset}", include_in_schema=False)
     def operations_asset(asset: str):
-        if asset not in {"board.js", "board.css"}:
+        if asset not in {"board.js", "board.css", "a2ui.js"}:
             return Response(status_code=404)
         return FileResponse(UI_DIR / asset, headers={"X-Content-Type-Options": "nosniff"})
 

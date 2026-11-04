@@ -4,7 +4,7 @@ from typing import Annotated
 from uuid import UUID
 
 from fastapi import APIRouter, Request, Response
-from pydantic import Field
+from pydantic import Field, ValidationError
 from sqlalchemy import func, select, update
 
 from .codex_engine import sensitive_input
@@ -14,7 +14,7 @@ from .metering import price_call
 from .models import Attempt, PlanVersion, Run, TaskChatTurn, Worker, Workspace
 from .security import redact
 from .service import DomainError, owned
-from .task_chat_worker import CHAT_TIMEOUT, TaskChatOutcome
+from .task_chat_worker import CHAT_TIMEOUT, TaskAnswerOptions, TaskChatOutcome
 from .web_accounts import browser_write
 
 ACTIVE = ("QUEUED", "RUNNING")
@@ -53,7 +53,11 @@ def history(session, run, limit):
         reversed(
             session.scalars(
                 select(TaskChatTurn)
-                .where(TaskChatTurn.workspace_id == run.workspace_id, TaskChatTurn.run_id == run.id)
+                .where(
+                    TaskChatTurn.workspace_id == run.workspace_id,
+                    TaskChatTurn.run_id == run.id,
+                    TaskChatTurn.plan_id.is_(None),
+                )
                 .order_by(TaskChatTurn.created_at.desc(), TaskChatTurn.id.desc())
                 .limit(limit)
             ).all()
@@ -73,17 +77,29 @@ def expire_turns(session, workspace, now):
     )
 
 
-def context(session, run, turn):
-    latest_plan = session.scalar(
+def latest_plan(session, run):
+    return session.scalar(
         select(PlanVersion)
         .where(PlanVersion.workspace_id == run.workspace_id, PlanVersion.run_id == run.id)
         .order_by(PlanVersion.version.desc())
         .limit(1)
     )
+
+
+def plan_questions(plan):
+    questions = plan.body.get("open_questions", []) if plan else []
+    if not isinstance(questions, list):
+        return []
+    return [
+        question for question in questions[:100] if isinstance(question, str) and question.strip()
+    ]
+
+
+def context(session, run, turn, plan):
     task = run.snapshot["task_spec"]["task"]
     criteria = task["acceptance_criteria"][:20]
-    questions = latest_plan.body.get("open_questions", []) if latest_plan else []
-    return {
+    questions = plan_questions(plan)
+    result = {
         "role": "TASK_CHAT",
         "instructions": (
             "Answer the user's last message in their language. Explain the task and blockers "
@@ -101,7 +117,7 @@ def context(session, run, turn):
             "phase": run.phase,
             "status": run.status,
             "stop_reason": run.stop_reason,
-            "open_questions": questions[:10] if isinstance(questions, list) else [],
+            "open_questions": questions[:10],
             "allowed_write_paths": run.snapshot["policy"]["allowed_write_paths"],
         },
         "history": [
@@ -111,6 +127,58 @@ def context(session, run, turn):
         ],
         "message": turn.question,
     }
+
+    if turn.plan_id:
+        result.update(
+            role="ANSWER_OPTIONS",
+            instructions=(
+                "Propose one to three realistic short answers per listed question in its language. "
+                "Use one-based question_number. Prefer options within allowed_write_paths. "
+                "An option needing wider scope must explicitly say a maintainer must approve "
+                "a project policy change first. Never assert that permissions were changed. "
+                "If no reasonable options exist, omit that question."
+            ),
+            history=[],
+        )
+        result["run"]["open_questions"] = questions[:8]
+    return result
+
+
+def enqueue_turn(session, run, question, *, plan_id=None):
+    if session.get(Workspace, run.workspace_id).execution_stopped:
+        raise DomainError(409, "WORKSPACE_EXECUTION_STOPPED")
+    now = db_now(session)
+    expire_turns(session, run.workspace_id, now)
+    if session.scalar(
+        select(TaskChatTurn.id)
+        .where(TaskChatTurn.workspace_id == run.workspace_id, TaskChatTurn.status.in_(ACTIVE))
+        .limit(1)
+    ):
+        raise DomainError(409, "TASK_CHAT_BUSY")
+    if (
+        session.scalar(
+            select(func.count())
+            .select_from(TaskChatTurn)
+            .where(
+                TaskChatTurn.workspace_id == run.workspace_id,
+                TaskChatTurn.created_at > now - CHAT_WINDOW,
+            )
+        )
+        >= CHAT_LIMIT
+    ):
+        raise DomainError(429, "TASK_CHAT_DAILY_LIMIT")
+    turn = TaskChatTurn(
+        workspace_id=run.workspace_id,
+        run_id=run.id,
+        plan_id=plan_id,
+        question=question,
+        status="QUEUED",
+        created_at=now,
+        deadline_at=now + 180,
+    )
+    session.add(turn)
+    session.flush()
+    return turn
 
 
 def task_chat_router(service, token_type, key_type, workspace):
@@ -156,41 +224,7 @@ def task_chat_router(service, token_type, key_type, workspace):
                 raise DomainError(409, "TASK_CHAT_UNAVAILABLE")
             if sensitive_input(data.message):
                 raise DomainError(422, "SENSITIVE_INPUT")
-            if session.get(Workspace, actor.workspace_id).execution_stopped:
-                raise DomainError(409, "WORKSPACE_EXECUTION_STOPPED")
-            now = db_now(session)
-            expire_turns(session, actor.workspace_id, now)
-            if session.scalar(
-                select(TaskChatTurn.id)
-                .where(
-                    TaskChatTurn.workspace_id == actor.workspace_id, TaskChatTurn.status.in_(ACTIVE)
-                )
-                .limit(1)
-            ):
-                raise DomainError(409, "TASK_CHAT_BUSY")
-            if (
-                session.scalar(
-                    select(func.count())
-                    .select_from(TaskChatTurn)
-                    .where(
-                        TaskChatTurn.workspace_id == actor.workspace_id,
-                        TaskChatTurn.created_at > now - CHAT_WINDOW,
-                    )
-                )
-                >= CHAT_LIMIT
-            ):
-                raise DomainError(429, "TASK_CHAT_DAILY_LIMIT")
-            turn = TaskChatTurn(
-                workspace_id=actor.workspace_id,
-                run_id=run.id,
-                question=data.message,
-                status="QUEUED",
-                created_at=now,
-                deadline_at=now + 180,
-            )
-            session.add(turn)
-            session.flush()
-            return {"id": turn.id}
+            return {"id": enqueue_turn(session, run, data.message).id}
 
         return service.write(token, "USER", f"chat:{run_id}", key, data.model_dump(), command)
 
@@ -223,7 +257,10 @@ def task_chat_router(service, token_type, key_type, workspace):
             if turn is None or busy:
                 return Response(status_code=204)
             run = owned(session, Run, turn.run_id, actor.workspace_id)
-            if not available(run):
+            plan = latest_plan(session, run)
+            if not available(run) or (
+                turn.plan_id and (run.status != "BLOCKED" or not plan or plan.id != turn.plan_id)
+            ):
                 turn.status, turn.error = "FAILED", "TASK_CHAT_UNAVAILABLE"
                 return Response(status_code=204)
             turn.status, turn.worker_id = "RUNNING", actor.id
@@ -234,7 +271,8 @@ def task_chat_router(service, token_type, key_type, workspace):
                 "manifest_hash": run.snapshot["policy"]["agent_configuration"][
                     "engine_manifest_hash"
                 ],
-                "context": context(session, run, turn),
+                "answer_options": turn.plan_id is not None,
+                "context": context(session, run, turn, plan),
             }
 
     @router.put("/v1/worker/task-chat/{identifier}", status_code=204)
@@ -261,7 +299,12 @@ def task_chat_router(service, token_type, key_type, workspace):
                 and not sensitive_input(data.answer)
                 and redact(data.answer, (token,)) == data.answer
             ):
-                turn.status, turn.answer = "ANSWERED", data.answer
+                try:
+                    if turn.plan_id:
+                        TaskAnswerOptions.model_validate_json(data.answer)
+                    turn.status, turn.answer = "ANSWERED", data.answer
+                except ValidationError:
+                    turn.status, turn.error = "FAILED", "ANSWER_OPTIONS_INVALID"
             else:
                 turn.status, turn.error = "FAILED", data.error or "CHAT_SENSITIVE_OUTPUT"
             return Response(status_code=204)

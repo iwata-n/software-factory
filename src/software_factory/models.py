@@ -245,6 +245,12 @@ class TaskChatTurn(Base):
             ["workspace_id", "run_id"], ["runs.workspace_id", "runs.id"], ondelete="CASCADE"
         ),
         ForeignKeyConstraint(["workspace_id", "worker_id"], ["workers.workspace_id", "workers.id"]),
+        ForeignKeyConstraint(
+            ["workspace_id", "run_id", "plan_id"],
+            ["plan_versions.workspace_id", "plan_versions.run_id", "plan_versions.id"],
+            name="fk_task_chat_plan",
+            ondelete="CASCADE",
+        ),
         CheckConstraint("status IN ('QUEUED','RUNNING','ANSWERED','FAILED')"),
         Index("ix_task_chat_turns_workspace_id", "workspace_id", "created_at"),
         Index("ix_task_chat_turns_run_id", "run_id", "created_at"),
@@ -253,6 +259,7 @@ class TaskChatTurn(Base):
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
     workspace_id: Mapped[str] = mapped_column(ForeignKey("workspaces.id"))
     run_id: Mapped[str] = mapped_column(String(36))
+    plan_id: Mapped[str | None] = mapped_column(String(36))
     worker_id: Mapped[str | None] = mapped_column(String(36))
     question: Mapped[str] = mapped_column(Text)
     answer: Mapped[str | None] = mapped_column(Text)

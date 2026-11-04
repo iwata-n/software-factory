@@ -1,3 +1,5 @@
+import { renderAttention } from "./a2ui.js";
+
 const get = (id) => document.getElementById(id);
 const lanes = new Map([
   ["QUEUED", "実行待ち"],
@@ -563,7 +565,7 @@ async function followRunEvents(root, runId, revision, signal) {
 }
 
 const blockedGuidance = {
-  PLAN_HAS_OPEN_QUESTIONS: "Codex の質問に答える内容を、タスクの目的または受け入れ条件に追記してください。",
+  PLAN_HAS_OPEN_QUESTIONS: "質問に回答して仕様案を確認してください。必要に応じて Codex に回答候補を提案させられます。",
   SPEC_CHANGE_REQUIRED: "目的や受け入れ条件を見直し、新しい仕様で実行してください。",
   REPLAN_LIMIT_REACHED: "計画の再作成上限に達しました。仕様を確認し、新しい Run で実行してください。",
   BUDGET_EXHAUSTED: "予算の残額を確認し、必要に応じて予算を変更してから再開してください。",
@@ -676,6 +678,81 @@ function specCorrection(run, task, status, signal) {
   return editor;
 }
 
+function mountAttentionSurface(root, container, editor, status, signal) {
+  const drafts = {};
+  let refreshTimer;
+  let previousAddition = "";
+  let generateKey;
+
+  async function handle(envelope) {
+    const generate = envelope.action.name === "generate_options";
+    if (generate) generateKey ??= taskKey();
+    try {
+      const result = await postTask(`${root}/attention/actions`, JSON.stringify(envelope),
+        generate ? generateKey : taskKey(), signal);
+      if (signal.aborted) return;
+      if (generate) {
+        generateKey = undefined;
+        await refresh();
+      } else {
+        const objective = editor.querySelector('[name="objective"]');
+        if (objective.readOnly) throw new Error("保存した仕様を実行してから、次の修正を行ってください");
+        const current = previousAddition && objective.value.endsWith(previousAddition)
+          ? objective.value.slice(0, -previousAddition.length) : objective.value;
+        if (current.length + result.addition.length > objective.maxLength) {
+          throw new Error("目的欄の上限を超えます。回答を短くしてください");
+        }
+        objective.value = current + result.addition;
+        previousAddition = result.addition;
+        editor.open = true;
+        status.textContent = "回答を仕様案に反映しました。内容を確認して再実行できます。";
+        status.classList.remove("error");
+        objective.focus();
+      }
+    } catch (error) {
+      if (signal.aborted) return;
+      status.textContent = {
+        ATTENTION_ANSWER_REQUIRED: "各質問で候補を選ぶか、回答を入力してください。",
+        ATTENTION_ANSWER_TOO_LONG: "回答を短くしてください。",
+        ATTENTION_SURFACE_STALE: "計画または仕様が変わりました。詳細を更新してください。",
+        TASK_CHAT_BUSY: "Codex が別の質問を処理中です。少し待ってから再試行してください。",
+      }[error.message] ?? runActionMessage(error);
+      status.classList.add("error");
+    }
+  }
+
+  async function refresh() {
+    const {messages, pending} = await read(`${root}/attention`, signal);
+    if (signal.aborted || !messages.length) return;
+    const snapshot = JSON.stringify(messages);
+    if (container.dataset.surface !== snapshot) {
+      const focused = document.activeElement;
+      const inputId = container.contains(focused) && focused.dataset.a2uiId;
+      const form = renderAttention(messages, drafts, handle);
+      container.replaceChildren(form);
+      if (inputId) {
+        const input = form.querySelector(`[data-a2ui-id="${CSS.escape(inputId)}"]`);
+        input?.focus({preventScroll: true});
+        input?.setSelectionRange(focused.selectionStart, focused.selectionEnd);
+      }
+      container.dataset.surface = snapshot;
+    }
+    if (pending) refreshTimer = setTimeout(poll, 2000);
+  }
+
+  function poll() {
+    if (signal.aborted) return;
+    void refresh().catch(() => {
+      if (signal.aborted) return;
+      status.textContent = "質問フォームを更新できませんでした。詳細を更新してください。";
+      status.classList.add("error");
+    });
+  }
+
+  signal.addEventListener("abort", () => clearTimeout(refreshTimer), {once: true});
+  poll();
+}
+
 async function blockedRunView(root, run, signal) {
   const operator = ["ADMIN", "OPERATOR"].includes(executionContext?.access);
   const [plans, task, targets] = await Promise.allSettled([
@@ -689,10 +766,12 @@ async function blockedRunView(root, run, signal) {
   const panel = section("要対応",
     element("p", blockedGuidance[run.stop_reason] ?? "停止理由を確認し、必要な修正を行ってください。"));
   const questions = plans.value?.plans.at(-1)?.body?.open_questions;
+  const questionContent = element("div");
   if (Array.isArray(questions) && questions.length) {
     const list = element("ul");
     list.append(...questions.map((question) => element("li", question)));
-    panel.append(element("h4", "Codex からの質問"), list);
+    questionContent.append(list);
+    panel.append(element("h4", "Codex からの質問"), questionContent);
   } else if (plans.status === "rejected") {
     panel.append(element("p", "Codex の計画を取得できませんでした。", "error"));
   }
@@ -712,6 +791,9 @@ async function blockedRunView(root, run, signal) {
   if (canCorrectSpec) {
     const correction = task.value && specCorrection(run, task.value, status, signal);
     panel.append(correction ?? element("p", "タスクの仕様を取得できませんでした。", "error"));
+    if (correction && questions?.length) {
+      mountAttentionSurface(root, questionContent, correction, status, signal);
+    }
   }
   if (recoverableBlocks.has(run.stop_reason)) {
     const key = taskKey();

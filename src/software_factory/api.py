@@ -14,6 +14,7 @@ from sqlalchemy import select
 from sqlalchemy.exc import SQLAlchemyError
 from starlette.concurrency import run_in_threadpool
 
+from .attention_a2ui import attention_router
 from .ci_poll import CIPoller, configured_read_tokens
 from .ci_webhook import configured_webhooks, webhook_router
 from .codex_settings import CodexSettings, codex_settings_router
@@ -196,9 +197,9 @@ def create_app(
     app.include_router(integration_router(service, Token, vault, oauth_origin(), integrations))
     codex_settings = CodexSettings.configured()
     app.include_router(codex_settings_router(service, Token, codex_settings))
-    app.include_router(
-        task_chat_router(service, Token, Key, codex_settings.workspace if codex_settings else None)
-    )
+    codex_workspace = codex_settings.workspace if codex_settings else None
+    app.include_router(task_chat_router(service, Token, Key, codex_workspace))
+    app.include_router(attention_router(service, Token, Key, codex_workspace))
 
     @app.exception_handler(DomainError)
     async def domain_error(request: Request, error: DomainError):

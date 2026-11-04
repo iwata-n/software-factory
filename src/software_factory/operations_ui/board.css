@@ -170,3 +170,9 @@ summary { cursor: pointer; padding: 10px 0; }
 .task-chat-turn { padding-block: 8px; border-bottom: 1px solid var(--line); }
 .task-chat-turn h4 { margin: 4px 0; color: var(--muted); }
 .task-chat-message { white-space: pre-wrap; overflow-wrap: anywhere; margin-block: 4px 12px; }
+
+.a2ui-attention h4 { margin-block: 12px 6px; }
+.a2ui-attention fieldset { min-width: 0; border: 1px solid var(--line); border-radius: 8px; }
+.a2ui-attention fieldset label { grid-template-columns: auto 1fr; align-items: center; gap: 8px; }
+.a2ui-attention input[type="radio"] { width: auto; min-height: 0; }
+.a2ui-attention button { margin: 4px 6px 4px 0; }
