@@ -54,6 +54,30 @@ uv run python scripts/create_demo.py --workspace-id '<bootstrapのworkspace_id>'
 
 実行中Workerがあれば、Runは `BLOCKED / ASSEMBLE_CANDIDATE / CHANGE_ARTIFACT_MISSING` に到達します。出力されるRun URLはAPIリソースです。User認証付きのGETでスナップショット、停止理由、費用を確認できます。`/graph` は試行とLease状態、`/event-history?after_revision=N` は保存した履歴を返します。SSE配信は後続です。
 
+## Software Factory 自身の改善を試す
+
+`scripts/serve_self_host.py` は一時 PostgreSQL に Software Factory 専用 Workspace を作り、
+`iwata-n/software-factory` の指定ブランチをコミット SHA で固定します。変更できるのは
+`docs/Operations_Recovery_Runbook.md` です。既存の Codex CLI 認証で PLAN、IMPLEMENT、
+REVIEW を実行し、候補とは別に定義したテストで復旧手順書の主要な節が残っていることを確認します。
+
+固定した Linux Codex バイナリと、対応する隔離 Runner の manifest を用意して起動します。
+
+```sh
+export FACTORY_CODEX_AUTH_FILE=~/.codex/auth.json
+uv run --locked python scripts/with_postgres.py python scripts/serve_self_host.py \
+  --base-ref codex/sf24-acceptance-ci \
+  --codex-binary /path/to/linux/codex \
+  --codex-manifest /path/to/isolated-manifest.json \
+  --output .local/self-host-first
+```
+
+出力されたローカル URL を開き、出力されたファイルから Operator トークンを入力します。
+「新規タスク」で受け入れ条件を登録し、「作成したタスクを実行」を押します。
+カンバンの Run 詳細で Check・Gate を確認し、「変更パッチ」から候補を取得できます。
+Publisher を起動していないため、Local Gate 通過後は公開待ちになります。
+試用DBと接続トークンは起動したセッションの間だけ有効です。
+
 ## 実Codex CLIの利用
 
 `--adapter codex_cli` は既存のCodex CLIのChatGPTログインを使い、PLAN／IMPLEMENT／REPAIRを実行します。管理対象pipeline Workerの `--reviewer codex_cli` は同じ候補を別のCodex呼出でレビューします。Codex選択時にFakeへ切り替える処理はありません。

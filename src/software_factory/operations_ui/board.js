@@ -388,9 +388,43 @@ function verificationView(verification) {
   );
 }
 
+function patchDownloads({artifacts}) {
+  const patches = artifacts.filter(({kind, status}) => kind === "PATCH" && status === "AVAILABLE");
+  if (!patches.length) return section("変更パッチ", element("p", "ダウンロードできるパッチはありません。"));
+  const buttons = patches.map(({id}) => {
+    const button = element("button", `パッチをダウンロード · ${id.slice(0, 8)}`);
+    button.type = "button";
+    button.addEventListener("click", async () => {
+      button.disabled = true;
+      const signal = detailRequest?.signal;
+      try {
+        const response = await fetch(`/v1/artifacts/${encodeURIComponent(id)}/content`, {
+          headers: {Authorization: `Bearer ${token}`}, signal, cache: "no-store", redirect: "error",
+        });
+        if (!response.ok) throw new ApiError(response.status);
+        const blob = await response.blob();
+        if (signal?.aborted) return;
+        const url = URL.createObjectURL(blob);
+        const link = element("a");
+        link.href = url;
+        link.download = `factory-${id}.patch`;
+        link.click();
+        setTimeout(() => URL.revokeObjectURL(url), 1000);
+      } catch (error) {
+        if (!signal?.aborted) message("detail-status", error.message, true);
+      } finally {
+        button.disabled = false;
+      }
+    });
+    return button;
+  });
+  return section("変更パッチ", ...buttons);
+}
+
 const detailSections = [
   ["graph", "ジョブ・試行・修正", graphView],
   ["publication", "PR・公開処理", publicationView],
+  ["artifacts", "変更パッチ", patchDownloads],
   ["approvals", "承認", (items) => records("承認", items, (item) => [
     ["判断", item.action], ["状態", item.status], ["期限", date(item.expires_at)],
     ["Approval ID", item.approval_id],
@@ -559,6 +593,25 @@ const taskForm = get("task-form");
 let taskRequest;
 let taskProjects = [];
 let taskSubmission;
+let createdTask;
+
+function taskKey() {
+  return Array.from(crypto.getRandomValues(new Uint8Array(16)),
+    (byte) => byte.toString(16).padStart(2, "0")).join("");
+}
+
+async function postTask(path, body, key, signal) {
+  const response = await fetch(path, {
+    method: "POST", body, signal, redirect: "error",
+    headers: {Authorization: `Bearer ${token}`, "Content-Type": "application/json",
+      "Idempotency-Key": key},
+  });
+  if (!response.ok) {
+    const error = await response.json().catch(() => ({}));
+    throw new Error(error.code ?? `HTTP ${response.status}`);
+  }
+  return response.json();
+}
 
 function closeTaskDialog() {
   taskRequest?.abort();
@@ -574,7 +627,10 @@ function selectedProject() {
 }
 
 function updateTaskRepositories() {
-  taskOptions(get("task-repository"), selectedProject()?.repositories ?? []);
+  const project = selectedProject();
+  taskOptions(get("task-repository"), project?.repositories ?? []);
+  get("task-write-scope").textContent = project?.allowed_write_paths?.length
+    ? `変更を許可する範囲 · ${project.allowed_write_paths.join("、")}` : "";
 }
 
 get("task-project").addEventListener("change", updateTaskRepositories);
@@ -584,7 +640,8 @@ get("task-open").addEventListener("click", async () => {
   const {signal} = taskRequest;
   taskForm.reset();
   taskForm.hidden = true;
-  taskSubmission = undefined;
+  taskSubmission = createdTask = undefined;
+  get("task-run").hidden = true;
   taskDialog.showModal();
   message("task-status", "作成先を取得中…");
   try {
@@ -641,31 +698,21 @@ taskForm.addEventListener("submit", async (event) => {
   });
   const path = `/v1/projects/${encodeURIComponent(project.id)}/tasks`;
   if (taskSubmission?.body !== body || taskSubmission?.path !== path) {
-    const key = Array.from(crypto.getRandomValues(new Uint8Array(16)),
-      (byte) => byte.toString(16).padStart(2, "0")).join("");
-    taskSubmission = {body, path, key};
+    taskSubmission = {body, path, key: taskKey()};
   }
   const {signal} = taskRequest;
   const close = taskDialog.querySelector("header button");
   submit.disabled = close.disabled = true;
   message("task-status", "タスクを作成中…");
   try {
-    const response = await fetch(path, {
-      method: "POST", body, signal, redirect: "error",
-      headers: {Authorization: `Bearer ${token}`, "Content-Type": "application/json",
-        "Idempotency-Key": taskSubmission.key},
-    });
-    if (!response.ok) {
-      const error = await response.json().catch(() => ({}));
-      throw new Error(error.code ?? `HTTP ${response.status}`);
-    }
-    const result = await response.json();
+    const result = await postTask(path, body, taskSubmission.key, signal);
     if (signal.aborted) return;
+    createdTask = {...result, key: taskKey()};
     taskForm.hidden = true;
     taskForm.reset();
-    message("task-status", `「${title}」を作成しました。タスク ID ${result.task_id}。実行は開始していません。`);
-    close.disabled = false;
-    close.focus();
+    message("task-status", `「${title}」を作成しました。タスク ID ${result.task_id}。`);
+    get("task-run").hidden = false;
+    get("task-run").focus();
   } catch (error) {
     if (!signal.aborted) message("task-status", `作成できませんでした（${error.message}）。`, true);
   } finally {
@@ -674,7 +721,30 @@ taskForm.addEventListener("submit", async (event) => {
 });
 
 taskDialog.addEventListener("cancel", (event) => {
-  if (get("task-submit").disabled) event.preventDefault();
+  if (get("task-submit").disabled || get("task-run").disabled) event.preventDefault();
+});
+
+get("task-run").addEventListener("click", async () => {
+  const button = get("task-run");
+  if (button.disabled || !createdTask || taskRequest.signal.aborted) return;
+  const {task_id, spec_version, key} = createdTask;
+  const {signal} = taskRequest;
+  const close = taskDialog.querySelector("header button");
+  button.disabled = close.disabled = true;
+  message("task-status", "実行を登録中…");
+  try {
+    const run = await postTask(`/v1/tasks/${encodeURIComponent(task_id)}/runs`,
+      JSON.stringify({spec_version}), key, signal);
+    if (signal.aborted) return;
+    button.hidden = true;
+    message("task-status", `実行を登録しました。Run ID ${run.run_id}。`);
+    void loadBoard();
+  } catch (error) {
+    if (!signal.aborted) message("task-status", `実行を登録できませんでした（${error.message}）。`, true);
+  } finally {
+    button.disabled = close.disabled = false;
+    if (button.hidden && !signal.aborted) close.focus();
+  }
 });
 
 const settingsPath = "/v1/operations/integrations";

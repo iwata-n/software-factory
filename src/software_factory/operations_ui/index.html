@@ -53,9 +53,11 @@
       <form method="dialog"><button>閉じる</button></form>
     </header>
     <p id="task-status" role="status"></p>
+    <button id="task-run" type="button" hidden>作成したタスクを実行</button>
     <form id="task-form" hidden>
       <label>プロジェクト<select id="task-project" required></select></label>
       <label>リポジトリ<select id="task-repository" required></select></label>
+      <p id="task-write-scope"></p>
       <label>タイトル<input id="task-title" maxlength="200" required></label>
       <label>目的<textarea id="task-objective" rows="3" maxlength="16000" required></textarea></label>
       <label>受け入れ条件<textarea id="task-criteria" rows="4" maxlength="400099" required

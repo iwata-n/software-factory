@@ -152,12 +152,12 @@ def operations_router(service, token_type):
             projects = {}
             for project, repository in rows:
                 if project.id not in projects:
+                    policy = ProjectPolicy.model_validate(project.policy)
                     projects[project.id] = {
                         "id": project.id,
                         "name": project.name,
-                        "verification": ProjectPolicy.model_validate(
-                            project.policy
-                        ).verification.model_dump(),
+                        "verification": policy.verification.model_dump(),
+                        "allowed_write_paths": policy.allowed_write_paths,
                         "repositories": [],
                     }
                 projects[project.id]["repositories"].append(
