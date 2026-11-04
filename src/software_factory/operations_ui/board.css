@@ -15,9 +15,43 @@ body { margin: 0; }
   color: white;
   display: flex;
   justify-content: space-between;
+  align-items: center;
   gap: 12px;
-  padding: 14px max(16px, calc((100vw - 1200px) / 2));
+  padding: 8px max(16px, calc((100vw - 1200px) / 2));
   font-weight: 650;
+}
+.masthead-menu { position: relative; }
+.masthead-menu summary {
+  min-height: 44px;
+  border: 1px solid #94b4a8;
+  border-radius: 8px;
+  padding: 8px 12px;
+  white-space: nowrap;
+}
+.masthead-menu summary:focus-visible { outline: 3px solid white; outline-offset: 2px; }
+.masthead-menu-panel {
+  position: absolute;
+  inset-block-start: calc(100% + 6px);
+  inset-inline-end: 0;
+  z-index: 2;
+  display: grid;
+  gap: 4px;
+  width: min(230px, calc(100vw - 32px));
+  max-height: calc(100dvh - 72px);
+  overflow: auto;
+  padding: 8px;
+  color: #182624;
+  background: white;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  box-shadow: 0 8px 22px rgb(17 40 34 / 18%);
+}
+.masthead-menu-panel button { text-align: start; }
+#account-name {
+  margin: 0 0 4px;
+  padding: 4px 10px 8px;
+  border-bottom: 1px solid var(--line);
+  overflow-wrap: anywhere;
 }
 main { max-width: 1232px; padding: 20px 16px 40px; margin: auto; }
 h1 { margin: 0 0 16px; font-size: 1.85rem; }

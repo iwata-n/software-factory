@@ -10,6 +10,8 @@ const lanes = new Map([
   ["CANCELLED", "取消済み"],
 ]);
 const detail = get("detail");
+const toolbar = get("toolbar");
+const menuToggle = toolbar.querySelector("summary");
 const executionButtons = ["execution-action", "execution-submit", "execution-dismiss"];
 let token = "";
 let account;
@@ -87,6 +89,7 @@ function disconnect(text = "接続を終了しました。", error = false) {
   detail.close();
   get("detail-content").replaceChildren();
   get("board").replaceChildren();
+  toolbar.open = false;
   for (const id of ["board", "toolbar", "older"]) get(id).hidden = true;
   get("token-login").hidden = false;
   get("login").hidden = !secureAccounts;
@@ -589,6 +592,22 @@ get("connect").addEventListener("submit", (event) => {
   token = get("token").value.trim();
   get("token").value = "";
   if (token) loadBoard();
+});
+toolbar.addEventListener("click", (event) => {
+  if (event.target.closest("button")) {
+    toolbar.open = false;
+    menuToggle.focus();
+  }
+}, {capture: true});
+toolbar.addEventListener("keydown", (event) => {
+  if (event.key === "Escape" && toolbar.open) {
+    event.preventDefault();
+    toolbar.open = false;
+    menuToggle.focus();
+  }
+});
+document.addEventListener("click", (event) => {
+  if (toolbar.open && !toolbar.contains(event.target)) toolbar.open = false;
 });
 get("refresh").addEventListener("click", () => loadBoard());
 get("older").addEventListener("click", () => loadBoard(true));
