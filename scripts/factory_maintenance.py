@@ -40,6 +40,7 @@ from software_factory.models import (
     SlackDelivery,
     SpecVersion,
     Task,
+    WebSession,
     WorkerEvent,
     Workspace,
 )
@@ -262,6 +263,7 @@ def restore(database, root, bundle, certificate, key):
         if inventory(database) != rows:
             raise ValueError("Restored database and Artifact inventory disagree")
         with database.transaction() as session:
+            session.execute(delete(WebSession))
             now = db_now(session)
             for workspace in session.scalars(select(Workspace)):
                 before = workspace.execution_stop_revision

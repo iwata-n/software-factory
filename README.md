@@ -54,6 +54,18 @@ uv run python scripts/create_demo.py --workspace-id '<bootstrapのworkspace_id>'
 
 実行中Workerがあれば、Runは `BLOCKED / ASSEMBLE_CANDIDATE / CHANGE_ARTIFACT_MISSING` に到達します。出力されるRun URLはAPIリソースです。User認証付きのGETでスナップショット、停止理由、費用を確認できます。`/graph` は試行とLease状態、`/event-history?after_revision=N` は保存した履歴を返します。SSE配信は後続です。
 
+## カンバンにアカウントでログインする
+
+既存のDBには先に `uv run alembic upgrade head` を適用してから Control Plane を再起動します。
+最初のアカウントは、`/operations` の「トークンで接続」に管理者の User トークンを入力し、
+「アカウント管理」で追加します。以後はユーザー名とパスワードでログインできます。
+ログイン状態は7日間保持され、ログアウト、アカウントの無効化、パスワードの再設定で失効します。
+ユーザー名は同じ Control Plane 内で一意です。大文字と小文字は区別しません。
+
+管理者は同じ Workspace 内で閲覧者、操作者、管理者のアカウントを追加できます。
+アカウントを管理するブラウザは HTTPS または同じ端末のループバックから接続してください。
+CLI・Workerの認証は従来のトークンを使います。
+
 ## Software Factory 自身の改善を試す
 
 `scripts/serve_self_host.py` は一時 PostgreSQL に Software Factory 専用 Workspace を作り、
@@ -73,6 +85,8 @@ uv run --locked python scripts/with_postgres.py python scripts/serve_self_host.p
 ```
 
 出力されたローカル URL を開き、出力されたファイルから Operator トークンを入力します。
+`--admin-username factory-admin` を付けると、代わりにログイン用アカウントを作成し、
+初期パスワードを所有者だけが読めるファイルに保存します。
 「新規タスク」で受け入れ条件を登録し、「作成したタスクを実行」を押します。
 カンバンの Run 詳細で Check・Gate を確認し、「変更パッチ」から候補を取得できます。
 Publisher を起動していないため、Local Gate 通過後は公開待ちになります。

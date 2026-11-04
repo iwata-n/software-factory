@@ -72,6 +72,25 @@ class Principal(Tenant, Base):
     previous_token_expires_at: Mapped[float | None] = mapped_column(Float, nullable=True)
 
 
+class WebAccount(Base):
+    __tablename__ = "web_accounts"
+
+    principal_id: Mapped[str] = mapped_column(ForeignKey("principals.id"), primary_key=True)
+    username: Mapped[str] = mapped_column(String(64), unique=True)
+    password_salt: Mapped[bytes] = mapped_column(LargeBinary)
+    password_hash: Mapped[bytes] = mapped_column(LargeBinary)
+    login_failures: Mapped[int] = mapped_column(Integer, default=0)
+    login_after: Mapped[float] = mapped_column(Float, default=0)
+
+
+class WebSession(Base):
+    __tablename__ = "web_sessions"
+
+    token_hash: Mapped[str] = mapped_column(String(64), primary_key=True)
+    principal_id: Mapped[str] = mapped_column(ForeignKey("web_accounts.principal_id"), index=True)
+    expires_at: Mapped[float] = mapped_column(Float)
+
+
 class Enrollment(Tenant, Base):
     __tablename__ = "worker_enrollments"
     token_hash: Mapped[str] = mapped_column(String(64), unique=True)

@@ -63,6 +63,7 @@ def main():
     parser.add_argument("--codex-binary", required=True, type=Path)
     parser.add_argument("--codex-manifest", required=True, type=Path)
     parser.add_argument("--port", type=int)
+    parser.add_argument("--admin-username", help="Provision a web administrator for this preview")
     args = parser.parse_args()
     db = os.environ["FACTORY_DATABASE_URL"]
     if not str(make_url(db).query.get("host", "")).startswith("/private/tmp/factory-pg-"):
@@ -232,9 +233,29 @@ def main():
                         *extra,
                     )
                 )
-        operator = admin("issue-user", "--workspace-id", workspace, "--access", "OPERATOR")
-        token_path = output / "operator-token.txt"
-        token_path.write_text(operator["user_token"] + "\n")
+        if args.admin_username:
+            password = secrets.token_urlsafe(24)
+            with httpx.Client(
+                base_url=url,
+                timeout=30,
+                trust_env=False,
+                headers={"Authorization": f"Bearer {account['user_token']}", "Origin": url},
+            ) as client:
+                post(
+                    client,
+                    "/v1/auth/accounts",
+                    {
+                        "username": args.admin_username,
+                        "password": password,
+                        "access": "ADMIN",
+                    },
+                )
+            credential_path = output / "admin-password.txt"
+            credential_path.write_text(password + "\n")
+        else:
+            operator = admin("issue-user", "--workspace-id", workspace, "--access", "OPERATOR")
+            credential_path = output / "operator-token.txt"
+            credential_path.write_text(operator["user_token"] + "\n")
         (output / "workspace.json").write_text(
             json.dumps(
                 {
@@ -245,7 +266,7 @@ def main():
                 }
             )
         )
-        print(f"{url}/operations\n{token_path}\n{base['sha']}", flush=True)
+        print(f"{url}/operations\n{credential_path}\n{base['sha']}", flush=True)
         while all(process.poll() is None for process in [source_process, server, *workers]):
             time.sleep(1)
         raise RuntimeError(f"Self-host service stopped. See logs in {output}")

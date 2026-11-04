@@ -70,16 +70,25 @@ from .models import (
 )
 from .operations import event_view, operations_router
 from .resolver import SourceResolver
-from .service import DomainError, Service, owned, run_view
+from .service import WEB_SESSION_PREFIX, DomainError, Service, owned, run_view
 from .slack_delivery import NOTIFICATION, SlackClient, SlackDispatcher
+from .web_accounts import browser_token, web_accounts_router
 
 security = HTTPBearer(auto_error=False)
 
 
-def bearer(credentials: Annotated[HTTPAuthorizationCredentials | None, Depends(security)]) -> str:
-    if credentials is None or credentials.scheme.lower() != "bearer":
-        raise DomainError(401, "UNAUTHENTICATED")
-    return credentials.credentials
+def bearer(
+    request: Request,
+    credentials: Annotated[HTTPAuthorizationCredentials | None, Depends(security)],
+) -> str:
+    if credentials is not None:
+        if credentials.scheme.lower() == "bearer" and not credentials.credentials.startswith(
+            WEB_SESSION_PREFIX
+        ):
+            return credentials.credentials
+    elif not request.headers.get("Authorization") and (token := browser_token(request)):
+        return token
+    raise DomainError(401, "UNAUTHENTICATED")
 
 
 Token = Annotated[str, Depends(bearer)]
@@ -181,6 +190,7 @@ def create_app(
     if jira := configured_jira():
         app.include_router(jira_router(service, *jira))
     app.include_router(operations_router(service, Token))
+    app.include_router(web_accounts_router(service, Token))
     app.include_router(integration_router(service, Token, vault, oauth_origin(), integrations))
 
     @app.exception_handler(DomainError)

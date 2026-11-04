@@ -42,6 +42,7 @@ from .models import (
     RunEvent,
     SpecVersion,
     Task,
+    WebSession,
     Worker,
     WorkerEvent,
     Workspace,
@@ -59,6 +60,7 @@ from .security import redact
 from .slack_delivery import enqueue_result
 from .worker_credentials import rotated_token
 
+WEB_SESSION_PREFIX = "web."
 LEASE_SECONDS = 90
 WORKER_TOKEN_SECONDS = 24 * 60 * 60
 WORKER_ROTATION_GRACE_SECONDS = 60
@@ -268,6 +270,23 @@ class Service:
 
     def principal(self, session: Session, token: str, role: str) -> Principal:
         hashed = token_hash(token)
+        if token.startswith(WEB_SESSION_PREFIX):
+            actor = session.scalar(
+                select(Principal)
+                .join(WebSession, WebSession.principal_id == Principal.id)
+                .where(
+                    WebSession.token_hash == hashed,
+                    WebSession.expires_at > db_now(session),
+                    Principal.active.is_(True),
+                    Principal.role == "USER",
+                )
+                .execution_options(populate_existing=True)
+            )
+            if actor is None:
+                raise DomainError(401, "UNAUTHENTICATED")
+            if role != "USER":
+                raise DomainError(403, "PRINCIPAL_ROLE_DENIED")
+            return actor
         actor = session.scalar(
             select(Principal)
             .where(or_(Principal.token_hash == hashed, Principal.previous_token_hash == hashed))

@@ -12,6 +12,13 @@ const lanes = new Map([
 const detail = get("detail");
 const executionButtons = ["execution-action", "execution-submit", "execution-dismiss"];
 let token = "";
+let account;
+const secureAccounts = location.protocol === "https:" ||
+  ["127.0.0.1", "localhost", "[::1]"].includes(location.hostname);
+
+function authHeaders() {
+  return token ? {Authorization: `Bearer ${token}`} : {};
+}
 let runs = [];
 let nextBefore = null;
 let boardRequest;
@@ -43,7 +50,7 @@ class ApiError extends Error {
 
 async function read(path, signal) {
   const response = await fetch(path, {
-    headers: { Authorization: `Bearer ${token}` },
+    headers: authHeaders(),
     cache: "no-store",
     signal,
     redirect: "error",
@@ -70,6 +77,10 @@ function disconnect(text = "接続を終了しました。", error = false) {
   get("worker-list").replaceChildren();
   executionMessage("");
   token = "";
+  account = undefined;
+  accountsDialog.close();
+  get("account-name").hidden = true;
+  get("accounts-open").hidden = true;
   runs = [];
   nextBefore = null;
   selected = null;
@@ -77,8 +88,9 @@ function disconnect(text = "接続を終了しました。", error = false) {
   get("detail-content").replaceChildren();
   get("board").replaceChildren();
   for (const id of ["board", "toolbar", "older"]) get(id).hidden = true;
-  get("connect").hidden = false;
-  get("token").focus();
+  get("token-login").hidden = false;
+  get("login").hidden = !secureAccounts;
+  get(secureAccounts ? "login-username" : "token").focus();
   message("status", text, error);
 }
 
@@ -150,6 +162,10 @@ function renderExecution(context) {
   get("execution-action").hidden = access !== "ADMIN";
   get("task-open").hidden = !["ADMIN", "OPERATOR"].includes(access);
   get("integration-open").hidden = access !== "ADMIN";
+  get("accounts-open").hidden = access !== "ADMIN" || !secureAccounts;
+  get("disconnect").textContent = account ? "ログアウト" : "切断";
+  get("account-name").hidden = !account;
+  get("account-name").textContent = account?.username ?? "";
   get("execution-action").textContent = execution.stopped ? "緊急停止を解除" : "緊急停止";
 }
 
@@ -189,14 +205,14 @@ async function submitExecution(event) {
     const response = await fetch(`/v1/workspaces/${encodeURIComponent(workspaceId)}/execution-control`, {
       method: "POST",
       headers: {
-        Authorization: `Bearer ${token}`, "Content-Type": "application/json", "Idempotency-Key": key,
+        ...authHeaders(), "Content-Type": "application/json", "Idempotency-Key": key,
       },
       body: JSON.stringify({ stopped, expected_revision, reason }),
       cache: "no-store", signal, redirect: "error",
     });
     if (signal.aborted) return;
     if (response.status === 401) {
-      disconnect("User トークンを確認してください。", true);
+      disconnect(account ? "ログインし直してください。" : "User トークンを確認してください。", true);
       return;
     }
     if ([403, 409].includes(response.status)) {
@@ -271,14 +287,14 @@ async function loadBoard(older = false) {
     runs = older ? [...runs, ...page.runs] : page.runs;
     nextBefore = page.next_before;
     renderBoard();
-    get("connect").hidden = true;
+    get("token-login").hidden = get("login").hidden = true;
     get("board").hidden = get("toolbar").hidden = false;
     get("older").hidden = !nextBefore;
     message("status", runs.length ? `${runs.length} 件を表示中` : "この Workspace に Run はありません。");
   } catch (error) {
     if (signal.aborted) return;
     if ([401, 403].includes(error.status)) {
-      disconnect("User トークンを確認してください。", true);
+      disconnect(account ? "ログインし直してください。" : "User トークンを確認してください。", true);
     } else {
       message("status", "一覧を更新できませんでした。再試行してください。", true);
     }
@@ -399,7 +415,7 @@ function patchDownloads({artifacts}) {
       const signal = detailRequest?.signal;
       try {
         const response = await fetch(`/v1/artifacts/${encodeURIComponent(id)}/content`, {
-          headers: {Authorization: `Bearer ${token}`}, signal, cache: "no-store", redirect: "error",
+          headers: authHeaders(), signal, cache: "no-store", redirect: "error",
         });
         if (!response.ok) throw new ApiError(response.status);
         const blob = await response.blob();
@@ -449,7 +465,7 @@ async function followRunEvents(root, runId, revision, signal) {
   const list = get("run-event-list");
   while (!signal.aborted) {
     try {
-      const headers = { Authorization: `Bearer ${token}`, Accept: "text/event-stream" };
+      const headers = { ...authHeaders(), Accept: "text/event-stream" };
       if (revision !== undefined) headers["Last-Event-ID"] = `${runId}:${revision}`;
       const response = await fetch(`${root}/events`, {
         headers, cache: "no-store", signal, redirect: "error",
@@ -459,7 +475,7 @@ async function followRunEvents(root, runId, revision, signal) {
         return;
       }
       if ([401, 403].includes(response.status)) {
-        if (!signal.aborted) disconnect("User トークンを確認してください。", true);
+        if (!signal.aborted) disconnect(account ? "ログインし直してください。" : "User トークンを確認してください。", true);
         return;
       }
       if (!response.ok) throw new ApiError(response.status);
@@ -559,7 +575,7 @@ async function loadDetail() {
   } catch (error) {
     if (signal.aborted) return;
     if ([401, 403].includes(error.status)) {
-      disconnect("User トークンを確認してください。", true);
+      disconnect(account ? "ログインし直してください。" : "User トークンを確認してください。", true);
     } else {
       message("detail-status", error instanceof ApiError ? error.message : "詳細を取得できませんでした。", true);
     }
@@ -576,7 +592,18 @@ get("connect").addEventListener("submit", (event) => {
 });
 get("refresh").addEventListener("click", () => loadBoard());
 get("older").addEventListener("click", () => loadBoard(true));
-get("disconnect").addEventListener("click", () => disconnect());
+get("disconnect").addEventListener("click", async () => {
+  const button = get("disconnect");
+  button.disabled = true;
+  try {
+    if (account) await accountCall("/logout", "POST");
+    disconnect(account ? "ログアウトしました。" : "接続を終了しました。");
+  } catch {
+    message("status", "ログアウトできませんでした。もう一度お試しください。", true);
+  } finally {
+    button.disabled = false;
+  }
+});
 get("reload-detail").addEventListener("click", loadDetail);
 detail.addEventListener("close", () => {
   if (detail.open) return;
@@ -587,6 +614,162 @@ detail.addEventListener("close", () => {
 get("execution-action").addEventListener("click", openExecutionForm);
 get("execution-dismiss").addEventListener("click", closeExecutionForm);
 get("execution-form").addEventListener("submit", submitExecution);
+
+const accountsDialog = get("accounts-dialog");
+const accountForm = get("account-create");
+let accountRequest;
+
+async function accountCall(path, method = "GET", body, signal) {
+  const response = await fetch("/v1/auth" + path, {
+    method, signal, redirect: "error", cache: "no-store",
+    headers: {...authHeaders(), ...(body === undefined ? {} : {"Content-Type": "application/json"})},
+    ...(body === undefined ? {} : {body: JSON.stringify(body)}),
+  });
+  if (!response.ok) {
+    const error = new ApiError(response.status);
+    error.code = (await response.json().catch(() => ({}))).code;
+    throw error;
+  }
+  return response.status === 204 ? null : response.json();
+}
+
+get("login").addEventListener("submit", async (event) => {
+  event.preventDefault();
+  if (!secureAccounts) return;
+  const button = event.submitter;
+  const body = Object.fromEntries(new FormData(event.currentTarget));
+  get("login-password").value = "";
+  button.disabled = true;
+  try {
+    account = await accountCall("/login", "POST", body);
+    token = "";
+    await loadBoard();
+  } catch (error) {
+    message("status", error.status === 401 ? "ユーザー名またはパスワードを確認してください。" :
+      "ログインできませんでした。少し待ってもう一度お試しください。", true);
+  } finally {
+    button.disabled = false;
+  }
+});
+
+async function restoreAccount() {
+  get("token-login").open = !secureAccounts;
+  if (!secureAccounts) {
+    message("status", "トークンで接続すると Run を表示します。");
+    return;
+  }
+  try {
+    const saved = await accountCall("/session");
+    if (token) return;
+    if (saved) {
+      account = saved;
+      await loadBoard();
+      return;
+    }
+  } catch {
+    // The token sign-in path remains available during a session lookup failure.
+  }
+  if (!token) get("login").hidden = false;
+}
+
+const accessLabels = {VIEWER: "閲覧者", OPERATOR: "操作者", ADMIN: "管理者"};
+
+async function renderAccounts(signal) {
+  const {accounts, current_id} = await accountCall("/accounts", "GET", undefined, signal);
+  if (signal.aborted) return;
+  const list = get("accounts-list");
+  list.replaceChildren();
+  for (const item of accounts) {
+    const row = element("section", undefined, "detail-section");
+    row.append(element("h3", item.username),
+      element("p", `${accessLabels[item.access]} · ${item.active ? "有効" : "無効"}`));
+    if (item.id !== current_id) {
+      const toggle = element("button", item.active ? "無効化" : "有効化");
+      toggle.addEventListener("click", async () => {
+        if (item.active && !confirm(`${item.username} を無効化しますか？`)) return;
+        await changeAccount(toggle, async () => {
+          await accountCall(`/accounts/${item.id}`, "PATCH", {active: !item.active}, signal);
+          await renderAccounts(signal);
+          message("accounts-status", "アカウントの状態を変更しました。");
+        });
+      });
+      row.append(toggle);
+    }
+    const reset = element("form", undefined, "account-form");
+    const field = element("label", "新しいパスワード");
+    const input = element("input");
+    input.type = "password";
+    input.autocomplete = "new-password";
+    input.minLength = 12;
+    input.maxLength = 256;
+    input.required = true;
+    field.append(input);
+    reset.append(field, element("button", "パスワードを再設定"));
+    reset.addEventListener("submit", (event) => {
+      event.preventDefault();
+      const password = input.value;
+      input.value = "";
+      void changeAccount(event.submitter, async () => {
+        await accountCall(`/accounts/${item.id}/password`, "PUT", {password}, signal);
+        if (item.id === current_id && account) {
+          disconnect("パスワードを変更しました。新しいパスワードでログインしてください。");
+          return;
+        }
+        message("accounts-status", "パスワードを再設定しました。");
+      });
+    });
+    row.append(reset);
+    list.append(row);
+  }
+  if (!accounts.length) list.append(element("p", "ログイン用アカウントはまだありません。"));
+  accountForm.hidden = false;
+}
+
+async function changeAccount(control, action) {
+  control.disabled = true;
+  try {
+    await action();
+  } catch (error) {
+    if (error.name !== "AbortError") message("accounts-status",
+      error.code === "USERNAME_TAKEN" ? "そのユーザー名は使用済みです。" : "変更できませんでした。", true);
+  } finally {
+    control.disabled = false;
+  }
+}
+
+get("accounts-open").addEventListener("click", async () => {
+  accountRequest?.abort();
+  accountRequest = new AbortController();
+  accountForm.hidden = true;
+  get("accounts-list").replaceChildren();
+  message("accounts-status", "");
+  accountsDialog.showModal();
+  try {
+    await renderAccounts(accountRequest.signal);
+  } catch (error) {
+    if (error.name !== "AbortError") message("accounts-status", "一覧を取得できませんでした。", true);
+  }
+});
+
+accountForm.addEventListener("submit", (event) => {
+  event.preventDefault();
+  const body = Object.fromEntries(new FormData(accountForm));
+  accountForm.elements.password.value = "";
+  const {signal} = accountRequest;
+  void changeAccount(event.submitter, async () => {
+    await accountCall("/accounts", "POST", body, signal);
+    accountForm.reset();
+    await renderAccounts(signal);
+    if (!signal.aborted) message("accounts-status", "アカウントを追加しました。");
+  });
+});
+
+accountsDialog.addEventListener("close", () => {
+  if (accountsDialog.open) return;
+  accountRequest?.abort();
+  accountForm.reset();
+  get("accounts-list").replaceChildren();
+});
 
 const taskDialog = get("task-dialog");
 const taskForm = get("task-form");
@@ -603,7 +786,7 @@ function taskKey() {
 async function postTask(path, body, key, signal) {
   const response = await fetch(path, {
     method: "POST", body, signal, redirect: "error",
-    headers: {Authorization: `Bearer ${token}`, "Content-Type": "application/json",
+    headers: {...authHeaders(), "Content-Type": "application/json",
       "Idempotency-Key": key},
   });
   if (!response.ok) {
@@ -767,7 +950,7 @@ const providerFields = {
 async function integrationCall(path, method, body, signal) {
   const response = await fetch(settingsPath + path, {
     method, signal, cache: "no-store", redirect: "error",
-    headers: {Authorization: `Bearer ${token}`, "Content-Type": "application/json"},
+    headers: {...authHeaders(), "Content-Type": "application/json"},
     ...(body === undefined ? {} : {body: JSON.stringify(body)}),
   });
   if (!response.ok) {
@@ -1003,3 +1186,5 @@ if (oauthResult === "connected" || oauthResult === "failed") {
     : "OAuth 認可を完了できませんでした。元の設定画面からやり直してください。", oauthResult === "failed");
   history.replaceState(null, "", location.pathname);
 }
+
+void restoreAccount();

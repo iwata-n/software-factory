@@ -113,3 +113,8 @@ summary { cursor: pointer; padding: 10px 0; }
   border-radius: 8px;
 }
 #task-form textarea { resize: vertical; }
+
+.account-form label { display: grid; gap: 4px; margin-block: 10px; }
+.account-form select { font: inherit; min-height: 44px; border-radius: 8px; padding: 6px; }
+#token-login { margin-top: 8px; }
+#accounts-list { margin-block-end: 16px; }

@@ -11,18 +11,30 @@
   <header class="masthead"><span>Software Factory</span><span>運用</span></header>
   <main>
     <h1>Run カンバン</h1>
-    <form id="connect">
+    <form id="login" class="account-form" hidden>
+      <label>ユーザー名<input id="login-username" name="username" autocomplete="username"
+        autocapitalize="none" spellcheck="false" minlength="3" maxlength="64" required></label>
+      <label>パスワード<input id="login-password" name="password" type="password"
+        autocomplete="current-password" maxlength="256" required></label>
+      <button type="submit">ログイン</button>
+    </form>
+    <details id="token-login">
+      <summary>トークンで接続</summary>
+      <form id="connect">
       <label for="token">Workspace の User トークン</label>
       <div class="controls">
         <input type="password" id="token" required autocomplete="off" spellcheck="false">
         <button type="submit">接続</button>
       </div>
-    </form>
+      </form>
+    </details>
     <div id="toolbar" class="controls" hidden>
       <button id="refresh">更新</button>
       <button id="disconnect">切断</button>
       <button id="task-open" hidden>新規タスク</button>
       <button id="integration-open" hidden>連携設定</button>
+      <button id="accounts-open" hidden>アカウント管理</button>
+      <span id="account-name" hidden></span>
     </div>
     <section id="execution" class="execution" aria-labelledby="execution-title" hidden>
       <h2 id="execution-title">Workspace の実行状態</h2>
@@ -43,10 +55,31 @@
       <p id="worker-status" role="status"></p>
       <div id="worker-list"></div>
     </details>
-    <p id="status" role="status">User トークンで接続すると Run を表示します。</p>
+    <p id="status" role="status">ログインすると Run を表示します。</p>
     <div id="board" class="board" aria-label="Run の状態別一覧" hidden></div>
     <button id="older" hidden>過去の Run を追加表示</button>
   </main>
+  <dialog id="accounts-dialog" aria-labelledby="accounts-title">
+    <header class="detail-header">
+      <h2 id="accounts-title">アカウント管理</h2>
+      <form method="dialog"><button>閉じる</button></form>
+    </header>
+    <p id="accounts-status" role="status"></p>
+    <div id="accounts-list"></div>
+    <form id="account-create" class="account-form" hidden>
+      <h3>アカウントを追加</h3>
+      <label>ユーザー名<input name="username" autocomplete="off" autocapitalize="none"
+        spellcheck="false" pattern="[A-Za-z0-9][A-Za-z0-9_.\-]{2,63}" required></label>
+      <label>初期パスワード<input name="password" type="password" autocomplete="new-password"
+        minlength="12" maxlength="256" required></label>
+      <label>権限<select name="access">
+        <option value="VIEWER">閲覧者</option>
+        <option value="OPERATOR">操作者</option>
+        <option value="ADMIN">管理者</option>
+      </select></label>
+      <button type="submit">追加</button>
+    </form>
+  </dialog>
   <dialog id="task-dialog" aria-labelledby="task-heading">
     <header class="detail-header">
       <h2 id="task-heading">新規タスク</h2>
