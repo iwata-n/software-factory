@@ -62,7 +62,8 @@
       <div id="worker-list"></div>
     </details>
     <p id="status" role="status">ログインすると Run を表示します。</p>
-    <div id="board" class="board" aria-label="Run の状態別一覧" hidden></div>
+    <div id="board" class="board" role="region" tabindex="0"
+      aria-label="Run の状態別カンバン。横にスクロールしてレーンを表示" hidden></div>
     <button id="older" hidden>過去の Run を追加表示</button>
   </main>
   <dialog id="accounts-dialog" aria-labelledby="accounts-title">

@@ -76,17 +76,35 @@ button:hover { background: #e8f3ee; }
 button:disabled { opacity: .6; cursor: default; }
 button:focus-visible, input:focus-visible { outline: 3px solid #08765c; outline-offset: 2px; }
 button[type="submit"] { background: var(--accent); color: white; }
-.board { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 12px; }
+.board {
+  display: grid;
+  grid-auto-flow: column;
+  grid-auto-columns: clamp(14rem, 72vw, 17rem);
+  gap: 12px;
+  overflow-x: auto;
+  overscroll-behavior-inline: contain;
+  scroll-snap-type: inline proximity;
+  padding: 2px 2px 12px;
+}
+.board:focus-visible { outline: 3px solid #08765c; outline-offset: 2px; }
 .lane {
   background: #e6eeea;
   border: 1px solid var(--line);
   padding: 12px;
   border-radius: 12px;
   min-width: 0;
+  min-height: 12rem;
+  scroll-snap-align: start;
 }
 .lane h2 { display: flex; justify-content: space-between; gap: 6px; }
 .lane-count { color: var(--muted); font-variant-numeric: tabular-nums; }
-.lane ul { margin: 10px 0 0; padding: 0; list-style: none; }
+.lane ul {
+  max-height: max(12rem, 55dvh);
+  overflow-y: auto;
+  margin: 8px -4px -4px;
+  padding: 4px;
+  list-style: none;
+}
 .lane li + li { margin-top: 8px; }
 .card { width: 100%; text-align: left; color: inherit; overflow-wrap: anywhere; }
 .card small { display: block; color: var(--muted); font-weight: 500; }
@@ -118,9 +136,6 @@ dd { margin: 0; }
 .record + .record { border-top: 1px solid var(--line); }
 summary { cursor: pointer; padding: 10px 0; }
 .error { color: #942f21; }
-@media (max-width: 1000px) { .board { grid-template-columns: repeat(3, minmax(0, 1fr)); } }
-@media (max-width: 740px) { .board { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
-@media (max-width: 440px) { .board { grid-template-columns: minmax(0, 1fr); } }
 
 .execution {
   margin-top: 12px;

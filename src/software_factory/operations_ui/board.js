@@ -106,6 +106,10 @@ function disconnect(text = "接続を終了しました。", error = false) {
 }
 
 function renderBoard() {
+  const board = get("board");
+  const scrollLeft = board.scrollLeft;
+  const laneOffsets = new Map([...board.querySelectorAll(".lane ul")]
+    .map((list) => [list.closest(".lane").dataset.status, list.scrollTop]));
   const focusedRun = document.activeElement?.dataset.runId;
   const grouped = new Map([...lanes.keys()].map((status) => [status, []]));
   for (const run of runs) {
@@ -115,6 +119,7 @@ function renderBoard() {
   const sections = [];
   for (const [status, items] of grouped) {
     const section = element("section", undefined, "lane");
+    section.dataset.status = status;
     const heading = element("h2", lanes.get(status) ?? status);
     heading.id = `lane-${sections.length}`;
     heading.append(element("span", items.length, "lane-count"));
@@ -146,8 +151,11 @@ function renderBoard() {
     }
     sections.push(section);
   }
-  const board = get("board");
   board.replaceChildren(...sections);
+  board.scrollLeft = scrollLeft;
+  for (const list of board.querySelectorAll(".lane ul")) {
+    list.scrollTop = laneOffsets.get(list.closest(".lane").dataset.status) ?? 0;
+  }
   if (focusedRun) {
     board.querySelector(`[data-run-id="${CSS.escape(focusedRun)}"]`)?.focus({preventScroll: true});
   }
