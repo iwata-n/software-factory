@@ -4,6 +4,7 @@ import argparse
 import json
 import os
 import secrets
+import shutil
 import subprocess
 import sys
 import time
@@ -63,6 +64,7 @@ def main():
     parser.add_argument("--codex-binary", required=True, type=Path)
     parser.add_argument("--codex-manifest", required=True, type=Path)
     parser.add_argument("--port", type=int)
+    parser.add_argument("--codex-login-binary", default=shutil.which("codex"))
     parser.add_argument("--admin-username", help="Provision a web administrator for this preview")
     args = parser.parse_args()
     db = os.environ["FACTORY_DATABASE_URL"]
@@ -132,10 +134,19 @@ def main():
             base = post(
                 source, "/v1/sources/resolve", {"remote_url": REMOTE, "base_ref": args.base_ref}
             )
-        server = start(stack, output, "server", "software_factory.cli", server_env, "serve")
-        wait_ready(url + "/healthz", server)
         account = admin("bootstrap", "--name", "Software Factory")
         workspace = account["workspace_id"]
+        codex_root = {}
+        if args.codex_login_binary:
+            codex_root["FACTORY_CODEX_AUTH_ROOT"] = str(output / "codex-account")
+            server_env.update(
+                codex_root,
+                FACTORY_CODEX_WORKSPACE_ID=workspace,
+                FACTORY_CODEX_LOGIN_BINARY=str(Path(args.codex_login_binary).resolve()),
+                FACTORY_CODEX_AUTH_FILE=str(engine.auth_file),
+            )
+        server = start(stack, output, "server", "software_factory.cli", server_env, "serve")
+        wait_ready(url + "/healthz", server)
         pricing = json.loads((ROOT / "config/codex_pricing.json").read_text())
         policy = {
             "agent_adapter": "codex_cli",
@@ -216,6 +227,7 @@ def main():
                         adapter,
                         "software_factory.worker",
                         common
+                        | codex_root
                         | {
                             "FACTORY_WORKER_TOKEN": credential["worker_token"],
                             "FACTORY_RUNNER_IMAGE_DIGEST": image,

@@ -106,6 +106,18 @@ Project Policyは `agent_adapter=codex_cli`、`allow_external_model=true`、`age
 
 Codexは空の一時作業領域で、shell・apps・plugins・browser・画像・sub-agent・hooksを無効にして非対話実行します。Repositoryは許可されたUTF-8ソースのデータとしてだけ渡し、hostへcheckout・実行しません。CP／Worker／GitHub／APIキーの環境変数をCodexプロセスへ渡しません。認証はこの信頼されたCLIクライアントだけが利用します。モデルが返した変更は許可path・保護path・採用Planと照合してpatch化し、適用・実行・PASSの判断は管理対象の隔離Assembler／Verifier／Gateが担当します。OSによる全Sandbox保証の受け入れはSF-21に残ります。
 
+カンバンの「メニュー → 連携設定 → Codex」で、管理者は「既存のログインを使う」を選択できます。
+「ChatGPT で接続する」から新しく認可する場合は、表示されたコードを ChatGPT の認可画面で入力します。
+この方法を使うには ChatGPT 側でデバイスコード認証が許可されている必要があります。
+
+`scripts/serve_self_host.py` は、ホスト用 Codex CLI があればこの設定を有効にします。
+別の構成では Control Plane に `FACTORY_CODEX_WORKSPACE_ID`、`FACTORY_CODEX_AUTH_ROOT`、
+`FACTORY_CODEX_LOGIN_BINARY`（ホスト用CLIの絶対パス）、`FACTORY_CODEX_AUTH_FILE` を渡します。
+同じホストの Worker にも同じ `FACTORY_CODEX_AUTH_ROOT` と `FACTORY_CODEX_AUTH_FILE` を渡します。
+既存のログイン先は `FACTORY_CODEX_AUTH_FILE` で指定し、Web から新しく認可した場合のキャッシュは
+ホスト上の所有者専用ディレクトリ `FACTORY_CODEX_AUTH_ROOT` に保存します。
+設定できるのは指定 Workspace の管理者です。実行する Project は既存の Codex 用ポリシーを使います。
+
 実測トークン数をusage受領APIで精算してから成果物を確定します。記録するUSDはAPI公開単価を参照した **予算用の推計** で、ChatGPT契約の請求額や残利用枠ではありません。usage欠落を架空のゼロ円に変換せず、UNKNOWNで停止します。
 
 実Codexを含む再現用評価は、一時DB・実HTTP Worker・公開Repositoryの固定ソース・Linux Runnerを使います。空状態のgolden testがbaseで失敗することを確認し、Codex生成だけの変更を独立検証してLocal Gateまで進めます。PR／Slack送信はこの評価の対象に含みません。

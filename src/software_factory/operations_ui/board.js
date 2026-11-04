@@ -1212,6 +1212,57 @@ function settingsCard(provider, label, value, oauthAvailable, projects) {
   return card;
 }
 
+async function renderCodexSettings(section, signal) {
+  const result = await integrationCall("/codex", "GET", undefined, signal);
+  if (signal.aborted || !section.isConnected) return;
+  if (result.login === "pending") {
+    setTimeout(() => {
+      if (!signal.aborted && section.isConnected) {
+        void renderCodexSettings(section, signal).catch(() => {
+          if (!signal.aborted) integrationMessage("Codex の認可状態を取得できませんでした。", true);
+        });
+      }
+    }, 2000);
+  }
+  const snapshot = JSON.stringify(result);
+  if (snapshot === section.dataset.snapshot) return;
+  section.dataset.snapshot = snapshot;
+  section.replaceChildren(element("h3", "Codex · ChatGPT サブスクリプション"));
+  if (!result.available) {
+    section.append(element("p", "この Workspace では実行ホストの Codex 接続設定が必要です。"));
+    return;
+  }
+  section.append(element("p", result.connected
+    ? (result.mode === "device" ? "ChatGPT の認可を使用中" : "実行ホストの既存の ChatGPT ログインを使用中")
+    : "ChatGPT に未接続"));
+  if (result.login === "pending") {
+    if (result.user_code) {
+      const auth = element("a", "ChatGPT で認可する（別タブ）");
+      auth.href = "https://auth.openai.com/codex/device";
+      auth.target = "_blank";
+      auth.rel = "noopener noreferrer";
+      const linkRow = element("p");
+      linkRow.append(auth);
+      section.append(element("p", "ChatGPT の画面に次のコードを入力してください。"),
+        element("code", result.user_code), linkRow);
+    } else {
+      section.append(element("p", "認可コードを取得中…"));
+    }
+    return;
+  }
+  if (result.login === "failed") {
+    section.append(element("p", "認可を完了できませんでした。ChatGPT のセキュリティ設定でデバイスコード認証を確認してください。", "error"));
+  }
+  for (const [action, label] of [["existing", "既存のログインを使う"], ["login", "ChatGPT で接続する"]]) {
+    const button = element("button", label);
+    button.addEventListener("click", settingsAction(async (activeSignal) => {
+      await integrationCall(`/codex/${action}`, "POST", undefined, activeSignal);
+      await renderCodexSettings(section, activeSignal);
+    }));
+    section.append(button);
+  }
+}
+
 async function refreshSettings(signal) {
   const loopback = ["localhost", "127.0.0.1", "[::1]"].includes(window.location.hostname);
   if (window.location.protocol !== "https:" && !loopback) {
@@ -1221,9 +1272,12 @@ async function refreshSettings(signal) {
   const status = await integrationCall("", "GET", undefined, signal);
   if (signal.aborted) return;
   const container = get("integration-providers");
-  container.replaceChildren();
+  const codex = element("section", undefined, "detail-section");
+  container.replaceChildren(codex);
+  await renderCodexSettings(codex, signal);
+  if (signal.aborted) return;
   if (!status.available) {
-    integrationMessage("連携設定にはサーバーの暗号化キー設定が必要です。", true);
+    container.append(element("p", "Jira・Slack・GitHubの設定にはサーバーの暗号化キーが必要です。"));
     return;
   }
   const reload = element("button", "状態を更新");

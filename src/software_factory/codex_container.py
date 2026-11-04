@@ -3,7 +3,6 @@
 import os
 import re
 import select
-import stat
 import subprocess
 import sys
 import time
@@ -14,6 +13,7 @@ from threading import Lock
 from uuid import uuid4
 
 from . import model_egress
+from .codex_credentials import chatgpt_credentials, private_bytes, selected_auth
 from .codex_engine import DISABLED_FEATURES, CodexCLI, CodexError, file_hash
 from .codex_watchdog import AUTH_PREFIX, names
 from .sandbox import STOP_UNCONFIRMED, DockerRunner, RunnerError
@@ -204,18 +204,10 @@ class DockerCodexCLI(CodexCLI):
 
     def copy_auth(self, destination):
         try:
-            with os.fdopen(os.open(self.auth_file, os.O_RDONLY | os.O_NOFOLLOW), "rb") as source:
-                info = os.fstat(source.fileno())
-                if (
-                    info.st_uid != os.getuid()
-                    or info.st_mode & 0o077
-                    or not stat.S_ISREG(info.st_mode)
-                    or not 0 < info.st_size <= 1024 * 1024
-                ):
-                    raise ValueError("invalid auth file")
-                content = source.read(1024 * 1024 + 1)
-                if len(content) != info.st_size:
-                    raise ValueError("auth file changed while reading")
+            if root := os.environ.get("FACTORY_CODEX_AUTH_ROOT"):
+                content = chatgpt_credentials(selected_auth(root, self.auth_file))
+            else:
+                content = private_bytes(self.auth_file)
             destination.write_bytes(content)
             # The parent directory is owner-only. The non-root container can read this mount.
             destination.chmod(0o444)

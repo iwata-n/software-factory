@@ -16,6 +16,7 @@ from starlette.concurrency import run_in_threadpool
 
 from .ci_poll import CIPoller, configured_read_tokens
 from .ci_webhook import configured_webhooks, webhook_router
+from .codex_settings import CodexSettings, codex_settings_router
 from .contracts import (
     ApprovalSubmission,
     ArtifactFinalize,
@@ -192,6 +193,7 @@ def create_app(
     app.include_router(operations_router(service, Token))
     app.include_router(web_accounts_router(service, Token))
     app.include_router(integration_router(service, Token, vault, oauth_origin(), integrations))
+    app.include_router(codex_settings_router(service, Token, CodexSettings.configured()))
 
     @app.exception_handler(DomainError)
     async def domain_error(request: Request, error: DomainError):
