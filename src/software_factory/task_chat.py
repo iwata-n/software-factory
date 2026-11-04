@@ -6,6 +6,7 @@ from uuid import UUID
 from fastapi import APIRouter, Request, Response
 from pydantic import Field, ValidationError
 from sqlalchemy import func, select, update
+from sqlalchemy.orm import aliased
 
 from .codex_engine import sensitive_input
 from .contracts import Contract
@@ -144,6 +145,68 @@ def context(session, run, turn, plan):
     return result
 
 
+def chat_limit_reached(session, workspace, now):
+    count = session.scalar(
+        select(func.count())
+        .select_from(TaskChatTurn)
+        .where(
+            TaskChatTurn.workspace_id == workspace,
+            TaskChatTurn.created_at > now - CHAT_WINDOW,
+        )
+    )
+    return count >= CHAT_LIMIT
+
+
+def automatic_proposal(session, workspace):
+    # The worker holds the Workspace lock, so a plan gets at most one automatic turn.
+    newer = aliased(PlanVersion)
+    latest = (
+        ~select(newer.id)
+        .where(
+            newer.workspace_id == PlanVersion.workspace_id,
+            newer.run_id == PlanVersion.run_id,
+            newer.version > PlanVersion.version,
+        )
+        .exists()
+    )
+    proposed = (
+        select(TaskChatTurn.id)
+        .where(
+            TaskChatTurn.workspace_id == workspace,
+            TaskChatTurn.run_id == Run.id,
+            TaskChatTurn.plan_id == PlanVersion.id,
+        )
+        .exists()
+    )
+    for run, plan in session.execute(
+        select(Run, PlanVersion)
+        .join(
+            PlanVersion,
+            (PlanVersion.run_id == Run.id) & (PlanVersion.workspace_id == Run.workspace_id),
+        )
+        .where(
+            Run.workspace_id == workspace,
+            Run.status == "BLOCKED",
+            Run.evidence_expired_at.is_(None),
+            Run.snapshot["policy"]["agent_adapter"].as_string() == "codex_cli",
+            PlanVersion.validation_error.in_(["PLAN_HAS_OPEN_QUESTIONS", "SPEC_CHANGE_REQUIRED"]),
+            latest,
+            ~proposed,
+        )
+        .order_by(Run.created_at.desc(), Run.id.desc())
+    ):
+        if eligible(run) and plan_questions(plan):
+            try:
+                return enqueue_turn(
+                    session, run, "Propose answers to the plan questions.", plan_id=plan.id
+                )
+            except DomainError as error:
+                if error.code in {"TASK_CHAT_BUSY", "TASK_CHAT_DAILY_LIMIT"}:
+                    return None
+                raise
+    return None
+
+
 def enqueue_turn(session, run, question, *, plan_id=None):
     if session.get(Workspace, run.workspace_id).execution_stopped:
         raise DomainError(409, "WORKSPACE_EXECUTION_STOPPED")
@@ -155,17 +218,7 @@ def enqueue_turn(session, run, question, *, plan_id=None):
         .limit(1)
     ):
         raise DomainError(409, "TASK_CHAT_BUSY")
-    if (
-        session.scalar(
-            select(func.count())
-            .select_from(TaskChatTurn)
-            .where(
-                TaskChatTurn.workspace_id == run.workspace_id,
-                TaskChatTurn.created_at > now - CHAT_WINDOW,
-            )
-        )
-        >= CHAT_LIMIT
-    ):
+    if chat_limit_reached(session, run.workspace_id, now):
         raise DomainError(429, "TASK_CHAT_DAILY_LIMIT")
     turn = TaskChatTurn(
         workspace_id=run.workspace_id,
@@ -245,6 +298,8 @@ def task_chat_router(service, token_type, key_type, workspace):
                 )
                 .limit(1)
             )
+            if busy:
+                return Response(status_code=204)
             turn = session.scalar(
                 select(TaskChatTurn)
                 .where(
@@ -254,7 +309,9 @@ def task_chat_router(service, token_type, key_type, workspace):
                 .order_by(TaskChatTurn.created_at, TaskChatTurn.id)
                 .limit(1)
             )
-            if turn is None or busy:
+            if turn is None:
+                turn = automatic_proposal(session, actor.workspace_id)
+            if turn is None:
                 return Response(status_code=204)
             run = owned(session, Run, turn.run_id, actor.workspace_id)
             plan = latest_plan(session, run)

@@ -565,7 +565,7 @@ async function followRunEvents(root, runId, revision, signal) {
 }
 
 const blockedGuidance = {
-  PLAN_HAS_OPEN_QUESTIONS: "質問に回答して仕様案を確認してください。必要に応じて Codex に回答候補を提案させられます。",
+  PLAN_HAS_OPEN_QUESTIONS: "回答候補を選ぶか、「その他」から回答して仕様案を確認してください。",
   SPEC_CHANGE_REQUIRED: "目的や受け入れ条件を見直し、新しい仕様で実行してください。",
   REPLAN_LIMIT_REACHED: "計画の再作成上限に達しました。仕様を確認し、新しい Run で実行してください。",
   BUDGET_EXHAUSTED: "予算の残額を確認し、必要に応じて予算を変更してから再開してください。",
@@ -682,40 +682,31 @@ function mountAttentionSurface(root, container, editor, status, signal) {
   const drafts = {};
   let refreshTimer;
   let previousAddition = "";
-  let generateKey;
 
   async function handle(envelope) {
-    const generate = envelope.action.name === "generate_options";
-    if (generate) generateKey ??= taskKey();
     try {
       const result = await postTask(`${root}/attention/actions`, JSON.stringify(envelope),
-        generate ? generateKey : taskKey(), signal);
+        taskKey(), signal);
       if (signal.aborted) return;
-      if (generate) {
-        generateKey = undefined;
-        await refresh();
-      } else {
-        const objective = editor.querySelector('[name="objective"]');
-        if (objective.readOnly) throw new Error("保存した仕様を実行してから、次の修正を行ってください");
-        const current = previousAddition && objective.value.endsWith(previousAddition)
-          ? objective.value.slice(0, -previousAddition.length) : objective.value;
-        if (current.length + result.addition.length > objective.maxLength) {
-          throw new Error("目的欄の上限を超えます。回答を短くしてください");
-        }
-        objective.value = current + result.addition;
-        previousAddition = result.addition;
-        editor.open = true;
-        status.textContent = "回答を仕様案に反映しました。内容を確認して再実行できます。";
-        status.classList.remove("error");
-        objective.focus();
+      const objective = editor.querySelector('[name="objective"]');
+      if (objective.readOnly) throw new Error("保存した仕様を実行してから、次の修正を行ってください");
+      const current = previousAddition && objective.value.endsWith(previousAddition)
+        ? objective.value.slice(0, -previousAddition.length) : objective.value;
+      if (current.length + result.addition.length > objective.maxLength) {
+        throw new Error("目的欄の上限を超えます。回答を短くしてください");
       }
+      objective.value = current + result.addition;
+      previousAddition = result.addition;
+      editor.open = true;
+      status.textContent = "回答を仕様案に反映しました。内容を確認して再実行できます。";
+      status.classList.remove("error");
+      objective.focus();
     } catch (error) {
       if (signal.aborted) return;
       status.textContent = {
         ATTENTION_ANSWER_REQUIRED: "各質問で候補を選ぶか、回答を入力してください。",
         ATTENTION_ANSWER_TOO_LONG: "回答を短くしてください。",
         ATTENTION_SURFACE_STALE: "計画または仕様が変わりました。詳細を更新してください。",
-        TASK_CHAT_BUSY: "Codex が別の質問を処理中です。少し待ってから再試行してください。",
       }[error.message] ?? runActionMessage(error);
       status.classList.add("error");
     }

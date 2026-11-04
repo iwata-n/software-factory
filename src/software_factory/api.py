@@ -199,7 +199,7 @@ def create_app(
     app.include_router(codex_settings_router(service, Token, codex_settings))
     codex_workspace = codex_settings.workspace if codex_settings else None
     app.include_router(task_chat_router(service, Token, Key, codex_workspace))
-    app.include_router(attention_router(service, Token, Key, codex_workspace))
+    app.include_router(attention_router(service, Token, codex_workspace))
 
     @app.exception_handler(DomainError)
     async def domain_error(request: Request, error: DomainError):

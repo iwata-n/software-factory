@@ -69,6 +69,13 @@ export function renderAttention(messages, drafts, onAction) {
         input.maxLength = 1200;
         input.value = container[key];
         input.addEventListener("input", () => { container[key] = input.value; });
+        const updateVisibility = () => {
+          const choice = container.choice[0];
+          label.hidden = !choice;
+          input.required = choice === "other";
+        };
+        form.addEventListener("input", updateVisibility);
+        updateVisibility();
         label.append(input);
         form.append(label);
         break;
@@ -88,29 +95,25 @@ export function renderAttention(messages, drafts, onAction) {
           input.name = `${surface.surfaceId}-${item.id}`;
           input.value = option.value;
           input.checked = container[key].includes(option.value);
-          input.addEventListener("change", () => { container[key] = [option.value]; });
+          input.addEventListener("input", () => { container[key] = [option.value]; });
           label.append(input, document.createTextNode(option.label));
           options.append(label);
         }
-        const clear = document.createElement("button");
-        clear.type = "button";
-        clear.textContent = "選択を解除";
-        clear.addEventListener("click", () => {
-          container[key] = [];
-          for (const radio of options.querySelectorAll("input")) radio.checked = false;
-        });
-        options.append(clear);
         form.append(options);
         break;
       }
       case "Button": {
         const event = item.action?.event;
-        if (!["draft_answers", "generate_options"].includes(event?.name) ||
-            item.id !== event.name) throw new Error("A2UI_ACTION_INVALID");
+        if (event?.name !== "draft_answers" || item.id !== event.name) {
+          throw new Error("A2UI_ACTION_INVALID");
+        }
         const button = document.createElement("button");
         button.type = "button";
         button.textContent = resolve(components.get(item.child)?.text);
         button.addEventListener("click", async () => {
+          for (const input of form.querySelectorAll("textarea:required")) {
+            if (!input.reportValidity()) return;
+          }
           const context = Object.fromEntries(
             Object.entries(event.context).map(([name, value]) => [name, resolve(value)]),
           );

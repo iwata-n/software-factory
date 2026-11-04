@@ -4,10 +4,11 @@ from pathlib import Path
 from types import SimpleNamespace
 
 from fastapi.testclient import TestClient
+from sqlalchemy import func, select
 
 from software_factory.api import create_app
 from software_factory.contracts import ModelCallUsage, digest
-from software_factory.models import PlanVersion, Run, Task, Worker
+from software_factory.models import PlanVersion, Run, Task, TaskChatTurn, Worker
 from software_factory.task_chat_worker import TaskAnswerOptions, claim_chat
 
 ORIGIN = "https://factory.example"
@@ -15,7 +16,9 @@ MANIFEST = "c" * 64
 QUESTION = "What should the empty state say?"
 
 
-def test_blocked_question_surface_drafts_verified_answers(world, monkeypatch, tmp_path):
+def test_blocked_question_surface_proposes_automatically_and_accepts_other(
+    world, monkeypatch, tmp_path
+):
     for name, value in {
         "WORKSPACE_ID": world.workspace_id,
         "AUTH_ROOT": str(tmp_path / "codex"),
@@ -42,6 +45,7 @@ def test_blocked_question_surface_drafts_verified_answers(world, monkeypatch, tm
                 version=1,
                 body=plan,
                 body_hash=digest(plan),
+                validation_error="PLAN_HAS_OPEN_QUESTIONS",
             )
         )
         worker = db.get(Worker, world.worker_id)
@@ -56,7 +60,14 @@ def test_blocked_question_surface_drafts_verified_answers(world, monkeypatch, tm
         return {"Authorization": f"Bearer {token}", "Origin": ORIGIN, "Idempotency-Key": key}
 
     user = auth(world.user_token)
-    surface = http.get(path, headers=user).raise_for_status().json()["messages"]
+    initial = http.get(path, headers=user).raise_for_status().json()
+    surface = initial["messages"]
+    assert initial["pending"]
+    components = surface[1]["updateComponents"]["components"]
+    assert [c["id"] for c in components if c["component"] == "Button"] == ["draft_answers"]
+    assert next(c for c in components if c["component"] == "ChoicePicker")["options"] == [
+        {"label": "その他", "value": "other"}
+    ]
     assert [m["version"] for m in surface] == ["v0.9.1"] * 3
     assert surface[2]["updateDataModel"]["value"]["questions"] == [QUESTION]
     assert http.get(path, headers=auth(world.other_user_token)).status_code == 404
@@ -78,15 +89,16 @@ def test_blocked_question_surface_drafts_verified_answers(world, monkeypatch, tm
             },
         }
 
-    empty = envelope(surface, "draft_answers", answers={"1": {"choice": [], "text": ""}})
+    empty = envelope(surface, "draft_answers", answers={"1": {"choice": ["other"], "text": ""}})
     assert http.post(path + "/actions", json=empty, headers=user).status_code == 422
-    free = envelope(surface, "draft_answers", answers={"1": {"choice": [], "text": "No items yet"}})
+    free = envelope(
+        surface, "draft_answers", answers={"1": {"choice": ["other"], "text": "No items yet"}}
+    )
     assert (
         "No items yet" in http.post(path + "/actions", json=free, headers=user).json()["addition"]
     )
-    generated = envelope(surface, "generate_options")
-    assert http.post(path + "/actions", json=generated, headers=user).json()["queued"]
-    assert http.get(path, headers=user).json()["pending"]
+    with world.database.transaction() as db:
+        assert db.scalar(select(func.count()).select_from(TaskChatTurn)) == 0
 
     def model(context, schema, *_args, **_kwargs):
         assert schema is TaskAnswerOptions
@@ -97,12 +109,20 @@ def test_blocked_question_surface_drafts_verified_answers(world, monkeypatch, tm
         )
 
     with TestClient(app, base_url=ORIGIN, headers=auth(world.worker_token)) as worker:
-        assert claim_chat(worker, SimpleNamespace(manifest_hash=MANIFEST, run=model))
+        engine = SimpleNamespace(manifest_hash=MANIFEST, run=model)
+        assert claim_chat(worker, engine)
+        assert not claim_chat(worker, engine)
 
-    proposed = http.get(path, headers=user).raise_for_status().json()["messages"]
-    assert any(
-        c["component"] == "ChoicePicker" for c in proposed[1]["updateComponents"]["components"]
+    result = http.get(path, headers=user).raise_for_status().json()
+    assert not result["pending"]
+    proposed = result["messages"]
+    choices = next(
+        c for c in proposed[1]["updateComponents"]["components"] if c["component"] == "ChoicePicker"
     )
+    assert choices["options"] == [
+        {"label": "Show No items yet.", "value": "1"},
+        {"label": "その他", "value": "other"},
+    ]
     draft = envelope(
         proposed, "draft_answers", answers={"1": {"choice": ["1"], "text": "Use Japanese."}}
     )
@@ -117,5 +137,6 @@ def test_blocked_question_surface_drafts_verified_answers(world, monkeypatch, tm
     chat = http.get(f"/v1/runs/{world.run_id}/chat", headers=user).raise_for_status()
     assert chat.json()["turns"] == []
     with world.database.transaction() as db:
+        assert db.scalar(select(func.count()).select_from(TaskChatTurn)) == 1
         assert db.get(Task, world.task_id).latest_spec_version == 1
         assert db.get(Run, world.run_id).status == "BLOCKED"

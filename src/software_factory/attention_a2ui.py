@@ -9,20 +9,20 @@ from sqlalchemy import select
 from .codex_engine import sensitive_input
 from .contracts import Contract
 from .db import db_now
-from .models import Run, Task, TaskChatTurn
+from .models import Run, Task, TaskChatTurn, Workspace
 from .service import DomainError, owned
-from .task_chat import eligible, enqueue_turn, latest_plan, plan_questions, turn_view
+from .task_chat import chat_limit_reached, eligible, latest_plan, plan_questions, turn_view
 from .task_chat_worker import TaskAnswerOptions
 from .web_accounts import browser_write
 
 VERSION = "v0.9.1"
 CATALOG = "https://a2ui.org/specification/v0_9/catalogs/basic/catalog.json"
 DRAFT = "draft_answers"
-GENERATE = "generate_options"
+OTHER = "other"
 
 
 class AnswerValue(Contract):
-    choice: list[Annotated[str, Field(pattern=r"^[1-3]$")]] = Field(max_length=1)
+    choice: list[Literal["1", "2", "3", "other"]] = Field(max_length=1)
     text: Annotated[str, Field(max_length=1200)]
 
 
@@ -34,7 +34,7 @@ class ActionContext(Contract):
 
 
 class SurfaceAction(Contract):
-    name: Literal["draft_answers", "generate_options"]
+    name: Literal["draft_answers"]
     surface_id: Annotated[str, Field(alias="surfaceId", max_length=64)]
     component_id: Annotated[str, Field(alias="sourceComponentId", max_length=64)]
     timestamp: AwareDatetime
@@ -70,7 +70,7 @@ def surface_id(plan):
     return f"attention-{plan.id}"
 
 
-def attention_messages(run, plan, questions, task, turn, state, can_generate):
+def attention_messages(run, plan, questions, task, turn, state):
     surface = surface_id(plan)
     components = []
     children = []
@@ -102,27 +102,33 @@ def attention_messages(run, plan, questions, task, turn, state, can_generate):
 
     for index in range(1, len(questions) + 1):
         add(f"question-{index}", "Text", variant="h4", text={"path": f"/questions/{index - 1}"})
-        choices = options.get(index)
-        if choices:
-            add(
-                f"choices-{index}",
-                "ChoicePicker",
-                variant="mutuallyExclusive",
-                label=f"質問 {index} の回答候補",
-                options=[
-                    {"label": text, "value": str(number)} for number, text in enumerate(choices, 1)
-                ],
-                value={"path": f"/answers/{index}/choice"},
-            )
+        choices = options.get(index, [])
+        add(
+            f"choices-{index}",
+            "ChoicePicker",
+            variant="mutuallyExclusive",
+            label=f"質問 {index} の回答候補",
+            options=[
+                {"label": text, "value": str(number)} for number, text in enumerate(choices, 1)
+            ]
+            + [{"label": "その他", "value": OTHER}],
+            value={"path": f"/answers/{index}/choice"},
+        )
         add(
             f"answer-{index}",
             "TextField",
-            label=f"質問 {index} への回答" + ("・補足" if choices else ""),
+            label=f"質問 {index} への回答・補足",
             variant="longText",
             value={"path": f"/answers/{index}/text"},
         )
-    if state in {"QUEUED", "RUNNING"}:
-        add("proposal-state", "Text", text="Codex が回答候補を考えています…")
+    if state in {"WAITING", "QUEUED", "RUNNING"}:
+        add("proposal-state", "Text", text="回答候補を準備中です。「その他」から先に回答できます。")
+    elif state == "PAUSED":
+        add(
+            "proposal-state",
+            "Text",
+            text="回答候補の生成は一時停止中です。「その他」から回答できます。",
+        )
     elif state == "FAILED":
         add(
             "proposal-state",
@@ -135,8 +141,6 @@ def attention_messages(run, plan, questions, task, turn, state, can_generate):
             "Text",
             text="Codex から回答候補はありません。自由入力で回答できます。",
         )
-    if can_generate and state in {None, "FAILED"}:
-        button(GENERATE, "Codex に回答候補を提案させる", scope, "default")
     button(
         DRAFT,
         "回答を仕様案に反映",
@@ -163,7 +167,7 @@ def attention_messages(run, plan, questions, task, turn, state, can_generate):
     ]
 
 
-def attention_router(service, token_type, key_type, codex_workspace):
+def attention_router(service, token_type, codex_workspace):
     router = APIRouter(prefix="/v1/runs/{run_id}/attention")
 
     def subject(session, actor, run_id):
@@ -185,20 +189,24 @@ def attention_router(service, token_type, key_type, codex_workspace):
                 return {"messages": [], "pending": False}
             task = owned(session, Task, run.task_id, actor.workspace_id)
             turn = proposal(session, run, plan)
-            state = turn_view(turn, db_now(session))["status"] if turn else None
+            now = db_now(session)
+            state = turn_view(turn, now)["status"] if turn else None
+            if not turn and can_generate(run):
+                paused = session.get(Workspace, run.workspace_id).execution_stopped
+                state = (
+                    "PAUSED"
+                    if paused or chat_limit_reached(session, run.workspace_id, now)
+                    else "WAITING"
+                )
             return {
-                "messages": attention_messages(
-                    run, plan, questions, task, turn, state, can_generate(run)
-                ),
-                "pending": state in {"QUEUED", "RUNNING"},
+                "messages": attention_messages(run, plan, questions, task, turn, state),
+                "pending": state in {"WAITING", "QUEUED", "RUNNING"},
             }
 
         return service.read(token, query)
 
     @router.post("/actions")
-    def answer(
-        run_id: str, data: ActionEnvelope, request: Request, token: token_type, key: key_type = None
-    ):
+    def answer(run_id: str, data: ActionEnvelope, request: Request, token: token_type):
         browser_write(request)
         action = data.action
         event = action.context
@@ -218,23 +226,6 @@ def attention_router(service, token_type, key_type, codex_workspace):
                 raise DomainError(409, "ATTENTION_SURFACE_STALE")
             return run, plan, questions
 
-        if action.name == GENERATE:
-
-            def enqueue(session, actor):
-                run, plan, _ = validate(session, actor)
-                if not can_generate(run):
-                    raise DomainError(409, "TASK_CHAT_UNAVAILABLE")
-                previous = proposal(session, run, plan)
-                if previous and previous.status == "ANSWERED":
-                    return {"queued": False}
-                enqueue_turn(
-                    session, run, "Propose answers to the plan questions.", plan_id=plan.id
-                )
-                return {"queued": True}
-
-            body = action.model_dump(mode="json", exclude={"timestamp"})
-            return service.write(token, "USER", f"chat:{run_id}", key, body, enqueue)
-
         def draft(session, actor):
             run, plan, questions = validate(session, actor)
             turn = proposal(session, run, plan)
@@ -245,9 +236,12 @@ def attention_router(service, token_type, key_type, codex_workspace):
             for index, question in enumerate(questions, 1):
                 value = event.answers[str(index)]
                 choices = options.get(index, [])
-                if value.choice and int(value.choice[0]) > len(choices):
-                    raise DomainError(409, "ATTENTION_SURFACE_STALE")
-                selected = choices[int(value.choice[0]) - 1] if value.choice else ""
+                choice = value.choice[0] if value.choice else None
+                selected = ""
+                if choice and choice != OTHER:
+                    if int(choice) > len(choices):
+                        raise DomainError(409, "ATTENTION_SURFACE_STALE")
+                    selected = choices[int(choice) - 1]
                 answer = "\n".join(text for text in (selected, value.text) if text)
                 if not answer:
                     raise DomainError(422, "ATTENTION_ANSWER_REQUIRED")
