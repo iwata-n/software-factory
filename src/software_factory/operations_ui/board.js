@@ -562,7 +562,193 @@ async function followRunEvents(root, runId, revision, signal) {
   }
 }
 
-async function loadDetail() {
+const blockedGuidance = {
+  PLAN_HAS_OPEN_QUESTIONS: "Codex の質問に答える内容を、タスクの目的または受け入れ条件に追記してください。",
+  SPEC_CHANGE_REQUIRED: "目的や受け入れ条件を見直し、新しい仕様で実行してください。",
+  REPLAN_LIMIT_REACHED: "計画の再作成上限に達しました。仕様を確認し、新しい Run で実行してください。",
+  BUDGET_EXHAUSTED: "予算の残額を確認し、必要に応じて予算を変更してから再開してください。",
+  BUDGET_EXCEEDED: "使用額と予算を確認し、原因を解消してから再開してください。",
+  USAGE_UNKNOWN: "利用量を確定してから再開してください。",
+  MANDATORY_EVIDENCE_MISSING: "不足している検証結果を確認してください。",
+  EVIDENCE_TARGET_MISMATCH: "検証の対象と現在の候補が一致しているか確認してください。",
+};
+const recoverableBlocks = new Set([
+  "BUDGET_EXHAUSTED", "BUDGET_EXCEEDED", "USAGE_UNKNOWN",
+  "MANDATORY_EVIDENCE_MISSING", "EVIDENCE_TARGET_MISMATCH",
+]);
+
+function runActionMessage(error) {
+  return {
+    RUN_REVISION_CONFLICT: "Run の状態が変わりました。「詳細を更新」で最新の状態を確認してください。",
+    INTERVENTION_TARGET_STALE: "再開条件が変わりました。「詳細を更新」で確認してください。",
+    BUDGET_NOT_RESOLVED: "予算が不足しています。",
+    USAGE_NOT_RECONCILED: "利用量がまだ確定していません。",
+    EVIDENCE_NOT_RESOLVED: "必要な検証結果がまだ揃っていません。",
+    WORKSPACE_EXECUTION_STOPPED: "Workspace の実行が停止中です。管理者に確認してください。",
+  }[error.message] ?? `操作できませんでした（${error.message}）。`;
+}
+
+function blockedForm(label, status, action) {
+  const form = element("form", undefined, "attention-form");
+  const submit = element("button", label);
+  submit.type = "submit";
+  form.append(submit);
+  form.addEventListener("submit", async (event) => {
+    event.preventDefault();
+    submit.disabled = true;
+    status.textContent = "処理中…";
+    status.classList.remove("error");
+    try {
+      await action(form);
+    } catch (error) {
+      if (error.name !== "AbortError") {
+        status.textContent = runActionMessage(error);
+        status.classList.add("error");
+      }
+    } finally {
+      submit.disabled = false;
+    }
+  });
+  return form;
+}
+
+function attentionField(label, name, value, maxLength, rows) {
+  const wrapper = element("label", label);
+  const input = element(rows ? "textarea" : "input");
+  input.name = name;
+  input.value = value;
+  input.maxLength = maxLength;
+  input.required = true;
+  if (rows) input.rows = rows;
+  wrapper.append(input);
+  return wrapper;
+}
+
+function specCorrection(run, task, status, signal) {
+  const original = task.spec_versions.at(-1);
+  if (!original) return null;
+  const root = `/v1/tasks/${encodeURIComponent(run.task_id)}`;
+  const spec = original.body;
+  const criterionText = spec.task.acceptance_criteria.map(({description}) => description).join("\n");
+  let pending;
+  let saved;
+  const runKey = taskKey();
+  const form = blockedForm("仕様を保存して再実行", status, async (form) => {
+    if (!saved) {
+      const formData = new FormData(form);
+      const objective = formData.get("objective").trim();
+      const criteria = formData.get("criteria");
+      const lines = criteria.split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
+      if (!objective || !lines.length || lines.length > 100 || lines.some((line) => line.length > 4000)) {
+        throw new Error("目的と受け入れ条件を確認してください");
+      }
+      if (objective === spec.task.objective && criteria === criterionText) {
+        if (original.version === run.spec_version &&
+            ["PLAN_HAS_OPEN_QUESTIONS", "SPEC_CHANGE_REQUIRED"].includes(run.stop_reason)) {
+          throw new Error("Codexへの回答を目的または受け入れ条件に追記してください");
+        }
+        saved = {spec_version: original.version};
+      } else {
+        const acceptance = criteria === criterionText ? spec.task.acceptance_criteria
+          : lines.map((description, index) => ({id: `AC-${index + 1}`, description}));
+        const body = JSON.stringify({...spec, task: {...spec.task, objective, acceptance_criteria: acceptance}});
+        if (pending?.body !== body) pending = {body, key: taskKey()};
+        saved = await postTask(`${root}/spec-versions`, body, pending.key, signal);
+      }
+      if (signal.aborted) return;
+      for (const input of form.querySelectorAll("textarea")) input.readOnly = true;
+      form.querySelector("button").textContent = `仕様 v${saved.spec_version} で実行`;
+    }
+    const result = await postTask(`${root}/runs`, JSON.stringify({spec_version: saved.spec_version}), runKey, signal);
+    if (!signal.aborted) {
+      selected = {...selected, run_id: result.run_id};
+      void loadBoard();
+      void loadDetail(`仕様 v${saved.spec_version} で新しい Run を開始しました。`);
+    }
+  });
+  form.prepend(
+    element("p", `仕様 v${original.version} を編集中です。変更は新しい仕様として保存されます。`),
+    attentionField("目的", "objective", spec.task.objective, 16000, 4),
+    attentionField("受け入れ条件（1行に1件）", "criteria", criterionText, 400099, 5),
+  );
+  const editor = element("details");
+  editor.append(element("summary", "仕様を修正して再実行"), form);
+  return editor;
+}
+
+async function blockedRunView(root, run, signal) {
+  const operator = ["ADMIN", "OPERATOR"].includes(executionContext?.access);
+  const [plans, task, targets] = await Promise.allSettled([
+    read(`${root}/plan`, signal),
+    operator ? read(`/v1/tasks/${encodeURIComponent(run.task_id)}`, signal) : null,
+    operator ? read("/v1/operations/task-targets", signal) : null,
+  ]);
+  if (signal.aborted) return null;
+  const status = element("p");
+  status.setAttribute("role", "status");
+  const panel = section("要対応",
+    element("p", blockedGuidance[run.stop_reason] ?? "停止理由を確認し、必要な修正を行ってください。"));
+  const questions = plans.value?.plans.at(-1)?.body?.open_questions;
+  if (Array.isArray(questions) && questions.length) {
+    const list = element("ul");
+    list.append(...questions.map((question) => element("li", question)));
+    panel.append(element("h4", "Codex からの質問"), list);
+  } else if (plans.status === "rejected") {
+    panel.append(element("p", "Codex の計画を取得できませんでした。", "error"));
+  }
+  const repositoryId = task.value?.spec_versions.at(-1)?.body.task.repository_id;
+  const project = targets.value?.projects.find(({repositories}) =>
+    repositories.some(({id}) => id === repositoryId));
+  if (project?.allowed_write_paths?.length) {
+    panel.append(element("p", `プロジェクトで変更できる範囲 · ${project.allowed_write_paths.join("、")}`));
+  }
+  if (!operator) {
+    panel.append(element("p", "対応するには操作者または管理者の権限が必要です。"));
+    return panel;
+  }
+  panel.append(status);
+  const canCorrectSpec = ["PLAN", "WAIT_PLAN_APPROVAL"].includes(run.phase) ||
+    run.stop_reason === "SPEC_CHANGE_REQUIRED";
+  if (canCorrectSpec) {
+    const correction = task.value && specCorrection(run, task.value, status, signal);
+    panel.append(correction ?? element("p", "タスクの仕様を取得できませんでした。", "error"));
+  }
+  if (recoverableBlocks.has(run.stop_reason)) {
+    const key = taskKey();
+    const resolve = blockedForm("解消を確認して再開", status, async (form) => {
+      const reason = new FormData(form).get("reason").trim();
+      const target = await read(`${root}/interventions`, signal);
+      await postTask(`${root}/interventions`, JSON.stringify({
+        action: "resolve_blocked", subject_id: run.run_id, reason,
+        target_hash: target.target_hash, expected_run_revision: run.state_revision,
+      }), key, signal);
+      if (!signal.aborted) {
+        void loadBoard();
+        void loadDetail("Run を再開しました。");
+      }
+    });
+    resolve.prepend(attentionField("解消した内容", "reason", "", 4000, 2));
+    panel.append(resolve);
+  }
+  const key = taskKey();
+  const cancel = blockedForm("この Run を取り消す", status, async (form) => {
+    const reason = new FormData(form).get("reason").trim();
+    const result = await postTask(`${root}/cancel`, JSON.stringify({
+      expected_run_revision: run.state_revision, reason,
+    }), key, signal);
+    if (!signal.aborted) {
+      void loadBoard();
+      void loadDetail(result.status === "CANCELLED" ? "Run を取り消しました。" : "Run の取り消しを受け付けました。");
+    }
+  });
+  cancel.prepend(attentionField("取り消し理由", "reason", "", 2000, 2));
+  const cancelDetails = element("details");
+  cancelDetails.append(element("summary", "この Run を取り消す"), cancel);
+  panel.append(cancelDetails);
+  return panel;
+}
+
+async function loadDetail(notice = "") {
   detailRequest?.abort();
   detailRequest = new AbortController();
   const { signal } = detailRequest;
@@ -612,6 +798,11 @@ async function loadDetail() {
       ]) : element("p", "現候補なし")),
       ...(run.status === "SUCCEEDED" ? [] : [ciView(context)]),
     ];
+    if (run.status === "BLOCKED") {
+      const attention = await blockedRunView(root, run, signal);
+      if (signal.aborted) return;
+      if (attention) content.unshift(attention);
+    }
     if (verifiedResults[0]?.status === "fulfilled") {
       content.push(verifiedResultView(verifiedResults[0].value, verifiedResults[1].value));
     }
@@ -625,7 +816,7 @@ async function loadDetail() {
     });
     get("detail-content").replaceChildren(...content);
     const incomplete = allResults.some(({ status }) => status === "rejected");
-    message("detail-status", incomplete ? "一部の詳細を取得できませんでした。" : "", incomplete);
+    message("detail-status", incomplete ? "一部の詳細を取得できませんでした。" : notice, incomplete);
     const history = results[detailSections.length - 1].value;
     if (history) followRunEvents(root, run.run_id, history.events.at(-1)?.revision, signal);
   } catch (error) {
@@ -679,7 +870,7 @@ get("disconnect").addEventListener("click", async () => {
     button.disabled = false;
   }
 });
-get("reload-detail").addEventListener("click", loadDetail);
+get("reload-detail").addEventListener("click", () => loadDetail());
 detail.addEventListener("close", () => {
   if (detail.open) return;
   detailRequest?.abort();

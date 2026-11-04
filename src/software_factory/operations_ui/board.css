@@ -154,3 +154,14 @@ summary { cursor: pointer; padding: 10px 0; }
 .account-form select { font: inherit; min-height: 44px; border-radius: 8px; padding: 6px; }
 #token-login { margin-top: 8px; }
 #accounts-list { margin-block-end: 16px; }
+
+.attention-form label { display: grid; gap: 4px; margin-block: 10px; }
+.attention-form textarea {
+  width: 100%;
+  font: inherit;
+  padding: 8px 10px;
+  border: 1px solid #78978b;
+  border-radius: 8px;
+  resize: vertical;
+}
+.attention-form { margin-block-end: 12px; }
