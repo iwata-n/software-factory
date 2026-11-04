@@ -109,6 +109,7 @@ export function renderAttention(messages, drafts, onAction) {
         }
         const button = document.createElement("button");
         button.type = "button";
+        button.classList.toggle("primary", item.variant === "primary");
         button.textContent = resolve(components.get(item.child)?.text);
         button.addEventListener("click", async () => {
           for (const input of form.querySelectorAll("textarea:required")) {

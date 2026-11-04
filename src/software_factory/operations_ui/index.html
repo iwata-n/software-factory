@@ -9,11 +9,23 @@
 </head>
 <body>
   <header class="masthead">
-    <span>Software Factory</span>
+    <span class="brand">
+      <svg class="brand-mark" viewBox="0 0 28 28" fill="none" aria-hidden="true">
+        <rect x="3" y="3" width="22" height="22" rx="3"></rect>
+        <path d="M8 9h12M8 14h12M8 19h12"></path>
+      </svg>
+      <span>Software Factory</span>
+    </span>
     <div class="masthead-actions">
-      <button id="task-open" type="button" hidden>新規タスク</button>
+      <button id="task-open" class="primary icon-label" type="button" hidden>
+        <svg viewBox="0 0 20 20" fill="none" aria-hidden="true"><path d="M10 4v12M4 10h12"></path></svg>
+        <span>新規タスク</span>
+      </button>
       <details id="toolbar" class="masthead-menu" hidden>
-        <summary>メニュー</summary>
+        <summary class="icon-label">
+          <span>メニュー</span>
+          <svg viewBox="0 0 20 20" fill="none" aria-hidden="true"><path d="m5 8 5 5 5-5"></path></svg>
+        </summary>
         <div class="masthead-menu-panel">
           <p id="account-name" hidden></p>
           <button id="integration-open" type="button" hidden>連携設定</button>
@@ -43,9 +55,21 @@
       </form>
     </details>
     <section id="execution" class="execution" aria-labelledby="execution-title" hidden>
-      <h2 id="execution-title">Workspace の実行状態</h2>
-      <p id="execution-state" role="status"></p>
-      <button id="execution-action" type="button" hidden></button>
+      <div class="execution-strip">
+        <h2 id="execution-title">Workspace の実行状態</h2>
+        <p id="execution-state" role="status"></p>
+        <details id="worker-panel" class="worker-panel" hidden>
+          <summary class="icon-label">
+            <span>Worker の状態</span>
+            <svg viewBox="0 0 20 20" fill="none" aria-hidden="true"><path d="m5 8 5 5 5-5"></path></svg>
+          </summary>
+          <div class="worker-popover">
+            <p id="worker-status" role="status"></p>
+            <div id="worker-list"></div>
+          </div>
+        </details>
+        <button id="execution-action" type="button" hidden></button>
+      </div>
       <form id="execution-form" hidden>
         <label for="execution-reason">操作の理由</label>
         <div class="controls">
@@ -56,12 +80,17 @@
       </form>
       <p id="execution-message" role="status" hidden></p>
     </section>
-    <details id="worker-panel" class="execution" hidden>
-      <summary>Worker の状態</summary>
-      <p id="worker-status" role="status"></p>
-      <div id="worker-list"></div>
-    </details>
-    <p id="status" role="status">ログインすると Run を表示します。</p>
+    <div class="board-toolbar">
+      <p id="status" role="status">ログインすると Run を表示します。</p>
+      <div id="board-navigation" class="board-navigation" hidden>
+        <button id="board-previous" type="button" aria-label="前のレーン" aria-controls="board">
+          <svg viewBox="0 0 20 20" fill="none" aria-hidden="true"><path d="m12 5-5 5 5 5"></path></svg>
+        </button>
+        <button id="board-next" type="button" aria-label="次のレーン" aria-controls="board">
+          <svg viewBox="0 0 20 20" fill="none" aria-hidden="true"><path d="m8 5 5 5-5 5"></path></svg>
+        </button>
+      </div>
+    </div>
     <div id="board" class="board" role="region" tabindex="0"
       aria-label="Run の状態別カンバン。横にスクロールしてレーンを表示" hidden></div>
     <button id="older" hidden>過去の Run を追加表示</button>
@@ -120,9 +149,11 @@
   <dialog id="detail" aria-labelledby="detail-title">
     <header class="detail-header">
       <h2 id="detail-title">Run 詳細</h2>
-      <form method="dialog"><button>閉じる</button></form>
+      <div class="dialog-actions">
+        <form method="dialog"><button>閉じる</button></form>
+        <button id="reload-detail" type="button">詳細を更新</button>
+      </div>
     </header>
-    <button id="reload-detail">詳細を更新</button>
     <p id="detail-status" role="status"></p>
     <div id="detail-content"></div>
   </dialog>

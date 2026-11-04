@@ -98,7 +98,7 @@ function disconnect(text = "接続を終了しました。", error = false) {
   get("detail-content").replaceChildren();
   get("board").replaceChildren();
   toolbar.open = false;
-  for (const id of ["board", "toolbar", "older"]) get(id).hidden = true;
+  for (const id of ["board", "board-navigation", "toolbar", "older"]) get(id).hidden = true;
   get("token-login").hidden = false;
   get("login").hidden = !secureAccounts;
   get(secureAccounts ? "login-username" : "token").focus();
@@ -345,7 +345,8 @@ async function loadBoard({older = false, quiet = false} = {}) {
     if (older) visibleRunLimit += RUN_PAGE_SIZE;
     nextBefore = page.next_before;
     get("token-login").hidden = get("login").hidden = true;
-    get("board").hidden = get("toolbar").hidden = false;
+    get("board").hidden = get("board-navigation").hidden = get("toolbar").hidden = false;
+    updateBoardNavigation();
     olderButton.hidden = !nextBefore;
     const status = runs.length ? `${runs.length} 件を表示中` : "この Workspace に Run はありません。";
     if (get("status").textContent !== status || get("status").classList.contains("error")) {
@@ -762,8 +763,11 @@ async function blockedRunView(root, run, signal) {
   if (signal.aborted) return null;
   const status = element("p");
   status.setAttribute("role", "status");
-  const panel = section("要対応",
+  const panel = element("section", undefined, "detail-section attention-section");
+  const alert = element("div", undefined, "attention-alert");
+  alert.append(element("h3", "要対応"),
     element("p", blockedGuidance[run.stop_reason] ?? "停止理由を確認し、必要な修正を行ってください。"));
+  panel.append(alert);
   const questions = plans.value?.plans.at(-1)?.body?.open_questions;
   const questionContent = element("div");
   if (Array.isArray(questions) && questions.length) {
@@ -838,6 +842,7 @@ function taskChat(root, signal) {
   const form = element("form", undefined, "attention-form");
   const field = attentionField("メッセージ", "message", "", 4000, 3);
   const input = field.querySelector("textarea");
+  input.placeholder = "Codex に相談したい内容を入力してください。";
   const send = element("button", "Codex に送信");
   send.type = "submit";
   form.append(field, send);
@@ -1004,6 +1009,23 @@ async function loadDetail(notice = "") {
     if (detailRequest.signal === signal) get("reload-detail").disabled = false;
   }
 }
+
+function updateBoardNavigation() {
+  const board = get("board");
+  get("board-previous").disabled = board.scrollLeft <= 1;
+  get("board-next").disabled = board.scrollLeft + board.clientWidth >= board.scrollWidth - 1;
+}
+
+for (const [id, direction] of [["board-previous", -1], ["board-next", 1]]) {
+  get(id).addEventListener("click", () => {
+    const board = get("board");
+    const laneWidth = board.firstElementChild?.getBoundingClientRect().width ?? board.clientWidth;
+    const gap = Number.parseFloat(getComputedStyle(board).columnGap);
+    board.scrollBy({left: direction * (laneWidth + gap)});
+  });
+}
+get("board").addEventListener("scroll", updateBoardNavigation, {passive: true});
+window.addEventListener("resize", updateBoardNavigation);
 
 get("connect").addEventListener("submit", (event) => {
   event.preventDefault();
