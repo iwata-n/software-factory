@@ -14,6 +14,7 @@ from sqlalchemy import (
     Integer,
     LargeBinary,
     String,
+    Text,
     UniqueConstraint,
 )
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
@@ -235,6 +236,31 @@ class Run(Tenant, Base):
     current_candidate_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
     cost_state: Mapped[str] = mapped_column(String(20), default="KNOWN", server_default="KNOWN")
     budget_version: Mapped[int] = mapped_column(Integer, default=1, server_default="1")
+
+
+class TaskChatTurn(Base):
+    __tablename__ = "task_chat_turns"
+    __table_args__ = (
+        ForeignKeyConstraint(
+            ["workspace_id", "run_id"], ["runs.workspace_id", "runs.id"], ondelete="CASCADE"
+        ),
+        ForeignKeyConstraint(["workspace_id", "worker_id"], ["workers.workspace_id", "workers.id"]),
+        CheckConstraint("status IN ('QUEUED','RUNNING','ANSWERED','FAILED')"),
+        Index("ix_task_chat_turns_workspace_id", "workspace_id", "created_at"),
+        Index("ix_task_chat_turns_run_id", "run_id", "created_at"),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    workspace_id: Mapped[str] = mapped_column(ForeignKey("workspaces.id"))
+    run_id: Mapped[str] = mapped_column(String(36))
+    worker_id: Mapped[str | None] = mapped_column(String(36))
+    question: Mapped[str] = mapped_column(Text)
+    answer: Mapped[str | None] = mapped_column(Text)
+    status: Mapped[str] = mapped_column(String(20))
+    error: Mapped[str | None] = mapped_column(String(100))
+    usage: Mapped[dict | None] = mapped_column(JSON)
+    created_at: Mapped[float] = mapped_column(Float)
+    deadline_at: Mapped[float] = mapped_column(Float)
 
 
 class PlanVersion(Tenant, Base):

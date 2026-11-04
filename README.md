@@ -118,6 +118,12 @@ Codexは空の一時作業領域で、shell・apps・plugins・browser・画像�
 ホスト上の所有者専用ディレクトリ `FACTORY_CODEX_AUTH_ROOT` に保存します。
 設定できるのは指定 Workspace の管理者です。実行する Project は既存の Codex 用ポリシーを使います。
 
+Run 詳細の「Codex とチャット」では、タスクの目的、受け入れ条件、停止理由を踏まえて
+相談できます。会話は開いている Run に保存します。仕様を変更する場合は Run 詳細の
+「仕様を修正して再実行」を使います。チャットの使用量は Run の実行費用とは別に記録します。
+独自の構成では管理対象 Codex Worker に `--task-chat` を追加してください。
+
+
 実測トークン数をusage受領APIで精算してから成果物を確定します。記録するUSDはAPI公開単価を参照した **予算用の推計** で、ChatGPT契約の請求額や残利用枠ではありません。usage欠落を架空のゼロ円に変換せず、UNKNOWNで停止します。
 
 実Codexを含む再現用評価は、一時DB・実HTTP Worker・公開Repositoryの固定ソース・Linux Runnerを使います。空状態のgolden testがbaseで失敗することを確認し、Codex生成だけの変更を独立検証してLocal Gateまで進めます。PR／Slack送信はこの評価の対象に含みません。

@@ -373,6 +373,7 @@ def main():
     )
     parser.add_argument("--adapter", choices=["fake", "pipeline", "codex_cli"], default="fake")
     parser.add_argument("--reviewer", choices=["none", "codex_cli"], default="none")
+    parser.add_argument("--task-chat", action="store_true", help="Handle task chats while idle")
     parser.add_argument(
         "--host-codex-evaluation",
         action="store_true",
@@ -396,6 +397,8 @@ def main():
     )
     args = parser.parse_args()
     validate_api_url(args.api_url)
+    if args.task_chat and (args.adapter != "codex_cli" or args.host_codex_evaluation):
+        parser.error("Task chat requires the isolated Codex adapter")
     if args.host_codex_evaluation and (
         not args.drain or urlparse(args.api_url).hostname not in {"127.0.0.1", "::1"}
     ):
@@ -416,6 +419,9 @@ def main():
             )
         except CodexError as error:
             parser.error(error.code)
+    if args.task_chat:
+        from .task_chat_worker import claim_chat
+
     headers = {"Authorization": f"Bearer {token}"} if token else {}
     with (
         credentials.lock() if credentials else nullcontext(),
@@ -445,7 +451,16 @@ def main():
             try:
                 if credentials:
                     credentials.prepare(client)
-                result = supervisor.run_once(wait_seconds=0 if args.once or args.drain else 20)
+                result = supervisor.run_once(
+                    wait_seconds=0 if args.once or args.drain or args.task_chat else 20
+                )
+                if result is None and args.task_chat:
+                    if claim_chat(client, engine):
+                        if args.once:
+                            return
+                        continue
+                    if not args.once and not args.drain:
+                        time.sleep(2)
                 if result:
                     print(json.dumps(result, ensure_ascii=False))
                 if args.once or (args.drain and result is None):

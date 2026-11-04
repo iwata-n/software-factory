@@ -42,6 +42,7 @@ from .models import (
     RunEvent,
     SpecVersion,
     Task,
+    TaskChatTurn,
     WebSession,
     Worker,
     WorkerEvent,
@@ -964,7 +965,16 @@ class Service:
                 )
                 .limit(1)
             )
-            if busy:
+            if busy or session.scalar(
+                select(TaskChatTurn.id)
+                .where(
+                    TaskChatTurn.workspace_id == actor.workspace_id,
+                    TaskChatTurn.worker_id == actor.id,
+                    TaskChatTurn.status == "RUNNING",
+                    TaskChatTurn.deadline_at > now,
+                )
+                .limit(1)
+            ):
                 return None
             jobs = session.scalars(
                 select(Job)

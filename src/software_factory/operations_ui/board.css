@@ -165,3 +165,8 @@ summary { cursor: pointer; padding: 10px 0; }
   resize: vertical;
 }
 .attention-form { margin-block-end: 12px; }
+
+.task-chat-history { max-height: 40dvh; overflow: auto; }
+.task-chat-turn { padding-block: 8px; border-bottom: 1px solid var(--line); }
+.task-chat-turn h4 { margin: 4px 0; color: var(--muted); }
+.task-chat-message { white-space: pre-wrap; overflow-wrap: anywhere; margin-block: 4px 12px; }

@@ -194,7 +194,11 @@ def main():
             )
             workers = []
             for adapter, kinds, extra in (
-                ("codex_cli", ["PLAN", "IMPLEMENT", "REPAIR"], []),
+                (
+                    "codex_cli",
+                    ["PLAN", "IMPLEMENT", "REPAIR"],
+                    ["--task-chat"] if codex_root else [],
+                ),
                 (
                     "pipeline",
                     ["ASSEMBLE_CANDIDATE", "VERIFY", "REVIEW"],

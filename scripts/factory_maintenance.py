@@ -40,6 +40,7 @@ from software_factory.models import (
     SlackDelivery,
     SpecVersion,
     Task,
+    TaskChatTurn,
     WebSession,
     WorkerEvent,
     Workspace,
@@ -264,6 +265,11 @@ def restore(database, root, bundle, certificate, key):
             raise ValueError("Restored database and Artifact inventory disagree")
         with database.transaction() as session:
             session.execute(delete(WebSession))
+            session.execute(
+                update(TaskChatTurn)
+                .where(TaskChatTurn.status.in_(["QUEUED", "RUNNING"]))
+                .values(status="FAILED", error="CHAT_RESTORED")
+            )
             now = db_now(session)
             for workspace in session.scalars(select(Workspace)):
                 before = workspace.execution_stop_revision
@@ -353,6 +359,7 @@ def purge_run(session, run, now):
     ).all()
     operations = [
         f"cancel:{run_id}",
+        f"chat:{run_id}",
         f"resolve-blocked:{run_id}",
         f"runs:{run_id}:budget-request",
         f"runs:{run_id}:replan",
@@ -411,6 +418,7 @@ def purge_run(session, run, now):
     run.current_candidate_id = None
     session.flush()
     for name in (
+        "task_chat_turns",
         "historical_ci_observations",
         "publication_observations",
         "publication_operations",

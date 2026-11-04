@@ -73,6 +73,7 @@ from .operations import event_view, operations_router
 from .resolver import SourceResolver
 from .service import WEB_SESSION_PREFIX, DomainError, Service, owned, run_view
 from .slack_delivery import NOTIFICATION, SlackClient, SlackDispatcher
+from .task_chat import task_chat_router
 from .web_accounts import browser_token, web_accounts_router
 
 security = HTTPBearer(auto_error=False)
@@ -193,7 +194,11 @@ def create_app(
     app.include_router(operations_router(service, Token))
     app.include_router(web_accounts_router(service, Token))
     app.include_router(integration_router(service, Token, vault, oauth_origin(), integrations))
-    app.include_router(codex_settings_router(service, Token, CodexSettings.configured()))
+    codex_settings = CodexSettings.configured()
+    app.include_router(codex_settings_router(service, Token, codex_settings))
+    app.include_router(
+        task_chat_router(service, Token, Key, codex_settings.workspace if codex_settings else None)
+    )
 
     @app.exception_handler(DomainError)
     async def domain_error(request: Request, error: DomainError):

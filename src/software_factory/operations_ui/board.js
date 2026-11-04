@@ -748,6 +748,98 @@ async function blockedRunView(root, run, signal) {
   return panel;
 }
 
+function taskChat(root, signal) {
+  const transcript = element("div", undefined, "task-chat-history");
+  transcript.setAttribute("aria-label", "会話履歴");
+  const status = element("p");
+  status.setAttribute("role", "status");
+  const operator = ["ADMIN", "OPERATOR"].includes(executionContext?.access);
+  const form = element("form", undefined, "attention-form");
+  const field = attentionField("メッセージ", "message", "", 4000, 3);
+  const input = field.querySelector("textarea");
+  const send = element("button", "Codex に送信");
+  send.type = "submit";
+  form.append(field, send);
+  form.hidden = true;
+  const panel = section("Codex とチャット", transcript, status, form);
+  let sent;
+  let displayed;
+  let timer;
+
+  async function refresh() {
+    clearTimeout(timer);
+    const {available, turns} = await read(`${root}/chat`, signal);
+    if (signal.aborted) return;
+    form.hidden = !available || !operator;
+    const snapshot = JSON.stringify(turns);
+    if (snapshot !== displayed) {
+      displayed = snapshot;
+      transcript.replaceChildren(...turns.map((turn) => {
+        const question = element("p", turn.question, "task-chat-message");
+        const rows = [element("h4", "あなたのチーム"), question];
+        if (turn.answer) rows.push(element("h4", "Codex"), element("p", turn.answer, "task-chat-message"));
+        if (turn.status === "FAILED") {
+          const explanation = {
+            CHAT_TIMEOUT: "返答を受信できませんでした。Worker の状態を確認して再送してください。",
+            CODEX_AUTH_OR_POLICY: "Codex の連携設定と実行ポリシーを確認してください。",
+          }[turn.error] ?? "Codex の返答を取得できませんでした。";
+          rows.push(element("p", explanation, "error"));
+        }
+        const article = element("article", undefined, "task-chat-turn");
+        article.append(...rows);
+        return article;
+      }));
+    }
+    const waiting = turns.some(({status}) => status === "QUEUED" || status === "RUNNING");
+    send.disabled = waiting;
+    status.textContent = waiting ? "Codex の返答を待っています…" :
+      !available ? "この Run では Codex チャットを利用できません。" :
+      !operator ? "チャットの送信には操作者または管理者の権限が必要です。" :
+      turns.length ? "" : "タスクの内容や停止理由について質問できます。";
+    if (waiting) timer = setTimeout(poll, 2000);
+  }
+
+  function poll() {
+    if (signal.aborted) return;
+    void refresh().catch(() => {
+      if (signal.aborted) return;
+      status.textContent = "チャットを取得できませんでした。再試行します。";
+      timer = setTimeout(poll, 5000);
+    });
+  }
+
+  form.addEventListener("submit", async (event) => {
+    event.preventDefault();
+    const message = input.value.trim();
+    if (!message || send.disabled) return;
+    if (sent?.message !== message) sent = {message, key: taskKey()};
+    send.disabled = true;
+    input.readOnly = true;
+    try {
+      await postTask(`${root}/chat`, JSON.stringify({message}), sent.key, signal);
+      if (signal.aborted) return;
+      input.value = "";
+      sent = undefined;
+      status.textContent = "Codex の返答を待っています…";
+      poll();
+    } catch (error) {
+      if (signal.aborted) return;
+      status.textContent = {
+        TASK_CHAT_BUSY: "別のチャットが処理中です。少し待ってから再送してください。",
+        TASK_CHAT_DAILY_LIMIT: "この Workspace のチャット利用上限に達しました。",
+        SENSITIVE_INPUT: "認証情報を含まないメッセージにしてください。",
+      }[error.message] ?? runActionMessage(error);
+      send.disabled = false;
+    } finally {
+      input.readOnly = false;
+    }
+  });
+
+  signal.addEventListener("abort", () => clearTimeout(timer), {once: true});
+  poll();
+  return panel;
+}
+
 async function loadDetail(notice = "") {
   detailRequest?.abort();
   detailRequest = new AbortController();
@@ -814,6 +906,7 @@ async function loadDetail(notice = "") {
       content.push(result.status === "fulfilled" ? view(result.value)
         : section(title, element("p", "取得できませんでした。", "error")));
     });
+    content.splice(run.status === "BLOCKED" ? 1 : 0, 0, taskChat(root, signal));
     get("detail-content").replaceChildren(...content);
     const incomplete = allResults.some(({ status }) => status === "rejected");
     message("detail-status", incomplete ? "一部の詳細を取得できませんでした。" : notice, incomplete);
