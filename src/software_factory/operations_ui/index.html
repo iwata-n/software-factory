@@ -21,6 +21,7 @@
     <div id="toolbar" class="controls" hidden>
       <button id="refresh">更新</button>
       <button id="disconnect">切断</button>
+      <button id="task-open" hidden>新規タスク</button>
       <button id="integration-open" hidden>連携設定</button>
     </div>
     <section id="execution" class="execution" aria-labelledby="execution-title" hidden>
@@ -46,6 +47,26 @@
     <div id="board" class="board" aria-label="Run の状態別一覧" hidden></div>
     <button id="older" hidden>過去の Run を追加表示</button>
   </main>
+  <dialog id="task-dialog" aria-labelledby="task-heading">
+    <header class="detail-header">
+      <h2 id="task-heading">新規タスク</h2>
+      <form method="dialog"><button>閉じる</button></form>
+    </header>
+    <p id="task-status" role="status"></p>
+    <form id="task-form" hidden>
+      <label>プロジェクト<select id="task-project" required></select></label>
+      <label>リポジトリ<select id="task-repository" required></select></label>
+      <label>タイトル<input id="task-title" maxlength="200" required></label>
+      <label>目的<textarea id="task-objective" rows="3" maxlength="16000" required></textarea></label>
+      <label>受け入れ条件<textarea id="task-criteria" rows="4" maxlength="400099" required
+        aria-describedby="task-criteria-help"></textarea></label>
+      <p id="task-criteria-help">合否を判断できる条件を1行に1件ずつ入力してください。</p>
+      <label>制約（任意）<textarea id="task-constraints" rows="2"
+        aria-describedby="task-constraints-help"></textarea></label>
+      <p id="task-constraints-help">1行に1件ずつ入力してください。</p>
+      <button id="task-submit" type="submit">タスクを作成</button>
+    </form>
+  </dialog>
   <dialog id="integration-settings" aria-labelledby="integration-title">
     <header class="detail-header">
       <h2 id="integration-title">連携設定</h2>

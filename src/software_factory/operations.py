@@ -1,4 +1,4 @@
-"""Read-only operations console and workspace-scoped Run index."""
+"""Operations console and workspace-scoped queries."""
 
 import asyncio
 import json
@@ -11,8 +11,9 @@ from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from sqlalchemy import select, tuple_
 from starlette.concurrency import run_in_threadpool
 
+from .contracts import ProjectPolicy
 from .db import db_now
-from .models import Attempt, Principal, Run, RunEvent, Task, Worker
+from .models import Attempt, Principal, Project, Repository, Run, RunEvent, Task, Worker
 from .service import DomainError, owned
 
 UI_DIR = Path(__file__).with_name("operations_ui")
@@ -129,6 +130,40 @@ def operations_router(service, token_type):
                 "access": actor.user_access,
                 "execution": service.execution_control(session, actor, actor.workspace_id),
             }
+
+        return service.read(token, query)
+
+    @router.get("/v1/operations/task-targets", tags=["Operations"])
+    def task_targets(token: token_type, response: Response):
+        response.headers["Cache-Control"] = "no-store"
+
+        def query(session, actor):
+            service.require_user_access(actor, "OPERATOR")
+            rows = session.execute(
+                select(Project, Repository)
+                .join(Repository, Repository.project_id == Project.id)
+                .where(
+                    Project.workspace_id == actor.workspace_id,
+                    Repository.workspace_id == actor.workspace_id,
+                    Repository.active.is_(True),
+                )
+                .order_by(Project.name, Project.id, Repository.name, Repository.id)
+            )
+            projects = {}
+            for project, repository in rows:
+                if project.id not in projects:
+                    projects[project.id] = {
+                        "id": project.id,
+                        "name": project.name,
+                        "verification": ProjectPolicy.model_validate(
+                            project.policy
+                        ).verification.model_dump(),
+                        "repositories": [],
+                    }
+                projects[project.id]["repositories"].append(
+                    {"id": repository.id, "name": repository.name, "base_ref": repository.base_ref}
+                )
+            return {"projects": list(projects.values())}
 
         return service.read(token, query)
 

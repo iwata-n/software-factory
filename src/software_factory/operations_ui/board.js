@@ -60,6 +60,8 @@ function disconnect(text = "接続を終了しました。", error = false) {
   executionButtons.forEach((id) => { get(id).disabled = false; });
   executionContext = undefined;
   closeExecutionForm();
+  closeTaskDialog();
+  get("task-open").hidden = true;
   get("integration-settings").close();
   get("integration-open").hidden = true;
   get("execution").hidden = true;
@@ -146,6 +148,7 @@ function renderExecution(context) {
     ? `緊急停止中 · Rev. ${execution.revision}`
     : `実行を許可 · Rev. ${execution.revision}`;
   get("execution-action").hidden = access !== "ADMIN";
+  get("task-open").hidden = !["ADMIN", "OPERATOR"].includes(access);
   get("integration-open").hidden = access !== "ADMIN";
   get("execution-action").textContent = execution.stopped ? "緊急停止を解除" : "緊急停止";
 }
@@ -550,6 +553,129 @@ detail.addEventListener("close", () => {
 get("execution-action").addEventListener("click", openExecutionForm);
 get("execution-dismiss").addEventListener("click", closeExecutionForm);
 get("execution-form").addEventListener("submit", submitExecution);
+
+const taskDialog = get("task-dialog");
+const taskForm = get("task-form");
+let taskRequest;
+let taskProjects = [];
+let taskSubmission;
+
+function closeTaskDialog() {
+  taskRequest?.abort();
+  taskDialog.close();
+}
+
+function taskOptions(select, items) {
+  select.replaceChildren(...items.map(({id, name}) => new Option(name, id)));
+}
+
+function selectedProject() {
+  return taskProjects.find(({id}) => id === get("task-project").value);
+}
+
+function updateTaskRepositories() {
+  taskOptions(get("task-repository"), selectedProject()?.repositories ?? []);
+}
+
+get("task-project").addEventListener("change", updateTaskRepositories);
+get("task-open").addEventListener("click", async () => {
+  taskRequest?.abort();
+  taskRequest = new AbortController();
+  const {signal} = taskRequest;
+  taskForm.reset();
+  taskForm.hidden = true;
+  taskSubmission = undefined;
+  taskDialog.showModal();
+  message("task-status", "作成先を取得中…");
+  try {
+    const {projects} = await read("/v1/operations/task-targets", signal);
+    if (signal.aborted) return;
+    taskProjects = projects;
+    if (!projects.length) {
+      message("task-status", "有効なリポジトリがありません。管理者に登録を依頼してください。", true);
+      return;
+    }
+    taskOptions(get("task-project"), projects);
+    updateTaskRepositories();
+    taskForm.hidden = false;
+    message("task-status", "");
+    get("task-title").focus();
+  } catch (error) {
+    if (!signal.aborted) message("task-status", error.message, true);
+  }
+});
+
+taskDialog.addEventListener("close", () => {
+  if (!taskDialog.open) taskRequest?.abort();
+});
+
+function taskLines(id) {
+  return get(id).value.split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
+}
+
+taskForm.addEventListener("submit", async (event) => {
+  event.preventDefault();
+  const submit = get("task-submit");
+  if (submit.disabled || taskRequest.signal.aborted) return;
+  const project = selectedProject();
+  const repository = project?.repositories.find(({id}) => id === get("task-repository").value);
+  const title = get("task-title").value.trim();
+  const objective = get("task-objective").value.trim();
+  const criteria = taskLines("task-criteria");
+  const constraints = taskLines("task-constraints");
+  if (!repository || !title || !objective || !criteria.length) {
+    message("task-status", "作成先、タイトル、目的、受け入れ条件を入力してください。", true);
+    return;
+  }
+  if (criteria.length > 100 || criteria.some((line) => Array.from(line).length > 4000) ||
+      constraints.length > 100 || constraints.some((line) => Array.from(line).length > 200)) {
+    message("task-status", "受け入れ条件と制約はそれぞれ100件まで入力できます。1件の上限は受け入れ条件が4000文字、制約が200文字です。", true);
+    return;
+  }
+  const body = JSON.stringify({
+    task: {
+      title, objective, repository_id: repository.id, base_ref: repository.base_ref, constraints,
+      acceptance_criteria: criteria.map((description, index) => ({id: `AC-${index + 1}`, description})),
+    },
+    verification: project.verification,
+  });
+  const path = `/v1/projects/${encodeURIComponent(project.id)}/tasks`;
+  if (taskSubmission?.body !== body || taskSubmission?.path !== path) {
+    const key = Array.from(crypto.getRandomValues(new Uint8Array(16)),
+      (byte) => byte.toString(16).padStart(2, "0")).join("");
+    taskSubmission = {body, path, key};
+  }
+  const {signal} = taskRequest;
+  const close = taskDialog.querySelector("header button");
+  submit.disabled = close.disabled = true;
+  message("task-status", "タスクを作成中…");
+  try {
+    const response = await fetch(path, {
+      method: "POST", body, signal, redirect: "error",
+      headers: {Authorization: `Bearer ${token}`, "Content-Type": "application/json",
+        "Idempotency-Key": taskSubmission.key},
+    });
+    if (!response.ok) {
+      const error = await response.json().catch(() => ({}));
+      throw new Error(error.code ?? `HTTP ${response.status}`);
+    }
+    const result = await response.json();
+    if (signal.aborted) return;
+    taskForm.hidden = true;
+    taskForm.reset();
+    message("task-status", `「${title}」を作成しました。タスク ID ${result.task_id}。実行は開始していません。`);
+    close.disabled = false;
+    close.focus();
+  } catch (error) {
+    if (!signal.aborted) message("task-status", `作成できませんでした（${error.message}）。`, true);
+  } finally {
+    submit.disabled = close.disabled = false;
+  }
+});
+
+taskDialog.addEventListener("cancel", (event) => {
+  if (get("task-submit").disabled) event.preventDefault();
+});
 
 const settingsPath = "/v1/operations/integrations";
 const settingsDialog = get("integration-settings");

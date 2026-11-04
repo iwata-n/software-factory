@@ -101,3 +101,15 @@ summary { cursor: pointer; padding: 10px 0; }
 .integration-field[hidden] { display: none; }
 .integration-field input, .integration-field select { min-width: 0; width: 100%; }
 #integration-settings a, #integration-settings button { margin-inline-end: .5rem; }
+
+#task-form label { display: grid; gap: 4px; margin-block: 12px; }
+#task-form input, #task-form select, #task-form textarea {
+  width: 100%;
+  min-width: 0;
+  min-height: 44px;
+  font: inherit;
+  padding: 6px 10px;
+  border: 1px solid #78978b;
+  border-radius: 8px;
+}
+#task-form textarea { resize: vertical; }
