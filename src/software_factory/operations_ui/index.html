@@ -10,17 +10,18 @@
 <body>
   <header class="masthead">
     <span>Software Factory</span>
-    <details id="toolbar" class="masthead-menu" hidden>
-      <summary>メニュー</summary>
-      <div class="masthead-menu-panel">
-        <p id="account-name" hidden></p>
-        <button id="refresh" type="button">更新</button>
-        <button id="task-open" type="button" hidden>新規タスク</button>
-        <button id="integration-open" type="button" hidden>連携設定</button>
-        <button id="accounts-open" type="button" hidden>アカウント管理</button>
-        <button id="disconnect" type="button">切断</button>
-      </div>
-    </details>
+    <div class="masthead-actions">
+      <button id="task-open" type="button" hidden>新規タスク</button>
+      <details id="toolbar" class="masthead-menu" hidden>
+        <summary>メニュー</summary>
+        <div class="masthead-menu-panel">
+          <p id="account-name" hidden></p>
+          <button id="integration-open" type="button" hidden>連携設定</button>
+          <button id="accounts-open" type="button" hidden>アカウント管理</button>
+          <button id="disconnect" type="button">切断</button>
+        </div>
+      </details>
+    </div>
   </header>
   <main>
     <h1>Run カンバン</h1>

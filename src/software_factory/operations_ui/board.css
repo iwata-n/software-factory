@@ -20,6 +20,8 @@ body { margin: 0; }
   padding: 8px max(16px, calc((100vw - 1200px) / 2));
   font-weight: 650;
 }
+.masthead-actions { display: flex; flex-shrink: 0; align-items: center; gap: 8px; }
+#task-open { padding-inline: 10px; white-space: nowrap; }
 .masthead-menu { position: relative; }
 .masthead-menu summary {
   min-height: 44px;

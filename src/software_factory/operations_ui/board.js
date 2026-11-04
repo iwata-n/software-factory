@@ -12,6 +12,8 @@ const lanes = new Map([
 const detail = get("detail");
 const toolbar = get("toolbar");
 const menuToggle = toolbar.querySelector("summary");
+const BOARD_REFRESH_MS = 5000;
+const RUN_PAGE_SIZE = 50;
 const executionButtons = ["execution-action", "execution-submit", "execution-dismiss"];
 let token = "";
 let account;
@@ -23,6 +25,8 @@ function authHeaders() {
 }
 let runs = [];
 let nextBefore = null;
+let visibleRunLimit = RUN_PAGE_SIZE;
+let boardTimer;
 let boardRequest;
 let detailRequest;
 let selected;
@@ -62,6 +66,7 @@ async function read(path, signal) {
 }
 
 function disconnect(text = "接続を終了しました。", error = false) {
+  clearTimeout(boardTimer);
   boardRequest?.abort();
   detailRequest?.abort();
   executionRequest?.abort();
@@ -85,6 +90,7 @@ function disconnect(text = "接続を終了しました。", error = false) {
   get("accounts-open").hidden = true;
   runs = [];
   nextBefore = null;
+  visibleRunLimit = RUN_PAGE_SIZE;
   selected = null;
   detail.close();
   get("detail-content").replaceChildren();
@@ -98,6 +104,7 @@ function disconnect(text = "接続を終了しました。", error = false) {
 }
 
 function renderBoard() {
+  const focusedRun = document.activeElement?.dataset.runId;
   const grouped = new Map([...lanes.keys()].map((status) => [status, []]));
   for (const run of runs) {
     if (!grouped.has(run.status)) grouped.set(run.status, []);
@@ -118,6 +125,7 @@ function renderBoard() {
       for (const run of items) {
         const item = element("li");
         const card = element("button", undefined, "card");
+        card.dataset.runId = run.run_id;
         card.append(
           element("span", run.task_title),
           element("small", `${run.status} / ${run.phase}`),
@@ -136,7 +144,11 @@ function renderBoard() {
     }
     sections.push(section);
   }
-  get("board").replaceChildren(...sections);
+  const board = get("board");
+  board.replaceChildren(...sections);
+  if (focusedRun) {
+    board.querySelector(`[data-run-id="${CSS.escape(focusedRun)}"]`)?.focus({preventScroll: true});
+  }
 }
 
 function executionMessage(text, error = false) {
@@ -252,9 +264,8 @@ const leaseLabels = {
 const credentialLabels = { ACTIVE: "有効", EXPIRED: "期限切れ", REVOKED: "失効済み" };
 
 async function loadWorkers(workspaceId, signal) {
+  if (get("worker-panel").hidden) message("worker-status", "Worker の状態を取得中…");
   get("worker-panel").hidden = false;
-  get("worker-list").replaceChildren();
-  message("worker-status", "Worker の状態を取得中…");
   try {
     const { workers } = await read(`/v1/workspaces/${encodeURIComponent(workspaceId)}/workers`, signal);
     if (signal.aborted) return;
@@ -272,39 +283,81 @@ async function loadWorkers(workspaceId, signal) {
   }
 }
 
-async function loadBoard(older = false) {
+async function readRuns(limit, signal, before = null) {
+  const items = [];
+  do {
+    const query = new URLSearchParams({limit: String(Math.min(100, limit - items.length))});
+    if (before) query.set("before", before);
+    const page = await read(`/v1/runs?${query}`, signal);
+    items.push(...page.runs);
+    before = page.next_before;
+  } while (before && items.length < limit);
+  return {runs: items, next_before: before};
+}
+
+function canRefreshBoard() {
+  return !get("board").hidden && !document.hidden && !boardRequest;
+}
+
+function scheduleBoardRefresh() {
+  clearTimeout(boardTimer);
+  if (canRefreshBoard()) {
+    boardTimer = setTimeout(() => {
+      if (canRefreshBoard()) void loadBoard({quiet: true});
+    }, BOARD_REFRESH_MS);
+  }
+}
+
+async function loadBoard({older = false, quiet = false} = {}) {
+  clearTimeout(boardTimer);
   boardRequest?.abort();
   boardRequest = new AbortController();
   const { signal } = boardRequest;
-  get("refresh").disabled = get("older").disabled = true;
-  get("connect").querySelector("button").disabled = true;
-  message("status", "Run 一覧を取得中…");
+  const initial = get("board").hidden;
+  const olderButton = get("older");
+  const connectButton = get("connect").querySelector("button");
+  olderButton.disabled = !quiet;
+  connectButton.disabled = true;
+  if (!quiet) message("status", "Run 一覧を取得中…");
   try {
-    const suffix = older ? `?before=${encodeURIComponent(nextBefore)}` : "";
     const [page, context] = await Promise.all([
-      read(`/v1/runs${suffix}`, signal), read("/v1/operations/context", signal),
+      older ? readRuns(RUN_PAGE_SIZE, signal, nextBefore)
+        : readRuns(visibleRunLimit, signal),
+      read("/v1/operations/context", signal),
     ]);
     if (signal.aborted) return;
     renderExecution(context);
-    void loadWorkers(context.execution.workspace_id, signal);
-    runs = older ? [...runs, ...page.runs] : page.runs;
+    const updated = older ? [...runs, ...page.runs] : page.runs;
+    if (initial || JSON.stringify(updated) !== JSON.stringify(runs)) {
+      runs = updated;
+      renderBoard();
+    }
+    if (older) visibleRunLimit += RUN_PAGE_SIZE;
     nextBefore = page.next_before;
-    renderBoard();
     get("token-login").hidden = get("login").hidden = true;
     get("board").hidden = get("toolbar").hidden = false;
-    get("older").hidden = !nextBefore;
-    message("status", runs.length ? `${runs.length} 件を表示中` : "この Workspace に Run はありません。");
+    olderButton.hidden = !nextBefore;
+    const status = runs.length ? `${runs.length} 件を表示中` : "この Workspace に Run はありません。";
+    if (get("status").textContent !== status || get("status").classList.contains("error")) {
+      message("status", status);
+    }
+    if (!quiet || get("worker-panel").open) {
+      await loadWorkers(context.execution.workspace_id, signal);
+    }
   } catch (error) {
     if (signal.aborted) return;
     if ([401, 403].includes(error.status)) {
       disconnect(account ? "ログインし直してください。" : "User トークンを確認してください。", true);
     } else {
-      message("status", "一覧を更新できませんでした。再試行してください。", true);
+      const status = initial ? "一覧を取得できませんでした。もう一度接続してください。"
+        : "一覧を更新できませんでした。自動で再試行します。";
+      if (get("status").textContent !== status) message("status", status, true);
     }
   } finally {
-    if (boardRequest.signal === signal) {
-      get("refresh").disabled = get("older").disabled = false;
-      get("connect").querySelector("button").disabled = false;
+    if (boardRequest?.signal === signal) {
+      boardRequest = undefined;
+      olderButton.disabled = connectButton.disabled = false;
+      scheduleBoardRefresh();
     }
   }
 }
@@ -609,8 +662,11 @@ toolbar.addEventListener("keydown", (event) => {
 document.addEventListener("click", (event) => {
   if (toolbar.open && !toolbar.contains(event.target)) toolbar.open = false;
 });
-get("refresh").addEventListener("click", () => loadBoard());
-get("older").addEventListener("click", () => loadBoard(true));
+get("older").addEventListener("click", () => loadBoard({older: true}));
+document.addEventListener("visibilitychange", () => {
+  clearTimeout(boardTimer);
+  if (canRefreshBoard()) void loadBoard({quiet: true});
+});
 get("disconnect").addEventListener("click", async () => {
   const button = get("disconnect");
   button.disabled = true;
