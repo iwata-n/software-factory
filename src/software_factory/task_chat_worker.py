@@ -9,7 +9,7 @@ import httpx
 from pydantic import Field, model_validator
 
 from .codex_engine import CodexError
-from .contracts import Contract, ModelCallUsage
+from .contracts import Contract, Criterion, ModelCallUsage
 from .sandbox import STOP_UNCONFIRMED
 
 CHAT_TIMEOUT = 90
@@ -38,8 +38,38 @@ class TaskAnswerOptions(Contract):
         return self
 
 
+class InterviewQuestion(Contract):
+    question: Annotated[str, Field(min_length=1, max_length=600)]
+    options: list[Annotated[str, Field(min_length=1, max_length=200)]] = Field(
+        min_length=2, max_length=3
+    )
+
+
+class InterviewSpec(Contract):
+    objective: Annotated[str, Field(min_length=1, max_length=3000)]
+    acceptance_criteria: list[Criterion] = Field(min_length=1, max_length=100)
+
+    @model_validator(mode="after")
+    def unique_criteria(self):
+        identifiers = [item.id for item in self.acceptance_criteria]
+        if len(identifiers) != len(set(identifiers)):
+            raise ValueError("Acceptance criterion IDs must be unique")
+        return self
+
+
+class InterviewReply(Contract):
+    follow_up: InterviewQuestion | None
+    specification: InterviewSpec | None
+
+    @model_validator(mode="after")
+    def question_or_specification(self):
+        if (self.follow_up is None) == (self.specification is None):
+            raise ValueError("Return either a follow-up or a specification")
+        return self
+
+
 class TaskChatOutcome(Contract):
-    answer: Answer | None = None
+    answer: Annotated[str, Field(min_length=1, max_length=500000)] | None = None
     error: Literal["CODEX_AUTH_OR_POLICY", "CODEX_UNAVAILABLE", "CODEX_NO_USAGE"] | None = None
     usage: ModelCallUsage | None = None
 
@@ -63,12 +93,17 @@ def claim_chat(client, engine):
         result = TaskChatOutcome(error="CODEX_AUTH_OR_POLICY")
     else:
         try:
-            schema = TaskAnswerOptions if job.get("answer_options") else TaskChatReply
+            if job.get("interview"):
+                schema = InterviewReply
+            elif job.get("answer_options"):
+                schema = TaskAnswerOptions
+            else:
+                schema = TaskChatReply
             reply = engine.run(job["context"], schema, Event(), timeout=CHAT_TIMEOUT)
             answer = (
-                json.dumps(reply.value, ensure_ascii=False)
-                if job.get("answer_options")
-                else reply.value["answer"]
+                reply.value["answer"]
+                if schema is TaskChatReply
+                else json.dumps(reply.value, ensure_ascii=False)
             )
             result = (
                 TaskChatOutcome(answer=answer, usage=reply.usage)

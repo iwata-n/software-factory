@@ -581,7 +581,9 @@ class Service:
         return self.add_spec(session, task, spec, task.latest_spec_version + 1)
 
     def start_run_request(self, token: str, task_id: str, data: RunStart, key: str | None) -> dict:
-        operation, body = f"runs:{task_id}", data.model_dump()
+        operation = f"runs:{task_id}"
+        # Preserve request hashes for Run starts recorded before this option existed.
+        body = data.model_dump(exclude={"reuse_existing"} if not data.reuse_existing else None)
         with self.db.transaction() as session:
             actor = self.principal(session, token, "USER")
             self.require_user_access(actor, "OPERATOR")
@@ -691,6 +693,20 @@ class Service:
             raise DomainError(403, "REPOSITORY_ACCESS_REVOKED")
         if not repo.remote_url and repo.base_ref != spec.task.base_ref:
             raise DomainError(422, "BASE_REF_NOT_REGISTERED")
+        if data.reuse_existing:
+            existing = session.scalar(
+                select(Run)
+                .where(
+                    Run.workspace_id == actor.workspace_id,
+                    Run.task_id == task.id,
+                    Run.spec_version == version.version,
+                    Run.snapshot["workflow_type"].as_string() == data.strategy,
+                )
+                .order_by(Run.created_at.desc(), Run.id.desc())
+                .limit(1)
+            )
+            if existing:
+                return run_view(existing)
         project = owned(session, Project, task.project_id, actor.workspace_id)
         policy = ProjectPolicy.model_validate(project.policy)
         base_sha = resolved_sha if resolved_sha is not None else repo.base_sha

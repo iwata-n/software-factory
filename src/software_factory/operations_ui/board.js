@@ -1,4 +1,4 @@
-import { renderAttention } from "./a2ui.js";
+import { renderAttention } from "./a2ui.js?v=spec-interview";
 
 const get = (id) => document.getElementById(id);
 const lanes = new Map([
@@ -586,7 +586,7 @@ async function followRunEvents(root, runId, revision, signal) {
 }
 
 const blockedGuidance = {
-  PLAN_HAS_OPEN_QUESTIONS: "回答候補を選ぶか、「その他」から回答して仕様案を確認してください。",
+  PLAN_HAS_OPEN_QUESTIONS: "Codex の質問に答えて仕様を詰めます。確認が済むと仕様案が表示されます。",
   SPEC_CHANGE_REQUIRED: "目的や受け入れ条件を見直し、新しい仕様で実行してください。",
   REPLAN_LIMIT_REACHED: "計画の再作成上限に達しました。仕様を確認し、新しい Run で実行してください。",
   BUDGET_EXHAUSTED: "予算の残額を確認し、必要に応じて予算を変更してから再開してください。",
@@ -699,65 +699,133 @@ function specCorrection(run, task, status, signal) {
   return editor;
 }
 
-function mountAttentionSurface(root, container, editor, status, signal) {
+function mountAttentionSurface(root, run, container, signal) {
   const drafts = {};
+  const notice = element("p", "質問を取得中…");
+  notice.setAttribute("role", "status");
+  const content = element("div");
+  container.append(notice, content);
   let refreshTimer;
-  let previousAddition = "";
+  let refreshVersion = 0;
+  let snapshot;
+  let request;
+  let sending = false;
 
   async function handle(envelope) {
+    if (sending) return;
+    const {timestamp, ...action} = envelope.action;
+    const payload = JSON.stringify(action);
+    if (request?.payload !== payload) request = {payload, key: taskKey()};
+    sending = true;
+    ++refreshVersion;
+    clearTimeout(refreshTimer);
+    notice.textContent = "送信中…";
+    notice.classList.remove("error");
     try {
-      const result = await postTask(`${root}/attention/actions`, JSON.stringify(envelope),
-        taskKey(), signal);
-      if (signal.aborted) return;
-      const objective = editor.querySelector('[name="objective"]');
-      if (objective.readOnly) throw new Error("保存した仕様を実行してから、次の修正を行ってください");
-      const current = previousAddition && objective.value.endsWith(previousAddition)
-        ? objective.value.slice(0, -previousAddition.length) : objective.value;
-      if (current.length + result.addition.length > objective.maxLength) {
-        throw new Error("目的欄の上限を超えます。回答を短くしてください");
-      }
-      objective.value = current + result.addition;
-      previousAddition = result.addition;
-      editor.open = true;
-      status.textContent = "回答を仕様案に反映しました。内容を確認して再実行できます。";
-      status.classList.remove("error");
-      objective.focus();
+      await postTask(`${root}/attention/actions`, JSON.stringify(envelope), request.key, signal);
+      snapshot = undefined;
+      await refresh();
+      request = undefined;
     } catch (error) {
       if (signal.aborted) return;
-      status.textContent = {
-        ATTENTION_ANSWER_REQUIRED: "各質問で候補を選ぶか、回答を入力してください。",
-        ATTENTION_ANSWER_TOO_LONG: "回答を短くしてください。",
-        ATTENTION_SURFACE_STALE: "計画または仕様が変わりました。詳細を更新してください。",
+      notice.textContent = {
+        ATTENTION_ANSWER_REQUIRED: "候補を選ぶか、「その他」から回答を入力してください。",
+        ATTENTION_SURFACE_STALE: "質問や仕様が変わりました。「詳細を更新」で確認してください。",
+        TASK_CHAT_BUSY: "Codex が別の応答を処理中です。少し待って送信してください。",
+        TASK_CHAT_DAILY_LIMIT: "本日の Codex 対話の上限に達しました。",
+        INTERVIEW_SPECIFICATION_INVALID: "仕様案を保存できませんでした。",
       }[error.message] ?? runActionMessage(error);
-      status.classList.add("error");
+      notice.classList.add("error");
+      if (error.message === "TASK_CHAT_BUSY") refreshTimer = setTimeout(poll, 2000);
+    } finally {
+      sending = false;
     }
   }
 
+  function openRun(runId, message) {
+    if (signal.aborted) return;
+    selected = {...selected, run_id: runId};
+    void loadBoard();
+    void loadDetail(message);
+  }
+
+  function specificationView(state) {
+    const {specification, adopted_version: adopted, resumed_run_id: resumed} = state;
+    const view = element("div");
+    const criteria = element("ul");
+    criteria.append(...specification.acceptance_criteria.map(({description}) =>
+      element("li", description)));
+    view.append(
+      element("h4", adopted ? `採用した仕様 v${adopted}` : "Codex がまとめた仕様案"),
+      element("h4", "目的"),
+      element("p", specification.objective, "task-chat-message"),
+      element("h4", "受け入れ条件"),
+      criteria,
+    );
+    if (resumed) {
+      const open = element("button", "実行した Run を開く");
+      open.type = "button";
+      open.addEventListener("click", () => openRun(resumed));
+      view.append(open);
+    } else if (adopted) {
+      view.append(blockedForm("採用した仕様で実行", notice, async () => {
+        const taskRoot = `/v1/tasks/${encodeURIComponent(run.task_id)}`;
+        const key = `attention-run-${run.run_id}-${adopted}`;
+        const result = await postTask(`${taskRoot}/runs`,
+          JSON.stringify({spec_version: adopted, reuse_existing: true}), key, signal);
+        openRun(result.run_id, `採用した仕様 v${adopted} の Run を表示しています。`);
+      }));
+    }
+    return view;
+  }
+
   async function refresh() {
-    const {messages, pending} = await read(`${root}/attention`, signal);
-    if (signal.aborted || !messages.length) return;
-    const snapshot = JSON.stringify(messages);
-    if (container.dataset.surface !== snapshot) {
+    const version = ++refreshVersion;
+    const state = await read(`${root}/attention`, signal);
+    if (signal.aborted || version !== refreshVersion) return;
+    const updated = JSON.stringify(state);
+    if (snapshot !== updated) {
       const focused = document.activeElement;
-      const inputId = container.contains(focused) && focused.dataset.a2uiId;
-      const form = renderAttention(messages, drafts, handle);
-      container.replaceChildren(form);
-      if (inputId) {
-        const input = form.querySelector(`[data-a2ui-id="${CSS.escape(inputId)}"]`);
+      const inputId = content.contains(focused) && focused.dataset.a2uiId;
+      const sameQuestion = drafts.surfaceId === state.surface_id;
+      const nodes = [];
+      if (state.history?.length) {
+        const history = element("details");
+        history.open = content.querySelector("details")?.open ?? false;
+        history.append(element("summary", `これまでの回答（${state.history.length}件）`));
+        for (const {question, answer} of state.history) {
+          history.append(element("h4", question), element("p", answer, "task-chat-message"));
+        }
+        nodes.push(history);
+      }
+      if (state.specification) nodes.push(specificationView(state));
+      if (state.messages.length) nodes.push(renderAttention(state.messages, drafts, handle));
+      content.replaceChildren(...nodes);
+      if (sameQuestion && inputId) {
+        const input = content.querySelector(`[data-a2ui-id="${CSS.escape(inputId)}"]`);
         input?.focus({preventScroll: true});
         input?.setSelectionRange(focused.selectionStart, focused.selectionEnd);
       }
-      container.dataset.surface = snapshot;
+      notice.textContent = !state.available ? "この Run では Codex との仕様確認を利用できません。"
+        : state.adopted_version ? "仕様を採用しました。"
+        : state.status === "FAILED" ? "Codex の応答を取得できませんでした。回答を送り直せます。"
+        : state.proposing ? "回答候補を準備中です。"
+        : state.pending ? "Codex が追加で確認する点と仕様案を検討しています…"
+        : state.specification ? "仕様案がまとまりました。"
+        : state.history?.length ? "Codex から追加の質問があります。"
+        : "";
+      notice.classList.toggle("error", state.status === "FAILED");
+      snapshot = updated;
     }
-    if (pending) refreshTimer = setTimeout(poll, 2000);
+    if (state.pending) refreshTimer = setTimeout(poll, 2000);
   }
 
   function poll() {
     if (signal.aborted) return;
     void refresh().catch(() => {
       if (signal.aborted) return;
-      status.textContent = "質問フォームを更新できませんでした。詳細を更新してください。";
-      status.classList.add("error");
+      notice.textContent = "対話を取得できませんでした。「詳細を更新」で再試行してください。";
+      notice.classList.add("error");
     });
   }
 
@@ -783,10 +851,14 @@ async function blockedRunView(root, run, signal) {
   const questions = plans.value?.plans.at(-1)?.body?.open_questions;
   const questionContent = element("div");
   if (Array.isArray(questions) && questions.length) {
-    const list = element("ul");
-    list.append(...questions.map((question) => element("li", question)));
-    questionContent.append(list);
-    panel.append(element("h4", "Codex からの質問"), questionContent);
+    if (operator) {
+      panel.append(element("h4", "Codex と仕様を確認"), questionContent);
+      mountAttentionSurface(root, run, questionContent, signal);
+    } else {
+      const list = element("ul");
+      list.append(...questions.map((question) => element("li", question)));
+      panel.append(element("h4", "Codex からの質問"), list);
+    }
   } else if (plans.status === "rejected") {
     panel.append(element("p", "Codex の計画を取得できませんでした。", "error"));
   }
@@ -803,12 +875,9 @@ async function blockedRunView(root, run, signal) {
   panel.append(status);
   const canCorrectSpec = ["PLAN", "WAIT_PLAN_APPROVAL"].includes(run.phase) ||
     run.stop_reason === "SPEC_CHANGE_REQUIRED";
-  if (canCorrectSpec) {
+  if (canCorrectSpec && !questions?.length) {
     const correction = task.value && specCorrection(run, task.value, status, signal);
     panel.append(correction ?? element("p", "タスクの仕様を取得できませんでした。", "error"));
-    if (correction && questions?.length) {
-      mountAttentionSurface(root, questionContent, correction, status, signal);
-    }
   }
   if (recoverableBlocks.has(run.stop_reason)) {
     const key = taskKey();

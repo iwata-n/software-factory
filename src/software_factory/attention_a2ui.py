@@ -1,23 +1,35 @@
-"""A2UI v0.9.1 surfaces for answering a blocked plan's questions."""
+"""A2UI v0.9.1 specification interviews for blocked plans."""
 
 from typing import Annotated, Literal
 
 from fastapi import APIRouter, Request, Response
-from pydantic import AwareDatetime, Field
+from pydantic import AwareDatetime, Field, ValidationError
 from sqlalchemy import select
 
 from .codex_engine import sensitive_input
-from .contracts import Contract
+from .contracts import Contract, TaskSpec
 from .db import db_now
 from .models import Run, Task, TaskChatTurn, Workspace
 from .service import DomainError, owned
-from .task_chat import chat_limit_reached, eligible, latest_plan, plan_questions, turn_view
-from .task_chat_worker import TaskAnswerOptions
+from .task_chat import (
+    ACTIVE,
+    chat_limit_reached,
+    eligible,
+    enqueue_turn,
+    interview_spec,
+    interview_turns,
+    latest_plan,
+    plan_questions,
+    turn_view,
+)
+from .task_chat_worker import InterviewReply, TaskAnswerOptions
 from .web_accounts import browser_write
 
 VERSION = "v0.9.1"
 CATALOG = "https://a2ui.org/specification/v0_9/catalogs/basic/catalog.json"
-DRAFT = "draft_answers"
+CONTINUE = "continue_interview"
+ADOPT = "adopt_specification"
+REFINE = "refine_specification"
 OTHER = "other"
 
 
@@ -29,12 +41,13 @@ class AnswerValue(Contract):
 class ActionContext(Contract):
     revision: Annotated[int, Field(strict=True, ge=1)]
     spec_version: Annotated[int, Field(strict=True, ge=1)]
+    turn_id: str | None = None
     proposal_id: str | None = None
-    answers: dict[str, AnswerValue] = Field(default_factory=dict, max_length=100)
+    answers: dict[Literal["1"], AnswerValue] = Field(default_factory=dict, max_length=1)
 
 
 class SurfaceAction(Contract):
-    name: Literal["draft_answers"]
+    name: Literal["continue_interview", "adopt_specification", "refine_specification"]
     surface_id: Annotated[str, Field(alias="surfaceId", max_length=64)]
     component_id: Annotated[str, Field(alias="sourceComponentId", max_length=64)]
     timestamp: AwareDatetime
@@ -53,104 +66,110 @@ def proposal(session, run, plan):
             TaskChatTurn.workspace_id == run.workspace_id,
             TaskChatTurn.run_id == run.id,
             TaskChatTurn.plan_id == plan.id,
+            TaskChatTurn.interview.is_(None),
         )
         .order_by(TaskChatTurn.created_at.desc(), TaskChatTurn.id.desc())
         .limit(1)
     )
 
 
-def options_by_question(turn):
+def options_for_first_question(turn):
     if not turn or turn.status != "ANSWERED":
-        return {}
+        return []
     reply = TaskAnswerOptions.model_validate_json(turn.answer)
-    return {row.question_number: row.options for row in reply.questions}
+    return next((row.options for row in reply.questions if row.question_number == 1), [])
 
 
-def surface_id(plan):
-    return f"attention-{plan.id}"
-
-
-def attention_messages(run, plan, questions, task, turn, state):
-    surface = surface_id(plan)
-    components = []
-    children = []
-    options = options_by_question(turn)
-    data = {
-        "questions": questions,
-        "answers": {
-            str(index): {"choice": [], "text": ""} for index in range(1, len(questions) + 1)
-        },
+def interview_state(session, run, plan, task, questions):
+    version = task.latest_spec_version
+    turns = interview_turns(session, run, plan, version)
+    if not turns and version > 1:
+        previous = interview_turns(session, run, plan, version - 1)
+        if previous and previous[-1].interview.get("adopted_version") == version:
+            turns = previous
+            version -= 1
+    latest = turns[-1] if turns else None
+    completed = next((turn for turn in reversed(turns) if turn.status == "ANSWERED"), None)
+    reply = InterviewReply.model_validate_json(completed.answer) if completed else None
+    initial_proposal = proposal(session, run, plan) if not completed else None
+    follow_up = reply.follow_up if reply else None
+    return {
+        "version": version,
+        "turns": turns,
+        "latest": latest,
+        "surface": f"attention-{completed.id if completed else plan.id}",
+        "proposal": initial_proposal,
+        "question": follow_up.question if follow_up else questions[0],
+        "options": follow_up.options if follow_up else options_for_first_question(initial_proposal),
+        "specification": reply.specification if reply else None,
     }
+
+
+def attention_messages(run, state, *, review=False):
+    surface = state["surface"]
+    latest = state["latest"]
     scope = {
         "revision": run.state_revision,
-        "spec_version": task.latest_spec_version,
+        "spec_version": state["version"],
+        "turn_id": latest.id if latest else None,
     }
-
-    def add(identifier, component, **properties):
-        components.append({"id": identifier, "component": component, **properties})
-        children.append(identifier)
-
-    def button(name, label, context, variant):
-        components.append({"id": f"{name}-label", "component": "Text", "text": label})
-        add(
-            name,
-            "Button",
-            child=f"{name}-label",
-            variant=variant,
-            action={"event": {"name": name, "context": context}},
-        )
-
-    for index in range(1, len(questions) + 1):
-        add(f"question-{index}", "Text", variant="h4", text={"path": f"/questions/{index - 1}"})
-        choices = options.get(index, [])
-        add(
-            f"choices-{index}",
-            "ChoicePicker",
-            variant="mutuallyExclusive",
-            label=f"質問 {index} の回答候補",
-            options=[
-                {"label": text, "value": str(number)} for number, text in enumerate(choices, 1)
-            ]
-            + [{"label": "その他", "value": OTHER}],
-            value={"path": f"/answers/{index}/choice"},
-        )
-        add(
-            f"answer-{index}",
-            "TextField",
-            label=f"質問 {index} への回答・補足",
-            variant="longText",
-            value={"path": f"/answers/{index}/text"},
-        )
-    if state in {"WAITING", "QUEUED", "RUNNING"}:
-        add("proposal-state", "Text", text="回答候補を準備中です。「その他」から先に回答できます。")
-    elif state == "PAUSED":
-        add(
-            "proposal-state",
-            "Text",
-            text="回答候補の生成は一時停止中です。「その他」から回答できます。",
-        )
-    elif state == "FAILED":
-        add(
-            "proposal-state",
-            "Text",
-            text="回答候補を取得できませんでした。自由入力で回答できます。",
-        )
-    elif state == "ANSWERED" and not options:
-        add(
-            "proposal-state",
-            "Text",
-            text="Codex から回答候補はありません。自由入力で回答できます。",
-        )
-    button(
-        DRAFT,
-        "回答を仕様案に反映",
-        scope
-        | {
-            **({"proposal_id": turn.id} if options else {}),
-            "answers": {"path": "/answers"},
-        },
-        "primary",
-    )
+    data = {"answers": {}}
+    if review:
+        name, label = ADOPT, "この仕様を採用"
+        data["answers"]["1"] = {"choice": [OTHER], "text": ""}
+        components = [
+            {
+                "id": "feedback",
+                "component": "TextField",
+                "label": "仕様案の修正・追加で確認したいこと",
+                "variant": "longText",
+                "value": {"path": "/answers/1/text"},
+            },
+            {"id": "refine-label", "component": "Text", "text": "仕様案の修正を依頼"},
+            {
+                "id": REFINE,
+                "component": "Button",
+                "child": "refine-label",
+                "variant": "borderless",
+                "action": {
+                    "event": {
+                        "name": REFINE,
+                        "context": scope | {"answers": {"path": "/answers"}},
+                    },
+                },
+            },
+        ]
+    else:
+        name, label = CONTINUE, "回答を送る"
+        data["answers"]["1"] = {"choice": [], "text": ""}
+        scope["answers"] = {"path": "/answers"}
+        if state["proposal"] and state["options"]:
+            scope["proposal_id"] = state["proposal"].id
+        components = [
+            {"id": "question", "component": "Text", "variant": "h4", "text": state["question"]},
+            {
+                "id": "choices",
+                "component": "ChoicePicker",
+                "variant": "mutuallyExclusive",
+                "label": "回答候補",
+                "options": [
+                    {"label": text + ("（推奨）" if number == 1 else ""), "value": str(number)}
+                    for number, text in enumerate(state["options"], 1)
+                ]
+                + [{"label": "その他", "value": OTHER}],
+                "value": {"path": "/answers/1/choice"},
+            },
+            {
+                "id": "answer",
+                "component": "TextField",
+                "label": "回答・補足",
+                "variant": "longText",
+                "value": {"path": "/answers/1/text"},
+            },
+        ]
+    children = [
+        component["id"] for component in components if component["id"] != "refine-label"
+    ] + [name]
     return [
         {"version": VERSION, "createSurface": {"surfaceId": surface, "catalogId": CATALOG}},
         {
@@ -160,11 +179,36 @@ def attention_messages(run, plan, questions, task, turn, state):
                 "components": [
                     {"id": "root", "component": "Column", "children": children},
                     *components,
+                    {"id": f"{name}-label", "component": "Text", "text": label},
+                    {
+                        "id": name,
+                        "component": "Button",
+                        "child": f"{name}-label",
+                        "variant": "primary",
+                        "action": {"event": {"name": name, "context": scope}},
+                    },
                 ],
             },
         },
         {"version": VERSION, "updateDataModel": {"surfaceId": surface, "value": data}},
     ]
+
+
+def answer_text(value, options):
+    if value is None:
+        raise DomainError(422, "ATTENTION_ANSWER_REQUIRED")
+    choice = value.choice[0] if value.choice else OTHER
+    if choice == OTHER:
+        answer = value.text
+    else:
+        if int(choice) > len(options):
+            raise DomainError(409, "ATTENTION_SURFACE_STALE")
+        answer = "\n".join(filter(None, (options[int(choice) - 1], value.text)))
+    if not answer:
+        raise DomainError(422, "ATTENTION_ANSWER_REQUIRED")
+    if sensitive_input(answer):
+        raise DomainError(422, "SENSITIVE_INPUT")
+    return answer
 
 
 def attention_router(service, token_type, codex_workspace):
@@ -173,10 +217,9 @@ def attention_router(service, token_type, codex_workspace):
     def subject(session, actor, run_id):
         run = owned(session, Run, run_id, actor.workspace_id)
         plan = latest_plan(session, run) if run.status == "BLOCKED" else None
-        questions = plan_questions(plan)
-        return run, plan, questions
+        return run, plan, plan_questions(plan)
 
-    def can_generate(run):
+    def available(run):
         return run.workspace_id == codex_workspace and eligible(run)
 
     @router.get("")
@@ -185,22 +228,56 @@ def attention_router(service, token_type, codex_workspace):
 
         def query(session, actor):
             run, plan, questions = subject(session, actor, run_id)
-            if not questions or actor.user_access == "VIEWER":
-                return {"messages": [], "pending": False}
+            if not questions or actor.user_access == "VIEWER" or not available(run):
+                return {"messages": [], "pending": False, "available": False}
             task = owned(session, Task, run.task_id, actor.workspace_id)
-            turn = proposal(session, run, plan)
+            state = interview_state(session, run, plan, task, questions)
+            latest = state["latest"]
             now = db_now(session)
-            state = turn_view(turn, now)["status"] if turn else None
-            if not turn and can_generate(run):
-                paused = session.get(Workspace, run.workspace_id).execution_stopped
-                state = (
-                    "PAUSED"
-                    if paused or chat_limit_reached(session, run.workspace_id, now)
-                    else "WAITING"
+            status = turn_view(latest, now)["status"] if latest else None
+            specification = state["specification"]
+            adopted = latest.interview.get("adopted_version") if latest else None
+            resumed = (
+                session.scalar(
+                    select(Run.id)
+                    .where(
+                        Run.workspace_id == run.workspace_id,
+                        Run.task_id == run.task_id,
+                        Run.spec_version == adopted,
+                    )
+                    .order_by(Run.created_at.desc(), Run.id.desc())
+                    .limit(1)
                 )
+                if adopted
+                else None
+            )
+            initial = state["proposal"]
+            proposing = not latest and (
+                turn_view(initial, now)["status"] in ACTIVE
+                if initial
+                else not session.get(Workspace, run.workspace_id).execution_stopped
+                and not chat_limit_reached(session, run.workspace_id, now)
+            )
+            messages = (
+                []
+                if adopted or status in ACTIVE
+                else attention_messages(run, state, review=specification is not None)
+            )
             return {
-                "messages": attention_messages(run, plan, questions, task, turn, state),
-                "pending": state in {"WAITING", "QUEUED", "RUNNING"},
+                "available": True,
+                "messages": messages,
+                "pending": status in ACTIVE or proposing,
+                "status": status,
+                "proposing": proposing,
+                "surface_id": state["surface"],
+                "history": [
+                    {"question": turn.interview["question"], "answer": turn.question}
+                    for turn in state["turns"]
+                    if turn.status == "ANSWERED" or turn is latest
+                ],
+                "specification": specification,
+                "adopted_version": adopted,
+                "resumed_run_id": resumed,
             }
 
         return service.read(token, query)
@@ -209,50 +286,72 @@ def attention_router(service, token_type, codex_workspace):
     def answer(run_id: str, data: ActionEnvelope, request: Request, token: token_type):
         browser_write(request)
         action = data.action
-        event = action.context
+        context = action.context
 
-        def validate(session, actor):
-            service.require_user_access(actor, "OPERATOR")
+        def command(session, actor):
             run, plan, questions = subject(session, actor, run_id)
-            if (
-                not questions
-                or action.surface_id != surface_id(plan)
-                or action.component_id != action.name
-                or event.revision != run.state_revision
-            ):
+            if not available(run):
+                raise DomainError(409, "TASK_CHAT_UNAVAILABLE")
+            if not questions or context.revision != run.state_revision:
                 raise DomainError(409, "ATTENTION_SURFACE_STALE")
             task = owned(session, Task, run.task_id, actor.workspace_id)
-            if event.spec_version != task.latest_spec_version:
+            state = interview_state(session, run, plan, task, questions)
+            latest = state["latest"]
+            if (
+                action.surface_id != state["surface"]
+                or action.component_id != action.name
+                or context.spec_version != state["version"]
+                or context.turn_id != (latest.id if latest else None)
+            ):
                 raise DomainError(409, "ATTENTION_SURFACE_STALE")
-            return run, plan, questions
+            specification = state["specification"]
+            if latest and turn_view(latest, db_now(session))["status"] in ACTIVE:
+                raise DomainError(409, "TASK_CHAT_BUSY")
+            if action.name == ADOPT and specification:
+                if adopted := latest.interview.get("adopted_version"):
+                    return {"spec_version": adopted}
+                base = interview_spec(session, run, state["version"])
+                try:
+                    spec = TaskSpec.model_validate(
+                        base.body | {"task": base.body["task"] | specification.model_dump()}
+                    )
+                except ValidationError:
+                    raise DomainError(422, "INTERVIEW_SPECIFICATION_INVALID") from None
+                result = service.new_spec(session, actor, task.id, spec)
+                latest.interview = latest.interview | {"adopted_version": result["spec_version"]}
+                return {"spec_version": result["spec_version"]}
+            refining = action.name == REFINE and specification is not None
+            if (
+                latest
+                and latest.interview.get("adopted_version")
+                or not (refining or (action.name == CONTINUE and specification is None))
+            ):
+                raise DomainError(409, "ATTENTION_SURFACE_STALE")
+            initial = state["proposal"]
+            options = state["options"] if not refining else []
+            if initial and initial.id != context.proposal_id:
+                options = []
+            answer = answer_text(context.answers.get("1"), options)
+            turn = enqueue_turn(
+                session,
+                run,
+                answer,
+                plan_id=plan.id,
+                interview={
+                    "revision": run.state_revision,
+                    "spec_version": state["version"],
+                    "question": "仕様案への修正・確認事項" if refining else state["question"],
+                },
+            )
+            return {"id": turn.id}
 
-        def draft(session, actor):
-            run, plan, questions = validate(session, actor)
-            turn = proposal(session, run, plan)
-            options = options_by_question(turn) if turn and turn.id == event.proposal_id else {}
-            if set(event.answers) != {str(i) for i in range(1, len(questions) + 1)}:
-                raise DomainError(422, "ATTENTION_ANSWER_REQUIRED")
-            lines = []
-            for index, question in enumerate(questions, 1):
-                value = event.answers[str(index)]
-                choices = options.get(index, [])
-                choice = value.choice[0] if value.choice else None
-                selected = ""
-                if choice and choice != OTHER:
-                    if int(choice) > len(choices):
-                        raise DomainError(409, "ATTENTION_SURFACE_STALE")
-                    selected = choices[int(choice) - 1]
-                answer = "\n".join(text for text in (selected, value.text) if text)
-                if not answer:
-                    raise DomainError(422, "ATTENTION_ANSWER_REQUIRED")
-                if sensitive_input(answer):
-                    raise DomainError(422, "SENSITIVE_INPUT")
-                lines.append(f"質問 {index}  {question}\n回答  {answer}")
-            addition = "\n\n【Codex の質問への回答】\n" + "\n\n".join(lines)
-            if len(addition) > 16000:
-                raise DomainError(422, "ATTENTION_ANSWER_TOO_LONG")
-            return {"addition": addition, "spec_version": event.spec_version}
-
-        return service.read(token, draft)
+        return service.write(
+            token,
+            "USER",
+            f"attention:{run_id}:{action.name}",
+            request.headers.get("Idempotency-Key"),
+            data.model_dump(mode="json", exclude={"action": {"timestamp"}}),
+            command,
+        )
 
     return router

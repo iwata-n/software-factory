@@ -104,7 +104,7 @@ export function renderAttention(messages, drafts, onAction) {
       }
       case "Button": {
         const event = item.action?.event;
-        if (event?.name !== "draft_answers" || item.id !== event.name) {
+        if (!["continue_interview", "adopt_specification", "refine_specification"].includes(event?.name) || item.id !== event.name) {
           throw new Error("A2UI_ACTION_INVALID");
         }
         const button = document.createElement("button");
@@ -112,8 +112,10 @@ export function renderAttention(messages, drafts, onAction) {
         button.classList.toggle("primary", item.variant === "primary");
         button.textContent = resolve(components.get(item.child)?.text);
         button.addEventListener("click", async () => {
-          for (const input of form.querySelectorAll("textarea:required")) {
-            if (!input.reportValidity()) return;
+          if (Object.hasOwn(event.context, "answers")) {
+            for (const input of form.querySelectorAll("textarea:required")) {
+              if (!input.reportValidity()) return;
+            }
           }
           const context = Object.fromEntries(
             Object.entries(event.context).map(([name, value]) => [name, resolve(value)]),
