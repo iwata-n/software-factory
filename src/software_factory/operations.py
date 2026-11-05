@@ -207,6 +207,7 @@ def operations_router(service, token_type):
         response: Response,
         before: str | None = Query(default=None, max_length=36),
         limit: int = Query(default=50, ge=1, le=100),
+        latest_per_task: bool = False,
     ):
         def query(session, actor):
             statement = (
@@ -221,6 +222,16 @@ def operations_router(service, token_type):
                 .join(Task, (Task.id == Run.task_id) & (Task.workspace_id == Run.workspace_id))
                 .where(Run.workspace_id == actor.workspace_id)
             )
+            if latest_per_task:
+                # Choose the latest Run before applying the page cursor, so older Runs
+                # for an already listed task cannot reappear on a later page.
+                latest_ids = (
+                    select(Run.id)
+                    .where(Run.workspace_id == actor.workspace_id)
+                    .distinct(Run.task_id)
+                    .order_by(Run.task_id, Run.created_at.desc(), Run.id.desc())
+                )
+                statement = statement.where(Run.id.in_(latest_ids))
             if before is not None:
                 anchor = owned(session, Run, before, actor.workspace_id)
                 statement = statement.where(

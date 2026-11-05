@@ -4,8 +4,8 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Run カンバン | Software Factory</title>
-  <link rel="stylesheet" href="/operations/board.css?v=compact-board">
-  <script type="module" src="/operations/board.js?v=execution-menu-layout"></script>
+  <link rel="stylesheet" href="/operations/board.css?v=latest-task-runs">
+  <script type="module" src="/operations/board.js?v=latest-task-runs"></script>
 </head>
 <body>
   <header class="masthead">
@@ -53,6 +53,7 @@
               <div id="worker-list" role="region" aria-label="Worker 一覧" tabindex="0" hidden></div>
             </details>
           </section>
+          <button id="run-history-toggle" type="button" aria-pressed="false">過去の Run も表示</button>
           <button id="integration-open" type="button" hidden>連携設定</button>
           <button id="accounts-open" type="button" hidden>アカウント管理</button>
           <button id="disconnect" type="button">切断</button>
@@ -91,7 +92,7 @@
     </div>
     <div id="board" class="board" role="region" tabindex="0"
       aria-label="Run の状態別カンバン。横にスクロールしてレーンを表示" hidden></div>
-    <button id="older" hidden>過去の Run を追加表示</button>
+    <button id="older" hidden>さらに表示</button>
   </main>
   <dialog id="accounts-dialog" aria-labelledby="accounts-title">
     <header class="detail-header">

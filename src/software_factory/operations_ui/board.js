@@ -28,7 +28,7 @@ function authHeaders() {
   return token ? {Authorization: `Bearer ${token}`} : {};
 }
 let runs = [];
-let nextBefore = null;
+let showRunHistory = false;
 let visibleRunLimit = RUN_PAGE_SIZE;
 let boardTimer;
 let boardRequest;
@@ -94,7 +94,8 @@ function disconnect(text = "接続を終了しました。", error = false) {
   get("account-name").hidden = true;
   get("accounts-open").hidden = true;
   runs = [];
-  nextBefore = null;
+  showRunHistory = false;
+  get("run-history-toggle").setAttribute("aria-pressed", "false");
   visibleRunLimit = RUN_PAGE_SIZE;
   selected = null;
   detail.close();
@@ -302,10 +303,13 @@ async function loadWorkers(workspaceId, signal) {
   }
 }
 
-async function readRuns(limit, signal, before = null) {
+async function readRuns(limit, signal) {
+  const latestPerTask = !showRunHistory;
+  let before = null;
   const items = [];
   do {
     const query = new URLSearchParams({limit: String(Math.min(100, limit - items.length))});
+    if (latestPerTask) query.set("latest_per_task", "true");
     if (before) query.set("before", before);
     const page = await read(`/v1/runs?${query}`, signal);
     items.push(...page.runs);
@@ -339,25 +343,24 @@ async function loadBoard({older = false, quiet = false} = {}) {
   connectButton.disabled = true;
   if (!quiet) message("status", "Run 一覧を取得中…");
   try {
+    const limit = visibleRunLimit + (older ? RUN_PAGE_SIZE : 0);
     const [page, context] = await Promise.all([
-      older ? readRuns(RUN_PAGE_SIZE, signal, nextBefore)
-        : readRuns(visibleRunLimit, signal),
+      readRuns(limit, signal),
       read("/v1/operations/context", signal),
     ]);
     if (signal.aborted) return;
     renderExecution(context);
-    const updated = older ? [...runs, ...page.runs] : page.runs;
-    if (initial || JSON.stringify(updated) !== JSON.stringify(runs)) {
-      runs = updated;
+    if (initial || JSON.stringify(page.runs) !== JSON.stringify(runs)) {
+      runs = page.runs;
       renderBoard();
     }
-    if (older) visibleRunLimit += RUN_PAGE_SIZE;
-    nextBefore = page.next_before;
+    visibleRunLimit = limit;
     get("token-login").hidden = get("login").hidden = true;
     get("board").hidden = get("board-navigation").hidden = get("toolbar").hidden = false;
     updateBoardNavigation();
-    olderButton.hidden = !nextBefore;
-    const status = runs.length ? `${runs.length} 件を表示中` : "この Workspace に Run はありません。";
+    olderButton.hidden = !page.next_before;
+    const kind = showRunHistory ? "Run" : "タスク";
+    const status = runs.length ? `${kind} ${runs.length} 件を表示中` : "この Workspace に Run はありません。";
     if (get("status").textContent !== status || get("status").classList.contains("error")) {
       message("status", status);
     }
@@ -683,7 +686,7 @@ function specCorrection(run, task, status, signal) {
     if (!signal.aborted) {
       selected = {...selected, run_id: result.run_id};
       void loadBoard();
-      void loadDetail(`仕様 v${saved.spec_version} で新しい Run を開始しました。`);
+      void loadDetail(`更新した仕様 v${saved.spec_version} で再実行を登録しました。`);
     }
   });
   form.prepend(
@@ -1057,6 +1060,12 @@ toolbar.addEventListener("keydown", (event) => {
 });
 document.addEventListener("click", (event) => {
   if (toolbar.open && !toolbar.contains(event.target)) toolbar.open = false;
+});
+get("run-history-toggle").addEventListener("click", (event) => {
+  showRunHistory = !showRunHistory;
+  event.currentTarget.setAttribute("aria-pressed", String(showRunHistory));
+  visibleRunLimit = RUN_PAGE_SIZE;
+  void loadBoard();
 });
 get("older").addEventListener("click", () => loadBoard({older: true}));
 document.addEventListener("visibilitychange", () => {

@@ -109,6 +109,7 @@ button[type="submit"]:hover, button.primary:hover { background: var(--accent-hov
   box-shadow: var(--shadow);
 }
 .masthead-menu-panel > button, #execution-action { border-color: transparent; text-align: start; }
+#run-history-toggle[aria-pressed="true"] { background: #eef0fc; color: var(--accent-hover); }
 #account-name { margin: 0 0 4px; padding: 4px 10px 8px; color: var(--muted); border-bottom: 1px solid var(--line); overflow-wrap: anywhere; }
 
 .execution {

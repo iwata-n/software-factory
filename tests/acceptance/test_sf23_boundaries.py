@@ -81,6 +81,48 @@ def test_run_index_paginates_timestamp_ties_and_matches_run_details(world):
     assert {card["status"] for card in cards} == {"QUEUED", "RUNNING"}
 
 
+def test_latest_runs_show_one_card_per_task_across_pages_and_keep_history(world):
+    task_path = f"/v1/tasks/{world.task_id}"
+    spec = example_spec(world.repository_id)
+    spec["task"]["objective"] += " with the operator's answer"
+    assert (
+        world.post(f"{task_path}/spec-versions", spec).raise_for_status().json()["spec_version"]
+        == 2
+    )
+    latest = (
+        world.post(f"{task_path}/runs", {"spec_version": 2}).raise_for_status().json()["run_id"]
+    )
+    # A different task can have the same title and still needs its own card.
+    other = (
+        world.post(f"/v1/projects/{world.project_id}/tasks", example_spec(world.repository_id))
+        .raise_for_status()
+        .json()["task_id"]
+    )
+    other_run = (
+        world.post(f"/v1/tasks/{other}/runs", {"spec_version": 1})
+        .raise_for_status()
+        .json()["run_id"]
+    )
+
+    with world.database.transaction() as session:
+        session.get(Run, latest).created_at = 30
+        session.get(Run, world.run_id).created_at = 20
+        session.get(Run, other_run).created_at = 10
+
+    first = world.get("/v1/runs?latest_per_task=true&limit=1").raise_for_status().json()
+    assert [run["run_id"] for run in first["runs"]] == [latest]
+    assert first["next_before"] == latest
+    second = (
+        world.get(f"/v1/runs?latest_per_task=true&limit=1&before={latest}")
+        .raise_for_status()
+        .json()
+    )
+    assert [run["run_id"] for run in second["runs"]] == [other_run]
+    assert second["next_before"] is None
+    history = world.get("/v1/runs").raise_for_status().json()
+    assert [run["run_id"] for run in history["runs"]] == [latest, world.run_id, other_run]
+
+
 @pytest.mark.ac("SF-23-AC03")
 def test_event_stream_resumes_from_last_run_revision_after_restart(world, evidence):
     history = f"/v1/runs/{world.run_id}/event-history"
