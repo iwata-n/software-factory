@@ -194,12 +194,9 @@ button[type="submit"]:hover, button.primary:hover { background: var(--accent-hov
   --lane-dot: #77879b;
 }
 .lane[data-status="RUNNING"] { --lane-dot: #4449c5; }
-.lane[data-status="WAITING_EXTERNAL"] { --lane-dot: #8150b4; }
+.lane[data-status="CLARIFYING"] { --lane-dot: #8150b4; }
 .lane[data-status="BLOCKED"] { --lane-dot: #bd4a40; }
-.lane[data-status="CANCELLING"] { --lane-dot: #2278b7; }
-.lane[data-status="SUCCEEDED"] { --lane-dot: #16804a; }
-.lane[data-status="FAILED"] { --lane-dot: #b3382d; }
-.lane[data-status="CANCELLED"] { --lane-dot: #687385; }
+.lane[data-status="DONE"] { --lane-dot: #16804a; }
 .lane h2 { display: flex; align-items: center; gap: 8px; min-height: 25px; padding-inline: 3px; font-size: 1.125rem; }
 .lane h2::before { content: ""; width: 14px; height: 14px; flex: 0 0 14px; border-radius: 50%; background: var(--lane-dot); }
 .lane-count { margin-inline-start: 2px; color: var(--muted); font-size: .875rem; font-variant-numeric: tabular-nums; }
@@ -316,6 +313,14 @@ dialog::backdrop { background: rgb(23 32 51 / 48%); }
 }
 .attention-alert h3 { margin: 0; padding: 3px 8px; color: #805000; background: #ffe7b8; border-radius: 6px; white-space: nowrap; }
 .attention-alert p { margin: 0; }
+.attention-section[data-state="CLARIFYING"] .attention-alert {
+  background: #f4f0fa;
+  border-color: #d7c9ec;
+}
+.attention-section[data-state="CLARIFYING"] .attention-alert h3 {
+  background: #e9def7;
+  color: #654187;
+}
 dl { display: grid; grid-template-columns: minmax(80px, 1fr) minmax(0, 3fr); gap: 4px 8px; margin: 0; }
 dt { color: var(--muted); }
 dd { margin: 0; }

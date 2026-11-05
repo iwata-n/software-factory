@@ -3,14 +3,43 @@ import { renderAttention } from "./a2ui.js?v=spec-interview";
 const get = (id) => document.getElementById(id);
 const lanes = new Map([
   ["QUEUED", "実行待ち"],
+  ["CLARIFYING", "詳細化中"],
   ["RUNNING", "実行中"],
-  ["WAITING_EXTERNAL", "外部待ち"],
   ["BLOCKED", "要対応"],
-  ["CANCELLING", "取消処理中"],
+  ["DONE", "完了"],
+]);
+const resultLabels = new Map([
   ["SUCCEEDED", "成功"],
   ["FAILED", "失敗"],
   ["CANCELLED", "取消済み"],
+  ["CANCELLING", "取消処理中"],
 ]);
+const phaseLabels = new Map([
+  ["PLAN", "仕様の詳細化"],
+  ["WAIT_PLAN_APPROVAL", "計画の承認待ち"],
+  ["IMPLEMENT", "実装"],
+  ["ASSEMBLE_CANDIDATE", "候補の作成"],
+  ["VERIFY_REVIEW", "検証・レビュー"],
+  ["REPAIR", "修正"],
+  ["PUBLISH_DRAFT", "Draft PR の作成"],
+  ["PUBLISH_UNKNOWN", "公開結果の確認"],
+  ["WAIT_CI", "CI 待ち"],
+]);
+
+function boardStatus(run) {
+  if (["SUCCEEDED", "CANCELLED"].includes(run.status)) return "DONE";
+  if (run.status === "BLOCKED") {
+    return ["PLAN_HAS_OPEN_QUESTIONS", "SPEC_CHANGE_REQUIRED"].includes(run.stop_reason)
+      ? "CLARIFYING" : "BLOCKED";
+  }
+  if (run.status === "FAILED") return "BLOCKED";
+  if (run.status === "QUEUED") return "QUEUED";
+  if (["RUNNING", "WAITING_EXTERNAL"].includes(run.status)) {
+    return ["PLAN", "WAIT_PLAN_APPROVAL"].includes(run.phase) ? "CLARIFYING" : "RUNNING";
+  }
+  return run.status === "CANCELLING" ? "RUNNING" : "BLOCKED";
+}
+
 const detail = get("detail");
 const detailResize = get("detail-resize");
 const detailWidthKey = "factory.runDetailWidth";
@@ -116,10 +145,7 @@ function renderBoard() {
     .map((list) => [list.closest(".lane").dataset.status, list.scrollTop]));
   const focusedRun = document.activeElement?.dataset.runId;
   const grouped = new Map([...lanes.keys()].map((status) => [status, []]));
-  for (const run of runs) {
-    if (!grouped.has(run.status)) grouped.set(run.status, []);
-    grouped.get(run.status).push(run);
-  }
+  for (const run of runs) grouped.get(boardStatus(run)).push(run);
   const sections = [];
   for (const [status, items] of grouped) {
     const section = element("section", undefined, "lane");
@@ -140,7 +166,7 @@ function renderBoard() {
         card.setAttribute("aria-haspopup", "dialog");
         card.append(
           element("span", run.task_title),
-          element("small", `${run.status} / ${run.phase}`),
+          element("small", `${lanes.get(status)} · ${resultLabels.get(run.status) ?? phaseLabels.get(run.phase) ?? run.phase}`),
           element("small", `Rev. ${run.state_revision} · ${run.run_id.slice(0, 8)}`),
         );
         if (run.stop_reason) card.append(element("small", run.stop_reason, "reason"));
@@ -844,8 +870,9 @@ async function blockedRunView(root, run, signal) {
   const status = element("p");
   status.setAttribute("role", "status");
   const panel = element("section", undefined, "detail-section attention-section");
+  panel.dataset.state = boardStatus(run);
   const alert = element("div", undefined, "attention-alert");
-  alert.append(element("h3", "要対応"),
+  alert.append(element("h3", lanes.get(boardStatus(run))),
     element("p", blockedGuidance[run.stop_reason] ?? "停止理由を確認し、必要な修正を行ってください。"));
   panel.append(alert);
   const questions = plans.value?.plans.at(-1)?.body?.open_questions;
@@ -1042,7 +1069,9 @@ async function loadDetail(notice = "") {
     const context = run.wait_context;
     const content = [
       section("Run", fields([
-        ["Run ID", run.run_id], ["状態", run.status], ["段階", run.phase],
+        ["Run ID", run.run_id], ["状態", lanes.get(boardStatus(run))],
+        ["段階", phaseLabels.get(run.phase) ?? run.phase],
+        ...(resultLabels.has(run.status) ? [["結果", resultLabels.get(run.status)]] : []),
         ["Revision", run.state_revision], ["停止理由", run.stop_reason],
         ...(run.evidence_expired_at == null ? [] : [["証拠の保持期限", "回収済み"]]),
         ["待機種別", context?.kind], ["要対応理由", context?.cause],
