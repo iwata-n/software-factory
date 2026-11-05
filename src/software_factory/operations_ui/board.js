@@ -1143,6 +1143,28 @@ window.addEventListener("resize", () => {
   if (detail.open) syncDetailResize();
 });
 
+// Older browsers ignore closedby. Require the click to begin and end on the backdrop.
+if (detail.closedBy !== "any") {
+  let startedOnBackdrop = false;
+
+  function hitsDetailBackdrop(event) {
+    if (event.target !== detail) return false;
+    const {left, right, top, bottom} = detail.getBoundingClientRect();
+    return event.clientX < left || event.clientX >= right ||
+      event.clientY < top || event.clientY >= bottom;
+  }
+
+  detail.addEventListener("pointerdown", (event) => {
+    if (event.isPrimary) startedOnBackdrop = event.button === 0 && hitsDetailBackdrop(event);
+  });
+  detail.addEventListener("pointercancel", () => { startedOnBackdrop = false; });
+  detail.addEventListener("click", (event) => {
+    const dismiss = startedOnBackdrop && event.detail > 0 && hitsDetailBackdrop(event);
+    startedOnBackdrop = false;
+    if (dismiss) detail.close();
+  });
+}
+
 get("reload-detail").addEventListener("click", () => loadDetail());
 detail.addEventListener("close", () => {
   if (detail.open) return;
