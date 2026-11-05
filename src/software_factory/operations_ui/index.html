@@ -147,15 +147,20 @@
     <div id="integration-providers"></div>
   </dialog>
   <dialog id="detail" aria-labelledby="detail-title">
+    <div id="detail-resize" class="detail-resize" role="separator" tabindex="0"
+      aria-orientation="vertical" aria-label="Run 詳細の幅" aria-controls="detail"
+      title="ドラッグまたは左右の矢印キーで幅を調整"></div>
     <header class="detail-header">
       <h2 id="detail-title">Run 詳細</h2>
       <div class="dialog-actions">
-        <form method="dialog"><button>閉じる</button></form>
+        <form method="dialog"><button autofocus>閉じる</button></form>
         <button id="reload-detail" type="button">詳細を更新</button>
       </div>
     </header>
-    <p id="detail-status" role="status"></p>
-    <div id="detail-content"></div>
+    <div id="detail-body" class="detail-body">
+      <p id="detail-status" role="status"></p>
+      <div id="detail-content"></div>
+    </div>
   </dialog>
 </body>
 </html>

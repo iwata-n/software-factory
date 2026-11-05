@@ -12,6 +12,8 @@ const lanes = new Map([
   ["CANCELLED", "取消済み"],
 ]);
 const detail = get("detail");
+const detailResize = get("detail-resize");
+const detailWidthKey = "factory.runDetailWidth";
 const toolbar = get("toolbar");
 const menuToggle = toolbar.querySelector("summary");
 const BOARD_REFRESH_MS = 5000;
@@ -133,6 +135,7 @@ function renderBoard() {
         const item = element("li");
         const card = element("button", undefined, "card");
         card.dataset.runId = run.run_id;
+        card.setAttribute("aria-haspopup", "dialog");
         card.append(
           element("span", run.task_title),
           element("small", `${run.status} / ${run.phase}`),
@@ -142,6 +145,8 @@ function renderBoard() {
         card.addEventListener("click", () => {
           selected = run;
           detail.showModal();
+          syncDetailResize();
+          get("detail-body").scrollTop = 0;
           loadDetail();
         });
         item.append(card);
@@ -1066,6 +1071,78 @@ get("disconnect").addEventListener("click", async () => {
     button.disabled = false;
   }
 });
+function detailWidthLimits() {
+  const max = document.documentElement.clientWidth;
+  const minWidth = Number.parseInt(getComputedStyle(detail).getPropertyValue("--detail-min-width"), 10);
+  return {min: Math.min(minWidth, max), max};
+}
+
+function syncDetailResize() {
+  const {min, max} = detailWidthLimits();
+  detailResize.hidden = min === max;
+  detailResize.setAttribute("aria-valuemin", min);
+  detailResize.setAttribute("aria-valuemax", max);
+  detailResize.setAttribute("aria-valuenow", detail.offsetWidth);
+  detailResize.setAttribute("aria-valuetext", `${detail.offsetWidth} ピクセル`);
+}
+
+function setDetailWidth(requested) {
+  const {min, max} = detailWidthLimits();
+  detail.style.setProperty("--detail-width", `${Math.max(min, Math.min(max, requested))}px`);
+  syncDetailResize();
+}
+
+function saveDetailWidth() {
+  try {
+    localStorage.setItem(detailWidthKey, String(detail.offsetWidth));
+  } catch {
+    // Resizing remains available when storage is disabled.
+  }
+}
+
+try {
+  const savedWidth = Number(localStorage.getItem(detailWidthKey));
+  if (Number.isFinite(savedWidth) && savedWidth > 0) {
+    detail.style.setProperty("--detail-width", `${savedWidth}px`);
+  }
+} catch {
+  // Use the responsive default when storage is disabled.
+}
+
+let detailDrag;
+detailResize.addEventListener("pointerdown", (event) => {
+  if (!event.isPrimary || event.button !== 0) return;
+  detailDrag = {pointer: event.pointerId, x: event.clientX, width: detail.offsetWidth};
+  detailResize.setPointerCapture(event.pointerId);
+  detailResize.focus({preventScroll: true});
+  event.preventDefault();
+});
+detailResize.addEventListener("pointermove", (event) => {
+  if (detailDrag?.pointer !== event.pointerId) return;
+  setDetailWidth(detailDrag.width + detailDrag.x - event.clientX);
+});
+detailResize.addEventListener("lostpointercapture", (event) => {
+  if (detailDrag?.pointer !== event.pointerId) return;
+  if (detail.open && detail.offsetWidth !== detailDrag.width) saveDetailWidth();
+  detailDrag = undefined;
+});
+detailResize.addEventListener("keydown", (event) => {
+  const {min, max} = detailWidthLimits();
+  const widths = {
+    ArrowLeft: detail.offsetWidth + 24,
+    ArrowRight: detail.offsetWidth - 24,
+    Home: min,
+    End: max,
+  };
+  if (!Object.hasOwn(widths, event.key)) return;
+  event.preventDefault();
+  setDetailWidth(widths[event.key]);
+  saveDetailWidth();
+});
+window.addEventListener("resize", () => {
+  if (detail.open) syncDetailResize();
+});
+
 get("reload-detail").addEventListener("click", () => loadDetail());
 detail.addEventListener("close", () => {
   if (detail.open) return;
