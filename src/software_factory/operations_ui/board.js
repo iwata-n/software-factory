@@ -225,6 +225,7 @@ function renderExecution(context) {
   get("integration-open").hidden = access !== "ADMIN";
   get("accounts-open").hidden = access !== "ADMIN" || !secureAccounts;
   get("disconnect").textContent = account ? "ログアウト" : "切断";
+  get("disconnect").hidden = account?.authentication === "lan";
   get("account-name").hidden = !account;
   get("account-name").textContent = account?.username ?? "";
   get("execution-action").textContent = execution.stopped ? "緊急停止を解除" : "緊急停止";

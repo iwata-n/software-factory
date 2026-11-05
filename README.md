@@ -66,6 +66,30 @@ uv run python scripts/create_demo.py --workspace-id '<bootstrapのworkspace_id>'
 アカウントを管理するブラウザは HTTPS または同じ端末のループバックから接続してください。
 CLI・Workerの認証は従来のトークンを使います。
 
+信頼するLANからログイン操作を省く場合は、Control Plane に
+`FACTORY_LAN_ACCESS_FILE=/absolute/path/lan-access.json` を設定して再起動します。
+設定ファイルはサーバー実行ユーザーだけが読める `0600` にし、次の項目を設定します。
+
+```json
+{
+  "origin": "https://192.168.1.34:18770",
+  "networks": ["192.168.1.0/24"],
+  "proxy_secret": "<32文字以上のランダムなプロキシ専用秘密値>",
+  "user_token": "<共有ユーザーのUserトークン>"
+}
+```
+
+共有ユーザーは `factory issue-user --workspace-id <id> --access OPERATOR` で発行します。
+LAN内の操作はこのユーザーの権限とWorkspaceに限定され、監査記録も同じユーザーに紐付きます。
+画面では「LAN 共有」と表示し、ID・パスワード入力やログアウト操作を省きます。
+設定を省いた起動では通常のログインを使います。
+
+HTTPSリバースプロキシは指定LANだけを許可し、受信した `X-Factory-LAN-Key` を
+`proxy_secret` で上書きします。`X-Forwarded-For` も実際の接続元アドレスで上書きし、
+`X-Forwarded-Proto` は `https` に設定します。Control Plane はループバックで起動し、
+プロキシの接続だけを信頼します。設定ファイルとプロキシ設定に含まれる秘密値は
+ブラウザーへ配信しません。自動接続の書き込みにも同一Originが必要です。
+
 ## Software Factory 自身の改善を試す
 
 `scripts/serve_self_host.py` は一時 PostgreSQL に Software Factory 専用 Workspace を作り、

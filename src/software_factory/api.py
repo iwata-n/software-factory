@@ -47,6 +47,7 @@ from .contracts import (
 from .db import Database
 from .integration_settings import Vault, integration_router, oauth_origin
 from .jira_input import configured_jira, jira_router
+from .lan_access import LANAccess
 from .models import (
     ApprovalRequest,
     Artifact,
@@ -89,8 +90,12 @@ def bearer(
             WEB_SESSION_PREFIX
         ):
             return credentials.credentials
-    elif not request.headers.get("Authorization") and (token := browser_token(request)):
-        return token
+    elif not request.headers.get("Authorization"):
+        lan = request.app.state.lan_access
+        if lan and (token := lan.token_for(request)):
+            return token
+        if token := browser_token(request):
+            return token
     raise DomainError(401, "UNAUTHENTICATED")
 
 
@@ -189,6 +194,7 @@ def create_app(
         ),
     )
     app.state.service = service
+    app.state.lan_access = LANAccess.configured()
     app.include_router(webhook_router(service, integrations, vault if vault.cipher else None))
     if jira := configured_jira():
         app.include_router(jira_router(service, *jira))

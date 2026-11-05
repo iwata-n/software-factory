@@ -196,8 +196,20 @@ def web_accounts_router(service, token_type):
 
     @router.get("/session")
     def current_session(request: Request, response: Response):
-        token = browser_token(request)
         response.headers["Cache-Control"] = "no-store"
+        lan = request.app.state.lan_access
+        if lan and (token := lan.token_for(request)):
+            return service.read(
+                token,
+                lambda session, actor: {
+                    "id": actor.id,
+                    "username": "LAN 共有",
+                    "access": actor.user_access,
+                    "active": actor.active,
+                    "authentication": "lan",
+                },
+            )
+        token = browser_token(request)
         if token is not None:
             try:
                 return service.read(
