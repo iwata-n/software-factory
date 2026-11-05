@@ -4,8 +4,8 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Run カンバン | Software Factory</title>
-  <link rel="stylesheet" href="/operations/board.css">
-  <script type="module" src="/operations/board.js"></script>
+  <link rel="stylesheet" href="/operations/board.css?v=execution-menu-layout">
+  <script type="module" src="/operations/board.js?v=execution-menu-layout"></script>
 </head>
 <body>
   <header class="masthead">
@@ -28,6 +28,31 @@
         </summary>
         <div class="masthead-menu-panel">
           <p id="account-name" hidden></p>
+          <section id="execution" class="execution" aria-labelledby="execution-title" hidden>
+            <div class="execution-status">
+              <h2 id="execution-title">実行状態</h2>
+              <span id="execution-state" class="execution-badge" role="status"></span>
+              <small id="execution-revision"></small>
+            </div>
+            <button id="execution-action" type="button" aria-controls="execution-form" aria-expanded="false" hidden></button>
+            <form id="execution-form" hidden>
+              <label for="execution-reason">操作の理由</label>
+              <input id="execution-reason" maxlength="2000" required>
+              <div class="controls">
+                <button id="execution-submit" type="submit"></button>
+                <button id="execution-dismiss" type="button">キャンセル</button>
+              </div>
+            </form>
+            <p id="execution-message" role="status" hidden></p>
+            <details id="worker-panel" class="worker-panel" hidden>
+              <summary class="icon-label">
+                <span>Worker の状態</span>
+                <svg viewBox="0 0 20 20" fill="none" aria-hidden="true"><path d="m5 8 5 5 5-5"></path></svg>
+              </summary>
+              <p id="worker-status" role="status"></p>
+              <div id="worker-list" role="region" aria-label="Worker 一覧" tabindex="0" hidden></div>
+            </details>
+          </section>
           <button id="integration-open" type="button" hidden>連携設定</button>
           <button id="accounts-open" type="button" hidden>アカウント管理</button>
           <button id="disconnect" type="button">切断</button>
@@ -54,32 +79,6 @@
       </div>
       </form>
     </details>
-    <section id="execution" class="execution" aria-labelledby="execution-title" hidden>
-      <div class="execution-strip">
-        <h2 id="execution-title">Workspace の実行状態</h2>
-        <p id="execution-state" role="status"></p>
-        <details id="worker-panel" class="worker-panel" hidden>
-          <summary class="icon-label">
-            <span>Worker の状態</span>
-            <svg viewBox="0 0 20 20" fill="none" aria-hidden="true"><path d="m5 8 5 5 5-5"></path></svg>
-          </summary>
-          <div class="worker-popover">
-            <p id="worker-status" role="status"></p>
-            <div id="worker-list"></div>
-          </div>
-        </details>
-        <button id="execution-action" type="button" hidden></button>
-      </div>
-      <form id="execution-form" hidden>
-        <label for="execution-reason">操作の理由</label>
-        <div class="controls">
-          <input id="execution-reason" maxlength="2000" required>
-          <button id="execution-submit" type="submit"></button>
-          <button id="execution-dismiss" type="button">閉じる</button>
-        </div>
-      </form>
-      <p id="execution-message" role="status" hidden></p>
-    </section>
     <div class="board-toolbar">
       <p id="status" role="status">ログインすると Run を表示します。</p>
       <div id="board-navigation" class="board-navigation" hidden>

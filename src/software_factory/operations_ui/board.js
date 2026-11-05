@@ -86,6 +86,7 @@ function disconnect(text = "接続を終了しました。", error = false) {
   get("worker-panel").hidden = true;
   get("worker-panel").open = false;
   get("worker-list").replaceChildren();
+  get("worker-list").hidden = true;
   executionMessage("");
   token = "";
   account = undefined;
@@ -174,6 +175,7 @@ function executionMessage(text, error = false) {
 function closeExecutionForm() {
   pendingExecution = undefined;
   get("execution-form").hidden = true;
+  get("execution-action").setAttribute("aria-expanded", "false");
   get("execution-reason").value = "";
 }
 
@@ -186,9 +188,9 @@ function renderExecution(context) {
   const panel = get("execution");
   panel.dataset.stopped = String(execution.stopped);
   panel.hidden = false;
-  get("execution-state").textContent = execution.stopped
-    ? `緊急停止中 · Rev. ${execution.revision}`
-    : `実行を許可 · Rev. ${execution.revision}`;
+  const state = execution.stopped ? "緊急停止中" : "実行許可";
+  if (get("execution-state").textContent !== state) message("execution-state", state);
+  get("execution-revision").textContent = `Rev. ${execution.revision}`;
   get("execution-action").hidden = access !== "ADMIN";
   get("task-open").hidden = !["ADMIN", "OPERATOR"].includes(access);
   get("integration-open").hidden = access !== "ADMIN";
@@ -210,6 +212,7 @@ function openExecutionForm() {
   executionMessage("");
   get("execution-submit").textContent = execution.stopped ? "解除を実行" : "停止を実行";
   get("execution-form").hidden = false;
+  get("execution-action").setAttribute("aria-expanded", "true");
   get("execution-reason").focus();
 }
 
@@ -292,6 +295,7 @@ async function loadWorkers(workspaceId, signal) {
       ["資格情報", credentialLabels[worker.credential_status] ?? worker.credential_status],
     ])));
     get("worker-list").replaceChildren(...entries);
+    get("worker-list").hidden = entries.length === 0;
     message("worker-status", workers.length ? "" : "登録済みの Worker はありません。");
   } catch {
     if (!signal.aborted) message("worker-status", "Worker の状態を取得できませんでした。", true);
@@ -1039,7 +1043,7 @@ get("connect").addEventListener("submit", (event) => {
   if (token) loadBoard();
 });
 toolbar.addEventListener("click", (event) => {
-  if (event.target.closest("button")) {
+  if (event.target.closest(".masthead-menu-panel > button")) {
     toolbar.open = false;
     menuToggle.focus();
   }
@@ -1173,7 +1177,10 @@ detail.addEventListener("close", () => {
 });
 
 get("execution-action").addEventListener("click", openExecutionForm);
-get("execution-dismiss").addEventListener("click", closeExecutionForm);
+get("execution-dismiss").addEventListener("click", () => {
+  closeExecutionForm();
+  get("execution-action").focus();
+});
 get("execution-form").addEventListener("submit", submitExecution);
 
 const accountsDialog = get("accounts-dialog");
