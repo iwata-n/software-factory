@@ -17,8 +17,7 @@
 * { box-sizing: border-box; }
 [hidden] { display: none !important; }
 body { margin: 0; }
-main { padding: 28px var(--gutter) 40px; }
-h1 { margin: 0 0 24px; font-size: clamp(1.9rem, 4vw, 2.875rem); line-height: 1.2; letter-spacing: -.035em; }
+main { padding: 8px var(--gutter) 40px; }
 h2 { margin: 0; font-size: 1.125rem; line-height: 1.35; }
 h3 { margin: 0 0 8px; font-size: 1.0625rem; line-height: 1.4; }
 p { margin: 10px 0; }
@@ -165,7 +164,7 @@ button[type="submit"]:hover, button.primary:hover { background: var(--accent-hov
 #worker-list { max-height: min(36dvh, 14rem); overflow-y: auto; }
 #worker-list .detail-section { padding: 8px 6px; }
 
-.board-toolbar { min-height: 88px; display: flex; justify-content: space-between; align-items: center; gap: 12px; }
+.board-toolbar { min-height: 56px; display: flex; justify-content: space-between; align-items: center; gap: 12px; }
 #status { margin: 0; color: var(--muted); font-weight: 560; }
 .board-navigation { display: flex; gap: 8px; }
 .board-navigation button { display: grid; place-items: center; min-width: 40px; padding: 6px; }
@@ -349,9 +348,7 @@ dd { margin: 0; }
   #task-open, .masthead-menu > summary { min-height: 44px; padding-inline: 8px; font-size: .875rem; }
   .brand { gap: 6px; font-size: .9375rem; }
   .brand-mark { flex-basis: 21px; width: 21px; height: 21px; }
-  main { padding-top: 20px; }
-  h1 { margin-bottom: 18px; }
-  .board-toolbar { min-height: 56px; font-size: .875rem; }
+  .board-toolbar { font-size: .875rem; }
   .board { grid-auto-columns: clamp(10rem, 48vw, 13rem); gap: 8px; }
   .lane { min-height: 20rem; padding: 10px 8px; }
   .lane h2 { gap: 5px; font-size: .875rem; }
