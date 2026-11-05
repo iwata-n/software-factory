@@ -62,6 +62,8 @@ let visibleRunLimit = RUN_PAGE_SIZE;
 let boardTimer;
 let boardRequest;
 let detailRequest;
+let detailTab = "conversation";
+let detailTabRunId;
 let selected;
 let executionContext;
 let executionRequest;
@@ -429,6 +431,92 @@ function section(title, ...children) {
   return node;
 }
 
+function foldSection(node, hint = "", open = false) {
+  const fold = element("details", undefined, "detail-disclosure");
+  fold.open = open;
+  const title = node.querySelector("h3");
+  const summary = element("summary");
+  summary.append(element("span", title.textContent));
+  if (hint) summary.append(element("small", hint));
+  title.remove();
+  fold.append(summary, node);
+  return fold;
+}
+
+function mountDetailTabs(panels) {
+  const tabs = get("detail-tabs");
+  const body = get("detail-body");
+  const offsets = new Map();
+  let active;
+  const buttons = panels.map(({id, label, content}) => {
+    const button = element("button", label);
+    button.type = "button";
+    button.id = `detail-tab-${id}`;
+    button.setAttribute("role", "tab");
+    button.setAttribute("aria-controls", `detail-panel-${id}`);
+    content.id = `detail-panel-${id}`;
+    content.classList.add("detail-panel");
+    content.setAttribute("role", "tabpanel");
+    content.setAttribute("aria-labelledby", button.id);
+    content.tabIndex = 0;
+    button.addEventListener("click", () => activate(id));
+    button.addEventListener("keydown", (event) => {
+      const index = panels.findIndex((panel) => panel.id === id);
+      const next = {ArrowRight: (index + 1) % panels.length,
+        ArrowLeft: (index + panels.length - 1) % panels.length,
+        Home: 0, End: panels.length - 1}[event.key];
+      if (next === undefined) return;
+      event.preventDefault();
+      activate(panels[next].id);
+      buttons[next].focus();
+    });
+    return button;
+  });
+  function activate(id) {
+    if (active) offsets.set(active, body.scrollTop);
+    detailTab = active = id;
+    panels.forEach((panel, index) => {
+      const selected = panel.id === id;
+      panel.content.hidden = !selected;
+      buttons[index].setAttribute("aria-selected", String(selected));
+      buttons[index].tabIndex = selected ? 0 : -1;
+    });
+    body.scrollTop = offsets.get(id) ?? 0;
+  }
+  tabs.replaceChildren(...buttons);
+  get("detail-content").replaceChildren(...panels.map(({content}) => content));
+  tabs.hidden = false;
+  activate(detailTab);
+}
+
+function taskSpecificationView(task, run) {
+  const version = task.spec_versions.find(({version}) => version === run.spec_version);
+  if (!version) return section("実行対象の仕様", element("p", "この実行に使った仕様を取得できませんでした。", "error"));
+  const spec = version.body;
+  const view = element("div");
+  const latest = task.spec_versions.at(-1)?.version;
+  view.append(element("p", `この実行に使った仕様 v${version.version}${latest > version.version ? ` · 最新の保存済み仕様は v${latest}` : ""}`, "detail-note"));
+  view.append(section("目的", element("p", spec.task.objective, "task-chat-message")));
+  const criteria = element("ol", undefined, "spec-criteria");
+  for (const criterion of spec.task.acceptance_criteria) {
+    const item = element("li");
+    item.append(element("small", criterion.id), element("p", criterion.description));
+    criteria.append(item);
+  }
+  view.append(section("受け入れ条件", criteria));
+  if (spec.task.constraints.length) {
+    const constraints = element("ul");
+    constraints.append(...spec.task.constraints.map((text) => element("li", text)));
+    view.append(section("制約", constraints));
+  }
+  view.append(foldSection(section("実行対象・検証設定", fields([
+    ["リポジトリ ID", spec.task.repository_id], ["対象ブランチ", spec.task.base_ref],
+    ["検証プロファイル", spec.verification.profile_id],
+    ["必須チェック", spec.verification.required_checks.join("、")],
+  ]))));
+  return view;
+}
+
 function records(title, items, rows) {
   return section(title, ...(items.length ? items.map((item) => {
     const node = element("div", undefined, "record");
@@ -551,18 +639,29 @@ const detailSections = [
     ["Approval ID", item.approval_id],
   ])],
   ["event-history", "履歴", ({ events }) => {
-    const list = element("div");
+    const list = element("ol", undefined, "event-timeline");
     list.id = "run-event-list";
     list.append(...[...events].reverse().map(eventRecord));
-    return section("履歴", list);
+    return section("実行イベント", list);
   }],
 ];
 
 function eventRecord(event) {
-  const record = element("div", undefined, "record");
-  record.append(fields([
-    ["Revision", event.revision], ["イベント", event.kind], ["時刻", date(event.created_at)],
-  ]));
+  const labels = {
+    RUN_CREATED: "実行を登録", RUN_COMPILED: "実行計画を作成", JOB_CLAIMED: "処理を開始",
+    WORKER_EVENT: "実行状況を更新", ARTIFACT_AVAILABLE: "成果物を保存",
+    USAGE_RECONCILED: "利用量を確定", BLOCKED: "対応待ちに移行",
+    RUN_CANCELLED: "実行を取り消し", CANCELLED: "実行を取り消し",
+    SUCCEEDED: "実行を完了", FAILED: "実行に失敗",
+  };
+  const record = element("li");
+  const heading = element("div", undefined, "event-heading");
+  const title = element("span", labels[event.kind] ?? event.kind);
+  title.title = event.kind;
+  heading.append(title, element("small", `Rev. ${event.revision}`));
+  const timestamp = element("time", date(event.created_at));
+  if (event.created_at != null) timestamp.dateTime = new Date(event.created_at * 1000).toISOString();
+  record.append(heading, timestamp);
   return record;
 }
 
@@ -815,8 +914,10 @@ function mountAttentionSurface(root, run, container, signal) {
       const inputId = content.contains(focused) && focused.dataset.a2uiId;
       const sameQuestion = drafts.surfaceId === state.surface_id;
       const nodes = [];
+      if (state.specification) nodes.push(specificationView(state));
+      if (state.messages.length) nodes.push(renderAttention(state.messages, drafts, handle));
       if (state.history?.length) {
-        const history = element("details");
+        const history = element("details", undefined, "interview-history");
         history.open = content.querySelector("details")?.open ?? false;
         history.append(element("summary", `これまでの回答（${state.history.length}件）`));
         for (const {question, answer} of state.history) {
@@ -824,8 +925,6 @@ function mountAttentionSurface(root, run, container, signal) {
         }
         nodes.push(history);
       }
-      if (state.specification) nodes.push(specificationView(state));
-      if (state.messages.length) nodes.push(renderAttention(state.messages, drafts, handle));
       content.replaceChildren(...nodes);
       if (sameQuestion && inputId) {
         const input = content.querySelector(`[data-a2ui-id="${CSS.escape(inputId)}"]`);
@@ -859,11 +958,10 @@ function mountAttentionSurface(root, run, container, signal) {
   poll();
 }
 
-async function blockedRunView(root, run, signal) {
+async function blockedRunView(root, run, signal, task) {
   const operator = ["ADMIN", "OPERATOR"].includes(executionContext?.access);
-  const [plans, task, targets] = await Promise.allSettled([
+  const [plans, targets] = await Promise.allSettled([
     read(`${root}/plan`, signal),
-    operator ? read(`/v1/tasks/${encodeURIComponent(run.task_id)}`, signal) : null,
     operator ? read("/v1/operations/task-targets", signal) : null,
   ]);
   if (signal.aborted) return null;
@@ -872,7 +970,7 @@ async function blockedRunView(root, run, signal) {
   const panel = element("section", undefined, "detail-section attention-section");
   panel.dataset.state = boardStatus(run);
   const alert = element("div", undefined, "attention-alert");
-  alert.append(element("h3", lanes.get(boardStatus(run))),
+  alert.append(element("h3", "次にすること"),
     element("p", blockedGuidance[run.stop_reason] ?? "停止理由を確認し、必要な修正を行ってください。"));
   panel.append(alert);
   const questions = plans.value?.plans.at(-1)?.body?.open_questions;
@@ -893,7 +991,8 @@ async function blockedRunView(root, run, signal) {
   const project = targets.value?.projects.find(({repositories}) =>
     repositories.some(({id}) => id === repositoryId));
   if (project?.allowed_write_paths?.length) {
-    panel.append(element("p", `プロジェクトで変更できる範囲 · ${project.allowed_write_paths.join("、")}`));
+    panel.append(foldSection(section("変更できる範囲",
+      element("p", project.allowed_write_paths.join("、")))));
   }
   if (!operator) {
     panel.append(element("p", "対応するには操作者または管理者の権限が必要です。"));
@@ -935,7 +1034,7 @@ async function blockedRunView(root, run, signal) {
     }
   });
   cancel.prepend(attentionField("取り消し理由", "reason", "", 2000, 2));
-  const cancelDetails = element("details");
+  const cancelDetails = element("details", undefined, "detail-disclosure cancel-disclosure");
   cancelDetails.append(element("summary", "この Run を取り消す"), cancel);
   panel.append(cancelDetails);
   return panel;
@@ -1039,10 +1138,16 @@ async function loadDetail(notice = "") {
   detailRequest = new AbortController();
   const { signal } = detailRequest;
   const root = `/v1/runs/${encodeURIComponent(selected.run_id)}`;
+  if (detailTabRunId !== selected.run_id) {
+    detailTab = "conversation";
+    detailTabRunId = selected.run_id;
+  }
   get("detail-title").textContent = selected.task_title;
   get("detail-content").replaceChildren();
+  get("detail-summary").replaceChildren();
+  get("detail-tabs").hidden = true;
   get("reload-detail").disabled = true;
-  message("detail-status", "Run 詳細を取得中…");
+  message("detail-status", "タスク詳細を取得中…");
 
   try {
     const [runResult, ...results] = await Promise.allSettled([
@@ -1054,60 +1159,97 @@ async function loadDetail(notice = "") {
     const run = runResult.value;
     const candidateId = run.current_candidate_id;
     const candidatePath = `/v1/candidates/${encodeURIComponent(candidateId)}`;
-    const [candidateResults, verifiedResults] = await Promise.all([
+    const [candidateResults, verifiedResults, [taskResult]] = await Promise.all([
       candidateId ? Promise.allSettled([
         read(candidatePath, signal), read(`${candidatePath}/verification`, signal),
       ]) : [],
       run.status === "SUCCEEDED" ? Promise.allSettled([
         read(`${root}/result`, signal), read(`${root}/result/current-pr`, signal),
       ]) : [],
+      Promise.allSettled([read(`/v1/tasks/${encodeURIComponent(run.task_id)}`, signal)]),
     ]);
     if (signal.aborted) return;
-    const allResults = [...results, ...candidateResults, ...verifiedResults];
+    const allResults = [taskResult, ...results, ...candidateResults, ...verifiedResults];
     const denied = allResults.find(({ reason }) => [401, 403].includes(reason?.status));
     if (denied) throw denied.reason;
     const context = run.wait_context;
-    const content = [
-      section("Run", fields([
-        ["Run ID", run.run_id], ["状態", lanes.get(boardStatus(run))],
-        ["段階", phaseLabels.get(run.phase) ?? run.phase],
-        ...(resultLabels.has(run.status) ? [["結果", resultLabels.get(run.status)]] : []),
-        ["Revision", run.state_revision], ["停止理由", run.stop_reason],
-        ...(run.evidence_expired_at == null ? [] : [["証拠の保持期限", "回収済み"]]),
-        ["待機種別", context?.kind], ["要対応理由", context?.cause],
-      ])),
-      section("費用 (µUSD)", fields([
-        ["消費", run.spent_microusd], ["予約", run.reserved_microusd],
-        ["予算", run.budget_microusd], ["費用状態", run.cost_state],
-      ])),
-      section("現候補", candidateId ? fields([
-        ["Candidate ID", candidateId], ["世代", candidateResults[0].value?.generation],
-        ["Head", candidateResults[0].value?.head_sha],
-      ]) : element("p", "現候補なし")),
-      ...(run.status === "SUCCEEDED" ? [] : [ciView(context)]),
-    ];
+    const badge = element("span", lanes.get(boardStatus(run)), "detail-state");
+    badge.dataset.state = boardStatus(run);
+    get("detail-summary").append(badge,
+      element("span", resultLabels.get(run.status) ?? phaseLabels.get(run.phase) ?? run.phase),
+      element("span", `仕様 v${run.spec_version}`, "detail-spec-version"));
+
+    const conversation = element("div");
     if (run.status === "BLOCKED") {
-      const attention = await blockedRunView(root, run, signal);
+      const attention = await blockedRunView(root, run, signal, taskResult);
       if (signal.aborted) return;
-      if (attention) content.unshift(attention);
+      if (attention) conversation.append(attention);
+    } else {
+      const guidance = {
+        QUEUED: "実行の開始を待っています。",
+        RUNNING: `${phaseLabels.get(run.phase) ?? run.phase}を進めています。`,
+        WAITING_EXTERNAL: "外部処理の結果を待っています。",
+        CANCELLING: "実行の取り消しを処理しています。",
+        CANCELLED: "この実行は取り消されました。仕様と実行履歴を確認できます。",
+        SUCCEEDED: "実行が完了しました。成果物と検証結果は「実行履歴」で確認できます。",
+        FAILED: "実行に失敗しました。「実行履歴」で停止理由と検証結果を確認してください。",
+      }[run.status];
+      if (guidance) conversation.append(element("p", guidance, "detail-guidance"));
     }
+    const chat = taskChat(root, signal);
+    conversation.append(run.status === "BLOCKED" ? foldSection(chat, "質問・相談") : chat);
+
+    const history = element("div");
+    // Keep every diagnostic available, but show the timeline before the technical details.
+    const views = results.map((result, index) => {
+      const [, title, view] = detailSections[index];
+      return result.status === "fulfilled" ? view(result.value)
+        : section(title, element("p", "取得できませんでした。", "error"));
+    });
+    history.append(views.at(-1));
+    history.append(foldSection(views[0], results[0].status === "fulfilled"
+      ? `${results[0].value.jobs.length} ジョブ` : "取得エラー"));
+    const outputs = section("成果物・検証結果");
     if (verifiedResults[0]?.status === "fulfilled") {
-      content.push(verifiedResultView(verifiedResults[0].value, verifiedResults[1].value));
+      outputs.append(verifiedResultView(verifiedResults[0].value, verifiedResults[1].value));
+    } else if (run.status === "SUCCEEDED") {
+      outputs.append(element("p", "検証済みの結果を取得できませんでした。", "error"));
     }
-    if (candidateId) content.push(candidateResults[1].status === "fulfilled"
+    outputs.append(views[1], views[2]);
+    if (run.status !== "SUCCEEDED") outputs.append(ciView(context));
+    if (candidateId) outputs.append(candidateResults[1].status === "fulfilled"
       ? verificationView(candidateResults[1].value)
       : section("Check・Gate", element("p", "取得できませんでした。", "error")));
-    results.forEach((result, index) => {
-      const [, title, view] = detailSections[index];
-      content.push(result.status === "fulfilled" ? view(result.value)
-        : section(title, element("p", "取得できませんでした。", "error")));
-    });
-    content.splice(run.status === "BLOCKED" ? 1 : 0, 0, taskChat(root, signal));
-    get("detail-content").replaceChildren(...content);
+    history.append(foldSection(outputs, "PR・パッチ・チェック", run.status === "SUCCEEDED"));
+    history.append(foldSection(views[3]));
+    const usd = (value) => value == null ? "—" : new Intl.NumberFormat("ja-JP", {
+      style: "currency", currency: "USD", maximumFractionDigits: 6,
+    }).format(value / 1000000);
+    history.append(foldSection(section("費用", fields([
+      ["消費", usd(run.spent_microusd)], ["予約", usd(run.reserved_microusd)],
+      ["予算", usd(run.budget_microusd)], ["費用状態", run.cost_state],
+    ])), `${usd(run.spent_microusd)} / ${usd(run.budget_microusd)} USD`));
+    history.append(foldSection(section("実行の技術情報", fields([
+      ["Run ID", run.run_id], ["状態コード", run.status], ["段階コード", run.phase],
+      ["Revision", run.state_revision], ["停止理由", run.stop_reason],
+      ["終了日時", date(run.finished_at)],
+      ...(run.evidence_expired_at == null ? [] : [["証拠の保持期限", "回収済み"]]),
+      ["待機種別", context?.kind], ["要対応理由", context?.cause],
+    ]), section("現候補", candidateId ? fields([
+      ["Candidate ID", candidateId], ["世代", candidateResults[0].value?.generation],
+      ["Head", candidateResults[0].value?.head_sha],
+    ]) : element("p", "現候補なし")))));
+    const specification = taskResult.status === "fulfilled" ? taskSpecificationView(taskResult.value, run)
+      : section("仕様", element("p", "仕様を取得できませんでした。「詳細を更新」で再試行してください。", "error"));
+    mountDetailTabs([
+      {id: "conversation", label: "対応・会話", content: conversation},
+      {id: "specification", label: "仕様", content: specification},
+      {id: "history", label: "実行履歴", content: history},
+    ]);
     const incomplete = allResults.some(({ status }) => status === "rejected");
     message("detail-status", incomplete ? "一部の詳細を取得できませんでした。" : notice, incomplete);
-    const history = results[detailSections.length - 1].value;
-    if (history) followRunEvents(root, run.run_id, history.events.at(-1)?.revision, signal);
+    const events = results.at(-1).value;
+    if (events) followRunEvents(root, run.run_id, events.events.at(-1)?.revision, signal);
   } catch (error) {
     if (signal.aborted) return;
     if ([401, 403].includes(error.status)) {

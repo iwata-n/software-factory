@@ -4,8 +4,8 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Run カンバン | Software Factory</title>
-  <link rel="stylesheet" href="/operations/board.css?v=five-status-lanes">
-  <script type="module" src="/operations/board.js?v=five-status-lanes"></script>
+  <link rel="stylesheet" href="/operations/board.css?v=organized-task-detail-2">
+  <script type="module" src="/operations/board.js?v=organized-task-detail-2"></script>
 </head>
 <body>
   <header class="masthead">
@@ -147,15 +147,22 @@
   </dialog>
   <dialog id="detail" closedby="any" aria-labelledby="detail-title">
     <div id="detail-resize" class="detail-resize" role="separator" tabindex="0"
-      aria-orientation="vertical" aria-label="Run 詳細の幅" aria-controls="detail"
+      aria-orientation="vertical" aria-label="タスク詳細の幅" aria-controls="detail"
       title="ドラッグまたは左右の矢印キーで幅を調整"></div>
     <header class="detail-header">
-      <h2 id="detail-title">Run 詳細</h2>
-      <div class="dialog-actions">
-        <form method="dialog"><button autofocus>閉じる</button></form>
-        <button id="reload-detail" type="button">詳細を更新</button>
+      <div class="detail-heading">
+        <p class="detail-eyebrow">タスク詳細</p>
+        <h2 id="detail-title">タスク詳細</h2>
       </div>
+      <div class="dialog-actions">
+        <button id="reload-detail" class="detail-icon-button" type="button" aria-label="詳細を更新" title="詳細を更新">
+          <svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M20 7v5h-5M4 17v-5h5M6.1 7a7 7 0 0 1 11.6-1L20 9M4 15l2.3 3A7 7 0 0 0 17.9 17"/></svg>
+        </button>
+        <form method="dialog"><button class="detail-icon-button" aria-label="閉じる" title="閉じる" autofocus><svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="m6 6 12 12M18 6 6 18"/></svg></button></form>
+      </div>
+      <div id="detail-summary" class="detail-summary"></div>
     </header>
+    <div id="detail-tabs" class="detail-tabs" role="tablist" aria-label="タスク詳細の表示" hidden></div>
     <div id="detail-body" class="detail-body">
       <p id="detail-status" role="status"></p>
       <div id="detail-content"></div>
