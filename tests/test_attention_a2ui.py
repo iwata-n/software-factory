@@ -217,11 +217,14 @@ def test_specification_interview_repeats_questions_until_the_operator_adopts(
         == state["specification"]["objective"]
     )
     assert len(task["runs"]) == 1
+    assert task["task_status"] == "READY"
+    assert task["clarified_spec_version"] == 2
     launch = f"/v1/tasks/{world.task_id}/runs"
     start = {"spec_version": 2, "reuse_existing": True}
     run_id = world.post(launch, start).raise_for_status().json()["run_id"]
     assert world.post(launch, start).raise_for_status().json()["run_id"] == run_id
     assert get_state()["resumed_run_id"] == run_id
+    assert world.get(f"/v1/tasks/{world.task_id}").json()["task_status"] == "RUNNING"
 
     assert http.get(f"/v1/runs/{world.run_id}/chat", headers=user).json()["turns"] == []
     with world.database.transaction() as db:

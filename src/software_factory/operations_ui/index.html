@@ -4,8 +4,8 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Run カンバン | Software Factory</title>
-  <link rel="stylesheet" href="/operations/board.css?v=lan-shared-access">
-  <script type="module" src="/operations/board.js?v=lan-shared-access"></script>
+  <link rel="stylesheet" href="/operations/board.css?v=task-lifecycle-stages">
+  <script type="module" src="/operations/board.js?v=task-lifecycle-stages"></script>
 </head>
 <body>
   <header class="masthead">
@@ -121,7 +121,7 @@
       <form method="dialog"><button>閉じる</button></form>
     </header>
     <p id="task-status" role="status"></p>
-    <button id="task-run" type="button" hidden>作成したタスクを実行</button>
+    <button id="task-run" type="button" hidden>AIによる詳細化を開始</button>
     <form id="task-form" hidden>
       <label>プロジェクト<select id="task-project" required></select></label>
       <label>リポジトリ<select id="task-repository" required></select></label>

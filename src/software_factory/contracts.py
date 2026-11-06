@@ -390,6 +390,7 @@ class RepositoryCreate(Contract):
 class RunStart(Contract):
     spec_version: int = Field(ge=1)
     reuse_existing: bool = False
+    clarification_only: bool = False
     strategy: Literal["implement_and_review"] = "implement_and_review"
 
 

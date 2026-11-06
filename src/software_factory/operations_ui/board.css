@@ -425,3 +425,6 @@ dd { margin: 0; }
   .brand-mark { flex-basis: 18px; width: 18px; height: 18px; }
   #task-open, .masthead-menu > summary { padding-inline: 6px; }
 }
+
+.lane[data-status="READY"] h2::before { background: #c49b25; }
+.detail-state[data-state="READY"] { background: #fbf1cf; color: #826010; }

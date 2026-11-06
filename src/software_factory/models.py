@@ -177,6 +177,7 @@ class Task(Tenant, Base):
     repository_id: Mapped[str] = mapped_column(String(36))
     title: Mapped[str] = mapped_column(String(200))
     latest_spec_version: Mapped[int] = mapped_column(Integer, default=1)
+    clarified_spec_version: Mapped[int | None] = mapped_column(Integer, nullable=True)
     retention_touched_at: Mapped[float | None] = mapped_column(Float, nullable=True)
 
 

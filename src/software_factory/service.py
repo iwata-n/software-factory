@@ -127,6 +127,8 @@ def run_view(run: Run) -> dict:
         "wait_context": run.wait_context,
         "current_candidate_id": run.current_candidate_id,
         "cost_state": run.cost_state,
+        "clarification_only": run.snapshot.get("clarification_only", False),
+        "execution_requested": run.snapshot.get("execution_requested", False),
         "budget_version": run.budget_version,
         "available_microusd": run.budget_microusd - run.spent_microusd - run.reserved_microusd,
     }
@@ -578,12 +580,17 @@ class Service:
         self.check_spec(session, actor, task.project_id, spec)
         if spec.task.repository_id != task.repository_id:
             raise DomainError(422, "REPOSITORY_CHANGE_REQUIRES_NEW_TASK")
+        task.clarified_spec_version = None
         return self.add_spec(session, task, spec, task.latest_spec_version + 1)
 
     def start_run_request(self, token: str, task_id: str, data: RunStart, key: str | None) -> dict:
         operation = f"runs:{task_id}"
         # Preserve request hashes for Run starts recorded before this option existed.
-        body = data.model_dump(exclude={"reuse_existing"} if not data.reuse_existing else None)
+        body = data.model_dump(
+            exclude={
+                name for name in ("reuse_existing", "clarification_only") if not getattr(data, name)
+            }
+        )
         with self.db.transaction() as session:
             actor = self.principal(session, token, "USER")
             self.require_user_access(actor, "OPERATOR")
@@ -701,6 +708,9 @@ class Service:
                     Run.task_id == task.id,
                     Run.spec_version == version.version,
                     Run.snapshot["workflow_type"].as_string() == data.strategy,
+                    (Run.snapshot["clarification_only"].as_boolean().is_(True))
+                    if data.clarification_only
+                    else (Run.snapshot["clarification_only"].as_boolean().is_not(True)),
                 )
                 .order_by(Run.created_at.desc(), Run.id.desc())
                 .limit(1)
@@ -731,6 +741,8 @@ class Service:
             "agent_configuration": policy.agent_configuration,
             "execution_image_digest": policy.execution_image_digest,
             "simulation": policy.agent_adapter == "fake",
+            "clarification_only": data.clarification_only,
+            "execution_requested": not data.clarification_only,
         }
         if policy.verification_commands or policy.required_ci_checks:
             snapshot["verification_profile"] = {

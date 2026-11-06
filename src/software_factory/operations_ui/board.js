@@ -2,8 +2,9 @@ import { renderAttention } from "./a2ui.js?v=spec-interview";
 
 const get = (id) => document.getElementById(id);
 const lanes = new Map([
-  ["QUEUED", "実行待ち"],
+  ["DRAFT", "詳細化前"],
   ["CLARIFYING", "詳細化中"],
+  ["READY", "実行待ち"],
   ["RUNNING", "実行中"],
   ["BLOCKED", "要対応"],
   ["DONE", "完了"],
@@ -27,13 +28,17 @@ const phaseLabels = new Map([
 ]);
 
 function boardStatus(run) {
+  if (lanes.has(run.task_status)) return run.task_status;
   if (["SUCCEEDED", "CANCELLED"].includes(run.status)) return "DONE";
   if (run.status === "BLOCKED") {
     return ["PLAN_HAS_OPEN_QUESTIONS", "SPEC_CHANGE_REQUIRED"].includes(run.stop_reason)
       ? "CLARIFYING" : "BLOCKED";
   }
   if (run.status === "FAILED") return "BLOCKED";
-  if (run.status === "QUEUED") return "QUEUED";
+  if (run.phase === "WAIT_PLAN_APPROVAL" && run.status === "WAITING_EXTERNAL") return "READY";
+  if (run.status === "CANCELLING" || run.execution_requested) return "RUNNING";
+  if (run.clarification_only) return "CLARIFYING";
+  if (run.status === "QUEUED") return run.phase === "PLAN" ? "DRAFT" : "RUNNING";
   if (["RUNNING", "WAITING_EXTERNAL"].includes(run.status)) {
     return ["PLAN", "WAIT_PLAN_APPROVAL"].includes(run.phase) ? "CLARIFYING" : "RUNNING";
   }
@@ -164,12 +169,12 @@ function renderBoard() {
       for (const run of items) {
         const item = element("li");
         const card = element("button", undefined, "card");
-        card.dataset.runId = run.run_id;
+        card.dataset.runId = run.run_id ?? run.task_id;
         card.setAttribute("aria-haspopup", "dialog");
         card.append(
           element("span", run.task_title),
-          element("small", `${lanes.get(status)} · ${resultLabels.get(run.status) ?? phaseLabels.get(run.phase) ?? run.phase}`),
-          element("small", `Rev. ${run.state_revision} · ${run.run_id.slice(0, 8)}`),
+          element("small", lanes.get(status) + (resultLabels.has(run.status) ? ` · ${resultLabels.get(run.status)}` : "")),
+          element("small", `仕様 v${run.task_spec_version ?? run.spec_version ?? 1}${run.run_id ? ` · ${run.run_id.slice(0, 8)}` : ""}`),
         );
         if (run.stop_reason) card.append(element("small", run.stop_reason, "reason"));
         card.addEventListener("click", () => {
@@ -333,15 +338,13 @@ async function loadWorkers(workspaceId, signal) {
 }
 
 async function readRuns(limit, signal) {
-  const latestPerTask = !showRunHistory;
   let before = null;
   const items = [];
   do {
     const query = new URLSearchParams({limit: String(Math.min(100, limit - items.length))});
-    if (latestPerTask) query.set("latest_per_task", "true");
     if (before) query.set("before", before);
-    const page = await read(`/v1/runs?${query}`, signal);
-    items.push(...page.runs);
+    const page = await read(`${showRunHistory ? "/v1/runs" : "/v1/operations/tasks"}?${query}`, signal);
+    items.push(...(showRunHistory ? page.runs : page.tasks));
     before = page.next_before;
   } while (before && items.length < limit);
   return {runs: items, next_before: before};
@@ -382,6 +385,13 @@ async function loadBoard({older = false, quiet = false} = {}) {
     if (initial || JSON.stringify(page.runs) !== JSON.stringify(runs)) {
       runs = page.runs;
       renderBoard();
+      const current = !showRunHistory && detail.open && selected?.task_id &&
+        runs.find((item) => item.task_id === selected.task_id);
+      if (current && current.task_status !== selected.task_status &&
+          (!selected.run_id || current.run_id === selected.run_id)) {
+        selected = {...current};
+        void loadDetail();
+      }
     }
     visibleRunLimit = limit;
     get("token-login").hidden = get("login").hidden = true;
@@ -389,7 +399,7 @@ async function loadBoard({older = false, quiet = false} = {}) {
     updateBoardNavigation();
     olderButton.hidden = !page.next_before;
     const kind = showRunHistory ? "Run" : "タスク";
-    const status = runs.length ? `${kind} ${runs.length} 件を表示中` : "この Workspace に Run はありません。";
+    const status = runs.length ? `${kind} ${runs.length} 件を表示中` : "この Workspace にタスクはありません。";
     if (get("status").textContent !== status || get("status").classList.contains("error")) {
       message("status", status);
     }
@@ -496,7 +506,7 @@ function taskSpecificationView(task, run) {
   const spec = version.body;
   const view = element("div");
   const latest = task.spec_versions.at(-1)?.version;
-  view.append(element("p", `この実行に使った仕様 v${version.version}${latest > version.version ? ` · 最新の保存済み仕様は v${latest}` : ""}`, "detail-note"));
+  view.append(element("p", `表示中の仕様 v${version.version}${latest > version.version ? ` · 最新の保存済み仕様は v${latest}` : ""}`, "detail-note"));
   view.append(section("目的", element("p", spec.task.objective, "task-chat-message")));
   const criteria = element("ol", undefined, "spec-criteria");
   for (const criterion of spec.task.acceptance_criteria) {
@@ -808,7 +818,7 @@ function specCorrection(run, task, status, signal) {
       for (const input of form.querySelectorAll("textarea")) input.readOnly = true;
       form.querySelector("button").textContent = `仕様 v${saved.spec_version} で実行`;
     }
-    const result = await postTask(`${root}/runs`, JSON.stringify({spec_version: saved.spec_version}), runKey, signal);
+    const result = await postTask(`${root}/runs`, JSON.stringify({spec_version: saved.spec_version, clarification_only: true}), runKey, signal);
     if (!signal.aborted) {
       selected = {...selected, run_id: result.run_id};
       void loadBoard();
@@ -849,6 +859,11 @@ function mountAttentionSurface(root, run, container, signal) {
     notice.classList.remove("error");
     try {
       await postTask(`${root}/attention/actions`, JSON.stringify(envelope), request.key, signal);
+      if (action.name === "adopt_specification") {
+        void loadBoard();
+        void loadDetail("仕様の詳細化が完了しました。実行を開始できます。");
+        return;
+      }
       snapshot = undefined;
       await refresh();
       request = undefined;
@@ -1134,7 +1149,96 @@ function taskChat(root, signal) {
   return panel;
 }
 
+function readyToExecute(run, task, signal) {
+  const status = element("p");
+  status.setAttribute("role", "status");
+  const panel = section("実行の準備ができました", element("p", "仕様の詳細化が完了しました。実行開始を押すと実装を開始します。"), status);
+  if (!["ADMIN", "OPERATOR"].includes(executionContext?.access)) return panel;
+  const key = taskKey();
+  panel.append(blockedForm("実行開始", status, async () => {
+    let result;
+    if (run.phase === "WAIT_PLAN_APPROVAL" && run.status === "WAITING_EXTERNAL" &&
+        run.spec_version === task.latest_spec_version) {
+      const approval = await read(`/v1/approvals/${encodeURIComponent(run.wait_context.approval_id)}`, signal);
+      result = await postTask(`/v1/approvals/${encodeURIComponent(approval.approval_id)}/decisions`,
+        JSON.stringify({expected_run_revision: run.state_revision, target_hash: approval.target_hash,
+          decision: "approve", reason: "詳細化した仕様と計画の実行を開始"}), key, signal);
+      result = result.run;
+    } else {
+      result = await postTask(`/v1/tasks/${encodeURIComponent(run.task_id)}/runs`,
+        JSON.stringify({spec_version: task.latest_spec_version, reuse_existing: true}), key, signal);
+    }
+    if (signal.aborted) return;
+    selected = {...selected, run_id: result.run_id, task_status: undefined};
+    void loadBoard();
+    void loadDetail("実行を開始しました。");
+  }));
+  return panel;
+}
+
+async function loadTaskDetail(notice = "") {
+  detailRequest?.abort();
+  detailRequest = new AbortController();
+  const {signal} = detailRequest;
+  const key = `task:${selected.task_id}`;
+  if (detailTabRunId !== key) { detailTab = "conversation"; detailTabRunId = key; }
+  get("detail-title").textContent = selected.task_title;
+  get("detail-content").replaceChildren();
+  get("detail-summary").replaceChildren();
+  get("detail-tabs").hidden = true;
+  get("reload-detail").disabled = true;
+  message("detail-status", "タスク詳細を取得中…");
+  try {
+    const task = await read(`/v1/tasks/${encodeURIComponent(selected.task_id)}`, signal);
+    if (signal.aborted) return;
+    if (task.task_status !== "DRAFT" && task.runs.length) {
+      selected = {...selected, run_id: task.runs.at(-1).run_id, task_status: task.task_status};
+      void loadDetail(notice);
+      return;
+    }
+    const badge = element("span", "詳細化前", "detail-state");
+    badge.dataset.state = "DRAFT";
+    get("detail-summary").append(badge, element("span", `仕様 v${task.latest_spec_version}`));
+    const status = element("p");
+    status.setAttribute("role", "status");
+    const conversation = section("AIによる仕様の詳細化", element("p", "目的と受け入れ条件をもとに、AIが実装前の確認と計画作成を行います。"), status);
+    if (["ADMIN", "OPERATOR"].includes(executionContext?.access)) {
+      const startKey = taskKey();
+      conversation.append(blockedForm("AIによる詳細化を開始", status, async () => {
+        const run = await postTask(`/v1/tasks/${encodeURIComponent(task.task_id)}/runs`,
+          JSON.stringify({spec_version: task.latest_spec_version, clarification_only: true, reuse_existing: true}), startKey, signal);
+        if (signal.aborted) return;
+        selected = {...run, task_id: task.task_id, task_title: task.title};
+        void loadBoard();
+        void loadDetail("AIによる仕様の詳細化を開始しました。");
+      }));
+    }
+    const history = section("これまでの実行");
+    if (!task.runs.length) history.append(element("p", "まだ実行はありません。"));
+    for (const run of [...task.runs].reverse()) {
+      const open = element("button", `仕様 v${run.spec_version} · ${run.run_id.slice(0, 8)}`);
+      open.type = "button";
+      open.addEventListener("click", () => {
+        selected = {...run, task_title: task.title};
+        void loadDetail();
+      });
+      history.append(open);
+    }
+    mountDetailTabs([
+      {id: "conversation", label: "対応・会話", content: conversation},
+      {id: "specification", label: "仕様", content: taskSpecificationView(task, {spec_version: task.latest_spec_version})},
+      {id: "history", label: "実行履歴", content: history},
+    ]);
+    message("detail-status", notice);
+  } catch (error) {
+    if (!signal.aborted) message("detail-status", error.message, true);
+  } finally {
+    if (detailRequest.signal === signal) get("reload-detail").disabled = false;
+  }
+}
+
 async function loadDetail(notice = "") {
+  if (!selected.run_id || selected.task_status === "DRAFT") return loadTaskDetail(notice);
   detailRequest?.abort();
   detailRequest = new AbortController();
   const { signal } = detailRequest;
@@ -1158,6 +1262,7 @@ async function loadDetail(notice = "") {
     if (signal.aborted) return;
     if (runResult.status === "rejected") throw runResult.reason;
     const run = runResult.value;
+    selected = {...selected, task_id: run.task_id, task_status: run.task_status};
     const candidateId = run.current_candidate_id;
     const candidatePath = `/v1/candidates/${encodeURIComponent(candidateId)}`;
     const [candidateResults, verifiedResults, [taskResult]] = await Promise.all([
@@ -1174,20 +1279,24 @@ async function loadDetail(notice = "") {
     const denied = allResults.find(({ reason }) => [401, 403].includes(reason?.status));
     if (denied) throw denied.reason;
     const context = run.wait_context;
+    const ready = boardStatus(run) === "READY";
+    const specVersion = ready ? taskResult.value?.latest_spec_version ?? run.spec_version : run.spec_version;
     const badge = element("span", lanes.get(boardStatus(run)), "detail-state");
     badge.dataset.state = boardStatus(run);
     get("detail-summary").append(badge,
-      element("span", resultLabels.get(run.status) ?? phaseLabels.get(run.phase) ?? run.phase),
-      element("span", `仕様 v${run.spec_version}`, "detail-spec-version"));
+      element("span", ready ? "仕様の詳細化完了" : resultLabels.get(run.status) ?? phaseLabels.get(run.phase) ?? run.phase),
+      element("span", `仕様 v${specVersion}`, "detail-spec-version"));
 
     const conversation = element("div");
-    if (run.status === "BLOCKED") {
+    if (ready && taskResult.status === "fulfilled") {
+      conversation.append(readyToExecute(run, taskResult.value, signal));
+    } else if (run.status === "BLOCKED") {
       const attention = await blockedRunView(root, run, signal, taskResult);
       if (signal.aborted) return;
       if (attention) conversation.append(attention);
     } else {
       const guidance = {
-        QUEUED: "実行の開始を待っています。",
+        QUEUED: boardStatus(run) === "CLARIFYING" ? "AIによる仕様の詳細化を開始しています。" : "実行を開始しています。",
         RUNNING: `${phaseLabels.get(run.phase) ?? run.phase}を進めています。`,
         WAITING_EXTERNAL: "外部処理の結果を待っています。",
         CANCELLING: "実行の取り消しを処理しています。",
@@ -1240,7 +1349,7 @@ async function loadDetail(notice = "") {
       ["Candidate ID", candidateId], ["世代", candidateResults[0].value?.generation],
       ["Head", candidateResults[0].value?.head_sha],
     ]) : element("p", "現候補なし")))));
-    const specification = taskResult.status === "fulfilled" ? taskSpecificationView(taskResult.value, run)
+    const specification = taskResult.status === "fulfilled" ? taskSpecificationView(taskResult.value, {...run, spec_version: specVersion})
       : section("仕様", element("p", "仕様を取得できませんでした。「詳細を更新」で再試行してください。", "error"));
     mountDetailTabs([
       {id: "conversation", label: "対応・会話", content: conversation},
@@ -1712,6 +1821,7 @@ taskForm.addEventListener("submit", async (event) => {
     taskForm.hidden = true;
     taskForm.reset();
     message("task-status", `「${title}」を作成しました。タスク ID ${result.task_id}。`);
+    void loadBoard();
     get("task-run").hidden = false;
     get("task-run").focus();
   } catch (error) {
@@ -1732,13 +1842,13 @@ get("task-run").addEventListener("click", async () => {
   const {signal} = taskRequest;
   const close = taskDialog.querySelector("header button");
   button.disabled = close.disabled = true;
-  message("task-status", "実行を登録中…");
+  message("task-status", "AIによる詳細化を開始中…");
   try {
     const run = await postTask(`/v1/tasks/${encodeURIComponent(task_id)}/runs`,
-      JSON.stringify({spec_version}), key, signal);
+      JSON.stringify({spec_version, clarification_only: true, reuse_existing: true}), key, signal);
     if (signal.aborted) return;
     button.hidden = true;
-    message("task-status", `実行を登録しました。Run ID ${run.run_id}。`);
+    message("task-status", "AIによる仕様の詳細化を開始しました。");
     void loadBoard();
   } catch (error) {
     if (!signal.aborted) message("task-status", `実行を登録できませんでした（${error.message}）。`, true);

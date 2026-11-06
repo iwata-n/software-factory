@@ -8,13 +8,14 @@ from typing import Annotated
 
 from fastapi import APIRouter, Header, Query, Response
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
-from sqlalchemy import select, tuple_
+from sqlalchemy import func, select, tuple_
 from starlette.concurrency import run_in_threadpool
 
 from .contracts import ProjectPolicy
 from .db import db_now
 from .models import Attempt, Principal, Project, Repository, Run, RunEvent, Task, Worker
 from .service import DomainError, owned
+from .task_lifecycle import task_stage
 
 UI_DIR = Path(__file__).with_name("operations_ui")
 HEARTBEAT_STALE_SECONDS = 30
@@ -201,6 +202,65 @@ def operations_router(service, token_type):
         response.headers["Cache-Control"] = "no-store"
         return service.read(token, query)
 
+    @router.get("/v1/operations/tasks", tags=["Tasks"])
+    def tasks_list(
+        token: token_type,
+        response: Response,
+        before: str | None = Query(default=None, max_length=36),
+        limit: int = Query(default=50, ge=1, le=100),
+    ):
+        def query(session, actor):
+            latest_run = (
+                select(Run.id)
+                .where(Run.workspace_id == actor.workspace_id, Run.task_id == Task.id)
+                .order_by(Run.created_at.desc(), Run.id.desc())
+                .limit(1)
+                .correlate(Task)
+                .scalar_subquery()
+            )
+            touched = func.coalesce(Task.retention_touched_at, 0)
+            statement = (
+                select(Task, Run)
+                .select_from(Task)
+                .outerjoin(Run, Run.id == latest_run)
+                .where(Task.workspace_id == actor.workspace_id)
+            )
+            if before:
+                anchor = owned(session, Task, before, actor.workspace_id)
+                statement = statement.where(
+                    tuple_(touched, Task.id) < (anchor.retention_touched_at or 0, anchor.id)
+                )
+            rows = session.execute(
+                statement.order_by(touched.desc(), Task.id.desc()).limit(limit + 1)
+            ).all()
+            return {
+                "tasks": [
+                    (
+                        {
+                            "run_id": run.id,
+                            "spec_version": run.spec_version,
+                            "status": run.status,
+                            "phase": run.phase,
+                            "state_revision": run.state_revision,
+                            "stop_reason": run.stop_reason,
+                        }
+                        if run
+                        else {"run_id": None}
+                    )
+                    | {
+                        "task_id": task.id,
+                        "task_title": task.title,
+                        "task_spec_version": task.latest_spec_version,
+                        "task_status": task_stage(task, run),
+                    }
+                    for task, run in rows[:limit]
+                ],
+                "next_before": rows[limit - 1][0].id if len(rows) > limit else None,
+            }
+
+        response.headers["Cache-Control"] = "no-store"
+        return service.read(token, query)
+
     @router.get("/v1/runs", tags=["Runs"])
     def runs_list(
         token: token_type,
@@ -218,6 +278,13 @@ def operations_router(service, token_type):
                     Run.phase,
                     Run.state_revision,
                     Run.stop_reason,
+                    Run.spec_version,
+                    func.coalesce(Run.snapshot["clarification_only"].as_boolean(), False).label(
+                        "clarification_only"
+                    ),
+                    func.coalesce(Run.snapshot["execution_requested"].as_boolean(), False).label(
+                        "execution_requested"
+                    ),
                 )
                 .join(Task, (Task.id == Run.task_id) & (Task.workspace_id == Run.workspace_id))
                 .where(Run.workspace_id == actor.workspace_id)

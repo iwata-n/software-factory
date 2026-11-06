@@ -318,6 +318,7 @@ def attention_router(service, token_type, codex_workspace):
                 except ValidationError:
                     raise DomainError(422, "INTERVIEW_SPECIFICATION_INVALID") from None
                 result = service.new_spec(session, actor, task.id, spec)
+                task.clarified_spec_version = result["spec_version"]
                 latest.interview = latest.interview | {"adopted_version": result["spec_version"]}
                 return {"spec_version": result["spec_version"]}
             refining = action.name == REFINE and specification is not None

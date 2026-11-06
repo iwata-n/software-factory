@@ -76,6 +76,7 @@ from .resolver import SourceResolver
 from .service import WEB_SESSION_PREFIX, DomainError, Service, owned, run_view
 from .slack_delivery import NOTIFICATION, SlackClient, SlackDispatcher
 from .task_chat import task_chat_router
+from .task_lifecycle import run_stage, task_stage
 from .web_accounts import browser_token, web_accounts_router
 
 security = HTTPBearer(auto_error=False)
@@ -290,11 +291,14 @@ def create_app(
                     Run.workspace_id == actor.workspace_id,
                     Run.task_id == task.id,
                 )
-                .order_by(Run.created_at)
-            )
+                .order_by(Run.created_at, Run.id)
+            ).all()
             return {
                 "task_id": task.id,
                 "title": task.title,
+                "latest_spec_version": task.latest_spec_version,
+                "clarified_spec_version": task.clarified_spec_version,
+                "task_status": task_stage(task, runs[-1] if runs else None),
                 "spec_versions": [
                     {"version": v.version, "hash": v.spec_hash, "body": v.body} for v in specs
                 ],
@@ -322,7 +326,20 @@ def create_app(
 
     @app.get("/v1/runs/{run_id}", tags=["Runs"])
     def run_get(run_id: str, token: Token):
-        return service.read(token, lambda s, a: run_view(owned(s, Run, run_id, a.workspace_id)))
+        def query(session, actor):
+            run = owned(session, Run, run_id, actor.workspace_id)
+            task = owned(session, Task, run.task_id, actor.workspace_id)
+            latest = session.scalar(
+                select(Run.id)
+                .where(Run.workspace_id == actor.workspace_id, Run.task_id == task.id)
+                .order_by(Run.created_at.desc(), Run.id.desc())
+                .limit(1)
+            )
+            return run_view(run) | {
+                "task_status": (task_stage(task, run) if latest == run.id else run_stage(run))
+            }
+
+        return service.read(token, query)
 
     def verified_result(session, actor, run_id):
         run = owned(session, Run, run_id, actor.workspace_id)

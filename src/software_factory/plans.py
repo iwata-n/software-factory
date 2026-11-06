@@ -146,7 +146,9 @@ class PlanCommands:
             if structural and self.schedule_replan(session, run, error, record.id):
                 return
             transition(session, run, "BLOCKED", error)
-        elif run.snapshot["policy"].get("require_plan_approval", False):
+        elif run.snapshot.get("clarification_only") or run.snapshot["policy"].get(
+            "require_plan_approval", False
+        ):
             transition(session, run, "PLAN_APPROVAL_REQUIRED")
             self.request_approval(session, run, record)
         else:
