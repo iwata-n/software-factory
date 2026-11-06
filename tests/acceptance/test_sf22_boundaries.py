@@ -102,7 +102,7 @@ def test_jira_uses_core_spec_and_keeps_active_run_fixed(world, jira, evidence):
     assert world.get(f"/v1/runs/{imported_run['run_id']}").json() == imported_run
 
     invalid = input_for(world, 4)
-    del invalid["fields"][FIELD]["task"]["acceptance_criteria"]
+    invalid["fields"][FIELD]["task"]["acceptance_criteria"] = [{"description": "Missing ID"}]
     assert receive(jira, invalid).json()["state"] == "NEEDS_INPUT"
     assert receive(jira, input_for(world, 4)).status_code == 409
     with world.database.transaction() as session:

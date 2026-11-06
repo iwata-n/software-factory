@@ -42,13 +42,23 @@ class Source(Contract):
 
 
 class TaskDefinition(Contract):
-    title: Name
+    title: Name = Field(default="", validate_default=True)
     repository_id: Name
     source: Source = Field(default_factory=Source)
     objective: Annotated[str, Field(min_length=1, max_length=16000)]
     base_ref: Name = "main"
-    acceptance_criteria: list[Criterion] = Field(min_length=1, max_length=100)
+    acceptance_criteria: list[Criterion] = Field(default_factory=list, max_length=100)
     constraints: list[Name] = Field(default_factory=list, max_length=100)
+
+    @model_validator(mode="before")
+    @classmethod
+    def title_from_objective(cls, data):
+        if isinstance(data, dict) and isinstance(data.get("objective"), str):
+            title = data.get("title", "")
+            objective = data["objective"].strip()
+            if isinstance(title, str) and not title.strip() and objective:
+                return data | {"title": objective.splitlines()[0][:80]}
+        return data
 
     @model_validator(mode="after")
     def unique_criteria(self):
@@ -340,6 +350,8 @@ def path_within(path: str, root: str) -> bool:
 
 
 def validate_plan(plan: Plan, spec: TaskSpec, policy: ProjectPolicy) -> str | None:
+    if not spec.task.acceptance_criteria:
+        return "SPEC_ACCEPTANCE_CRITERIA_REQUIRED"
     unit = plan.units[0]
     if plan.open_questions:
         return "PLAN_HAS_OPEN_QUESTIONS"

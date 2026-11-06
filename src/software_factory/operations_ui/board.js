@@ -514,7 +514,8 @@ function taskSpecificationView(task, run) {
     item.append(element("small", criterion.id), element("p", criterion.description));
     criteria.append(item);
   }
-  view.append(section("受け入れ条件", criteria));
+  view.append(section("受け入れ条件", spec.task.acceptance_criteria.length ? criteria
+    : element("p", "未設定です。AIとの詳細化で提案・確定します。", "detail-note")));
   if (spec.task.constraints.length) {
     const constraints = element("ul");
     constraints.append(...spec.task.constraints.map((text) => element("li", text)));
@@ -948,9 +949,12 @@ function mountAttentionSurface(root, run, container, signal) {
         input?.setSelectionRange(focused.selectionStart, focused.selectionEnd);
       }
       notice.textContent = !state.available ? "この Run では Codex との仕様確認を利用できません。"
+        : state.waiting_reason === "WORKSPACE_EXECUTION_STOPPED" ? "Workspace の緊急停止を解除すると、Codex による詳細化を開始できます。"
+        : state.waiting_reason === "TASK_CHAT_DAILY_LIMIT" ? "本日の Codex 対話の上限に達しました。利用枠が回復してから「詳細を更新」で再試行してください。"
         : state.adopted_version ? "仕様を採用しました。"
         : state.status === "FAILED" ? "Codex の応答を取得できませんでした。回答を送り直せます。"
-        : state.proposing ? "回答候補を準備中です。"
+        : state.proposing ? (run.snapshot.task_spec.task.acceptance_criteria.length
+          ? "回答候補を準備中です。" : "Codex が目的から質問と仕様案を準備しています…")
         : state.pending ? "Codex が追加で確認する点と仕様案を検討しています…"
         : state.specification ? "仕様案がまとまりました。"
         : state.history?.length ? "Codex から追加の質問があります。"
@@ -1201,7 +1205,7 @@ async function loadTaskDetail(notice = "") {
     get("detail-summary").append(badge, element("span", `仕様 v${task.latest_spec_version}`));
     const status = element("p");
     status.setAttribute("role", "status");
-    const conversation = section("AIによる仕様の詳細化", element("p", "目的と受け入れ条件をもとに、AIが実装前の確認と計画作成を行います。"), status);
+    const conversation = section("AIによる仕様の詳細化", element("p", "目的をもとに、AIが確認する点や受け入れ条件を提案します。"), status);
     if (["ADMIN", "OPERATOR"].includes(executionContext?.access)) {
       const startKey = taskKey();
       conversation.append(blockedForm("AIによる詳細化を開始", status, async () => {
@@ -1749,6 +1753,7 @@ get("task-open").addEventListener("click", async () => {
   taskRequest = new AbortController();
   const {signal} = taskRequest;
   taskForm.reset();
+  taskForm.querySelector("details").open = false;
   taskForm.hidden = true;
   taskSubmission = createdTask = undefined;
   get("task-run").hidden = true;
@@ -1766,7 +1771,7 @@ get("task-open").addEventListener("click", async () => {
     updateTaskRepositories();
     taskForm.hidden = false;
     message("task-status", "");
-    get("task-title").focus();
+    get("task-objective").focus();
   } catch (error) {
     if (!signal.aborted) message("task-status", error.message, true);
   }
@@ -1786,12 +1791,12 @@ taskForm.addEventListener("submit", async (event) => {
   if (submit.disabled || taskRequest.signal.aborted) return;
   const project = selectedProject();
   const repository = project?.repositories.find(({id}) => id === get("task-repository").value);
-  const title = get("task-title").value.trim();
   const objective = get("task-objective").value.trim();
+  const title = get("task-title").value.trim() || Array.from(objective.split(/\r?\n/)[0]).slice(0, 80).join("");
   const criteria = taskLines("task-criteria");
   const constraints = taskLines("task-constraints");
-  if (!repository || !title || !objective || !criteria.length) {
-    message("task-status", "作成先、タイトル、目的、受け入れ条件を入力してください。", true);
+  if (!repository || !objective) {
+    message("task-status", "作成先と目的を入力してください。", true);
     return;
   }
   if (criteria.length > 100 || criteria.some((line) => Array.from(line).length > 4000) ||

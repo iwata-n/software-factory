@@ -4,8 +4,8 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Run カンバン | Software Factory</title>
-  <link rel="stylesheet" href="/operations/board.css?v=task-lifecycle-stages">
-  <script type="module" src="/operations/board.js?v=task-lifecycle-stages"></script>
+  <link rel="stylesheet" href="/operations/board.css?v=optional-task-criteria-2">
+  <script type="module" src="/operations/board.js?v=optional-task-criteria-2"></script>
 </head>
 <body>
   <header class="masthead">
@@ -126,14 +126,17 @@
       <label>プロジェクト<select id="task-project" required></select></label>
       <label>リポジトリ<select id="task-repository" required></select></label>
       <p id="task-write-scope"></p>
-      <label>タイトル<input id="task-title" maxlength="200" required></label>
       <label>目的<textarea id="task-objective" rows="3" maxlength="16000" required></textarea></label>
-      <label>受け入れ条件<textarea id="task-criteria" rows="4" maxlength="400099" required
-        aria-describedby="task-criteria-help"></textarea></label>
-      <p id="task-criteria-help">合否を判断できる条件を1行に1件ずつ入力してください。</p>
-      <label>制約（任意）<textarea id="task-constraints" rows="2"
-        aria-describedby="task-constraints-help"></textarea></label>
-      <p id="task-constraints-help">1行に1件ずつ入力してください。</p>
+      <label>タイトル（任意）<input id="task-title" maxlength="200" placeholder="空欄なら目的から自動作成"></label>
+      <details>
+        <summary>受け入れ条件・制約（任意）</summary>
+        <label>受け入れ条件（任意）<textarea id="task-criteria" rows="4" maxlength="400099"
+          aria-describedby="task-criteria-help"></textarea></label>
+        <p id="task-criteria-help">未入力のまま作成できます。AIとの詳細化で提案・確定します。入力する場合は1行に1件ずつ記載してください。</p>
+        <label>制約（任意）<textarea id="task-constraints" rows="2"
+          aria-describedby="task-constraints-help"></textarea></label>
+        <p id="task-constraints-help">1行に1件ずつ入力してください。</p>
+      </details>
       <button id="task-submit" type="submit">タスクを作成</button>
     </form>
   </dialog>

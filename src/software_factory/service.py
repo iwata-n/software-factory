@@ -59,6 +59,7 @@ from .resolver import (
 )
 from .security import redact
 from .slack_delivery import enqueue_result
+from .task_lifecycle import run_stage
 from .worker_credentials import rotated_token
 
 WEB_SESSION_PREFIX = "web."
@@ -110,6 +111,7 @@ def owned(session: Session, model: type[T], item_id: str, workspace_id: str) -> 
 
 def run_view(run: Run) -> dict:
     return {
+        "task_status": run_stage(run),
         "run_id": run.id,
         "task_id": run.task_id,
         "spec_version": run.spec_version,
@@ -618,6 +620,8 @@ class Service:
             )
             if spec is None:
                 raise DomainError(404, "SPEC_NOT_FOUND")
+            if not data.clarification_only and not spec.body["task"]["acceptance_criteria"]:
+                raise DomainError(409, "SPEC_ACCEPTANCE_CRITERIA_REQUIRED")
             repo = owned(session, Repository, task.repository_id, actor.workspace_id)
             if not repo.active:
                 raise DomainError(403, "REPOSITORY_ACCESS_REVOKED")
@@ -694,6 +698,8 @@ class Service:
         if version is None:
             raise DomainError(404, "SPEC_NOT_FOUND")
         spec = TaskSpec.model_validate(version.body)
+        if not data.clarification_only and not spec.task.acceptance_criteria:
+            raise DomainError(409, "SPEC_ACCEPTANCE_CRITERIA_REQUIRED")
         self.check_spec(session, actor, task.project_id, spec)
         repo = owned(session, Repository, task.repository_id, actor.workspace_id)
         if not repo.active:
@@ -782,8 +788,28 @@ class Service:
         session.add(run)
         session.flush()
         self.costs.initial_budget(session, run)
-        enqueue(session, run, "PLAN")
         event(session, run, "RUN_COMPILED", {"snapshot_hash": digest(snapshot)})
+        if not spec.task.acceptance_criteria:
+            # A draft starts a specification interview before an executable Plan exists.
+            body = {
+                "units": [],
+                "assumptions": [],
+                "open_questions": ["このタスクで実現したい利用場面や振る舞いは何ですか？"],
+            }
+            session.add(
+                PlanVersion(
+                    workspace_id=run.workspace_id,
+                    run_id=run.id,
+                    version=1,
+                    body=body,
+                    body_hash=digest(body),
+                    validation_error="PLAN_HAS_OPEN_QUESTIONS",
+                )
+            )
+            session.flush()
+            transition(session, run, "BLOCKED", "PLAN_HAS_OPEN_QUESTIONS")
+        else:
+            enqueue(session, run, "PLAN")
         return run_view(run)
 
     def repository_allowed(self, session: Session, run: Run) -> bool:

@@ -252,15 +252,20 @@ def attention_router(service, token_type, codex_workspace):
                 else None
             )
             initial = state["proposal"]
+            waiting_reason = None
+            if not latest and not initial:
+                if session.get(Workspace, run.workspace_id).execution_stopped:
+                    waiting_reason = "WORKSPACE_EXECUTION_STOPPED"
+                elif chat_limit_reached(session, run.workspace_id, now):
+                    waiting_reason = "TASK_CHAT_DAILY_LIMIT"
             proposing = not latest and (
-                turn_view(initial, now)["status"] in ACTIVE
-                if initial
-                else not session.get(Workspace, run.workspace_id).execution_stopped
-                and not chat_limit_reached(session, run.workspace_id, now)
+                turn_view(initial, now)["status"] in ACTIVE if initial else waiting_reason is None
             )
             messages = (
                 []
-                if adopted or status in ACTIVE
+                if adopted
+                or status in ACTIVE
+                or (not latest and not run.snapshot["task_spec"]["task"]["acceptance_criteria"])
                 else attention_messages(run, state, review=specification is not None)
             )
             return {
@@ -269,11 +274,13 @@ def attention_router(service, token_type, codex_workspace):
                 "pending": status in ACTIVE or proposing,
                 "status": status,
                 "proposing": proposing,
+                "waiting_reason": waiting_reason,
                 "surface_id": state["surface"],
                 "history": [
                     {"question": turn.interview["question"], "answer": turn.question}
                     for turn in state["turns"]
-                    if turn.status == "ANSWERED" or turn is latest
+                    if not turn.interview.get("bootstrap")
+                    and (turn.status == "ANSWERED" or turn is latest)
                 ],
                 "specification": specification,
                 "adopted_version": adopted,
