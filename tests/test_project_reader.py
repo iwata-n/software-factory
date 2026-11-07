@@ -214,3 +214,54 @@ def test_overlapping_reads_are_merged_without_duplicate_source_context():
     excerpts = engine.contexts[2]["project_file_excerpts"]
     assert len(excerpts) == 1 and excerpts[0]["start_line"] == 1
     assert excerpts[0]["content"] == "one\ntwo\nthree\nfour\n"
+
+
+def test_validation_retry_retains_source_and_records_usage_without_rereading():
+    engine = Engine([request(read("src/a")), FINISH, {"answer": "corrected"}])
+    checked = []
+
+    def validate(value):
+        checked.append(value["answer"])
+        if value["answer"] != "corrected":
+            raise CodexError("MODEL_REJECTED", details={"path": "src/a"})
+
+    result = run_project_model(
+        engine,
+        {},
+        Reply,
+        Event(),
+        files={"src/a": ("100644", b"source\n")},
+        read_paths=["."],
+        write_paths=["."],
+        timeout=10,
+        validate_result=validate,
+    )
+    assert result.value == {"answer": "corrected"} and len(result.calls) == 3
+    assert result.usage.input_tokens == 30
+    assert checked == ["Source inspected", "corrected"]
+    assert (
+        engine.contexts[2]["project_file_excerpts"] == engine.contexts[1]["project_file_excerpts"]
+    )
+    assert engine.contexts[2]["generation_validation_error"]["code"] == "MODEL_REJECTED"
+
+
+def test_validation_self_correction_is_bounded_and_keeps_all_known_usage():
+    engine = Engine([FINISH, {"answer": "bad"}, {"answer": "bad"}])
+
+    def reject(value):
+        raise CodexError("MODEL_REJECTED")
+
+    with pytest.raises(CodexError, match="MODEL_REJECTED") as caught:
+        run_project_model(
+            engine,
+            {},
+            Reply,
+            Event(),
+            files={},
+            read_paths=["."],
+            write_paths=["."],
+            timeout=10,
+            validate_result=reject,
+        )
+    assert caught.value.usage.input_tokens == 30 and len(caught.value.calls) == 3
+    assert len(engine.contexts) == 3

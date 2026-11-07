@@ -133,7 +133,7 @@ ProjectPolicy の `delivery_mode: "local_candidate"` を指定すると、検証
 既定の `draft_pr` は従来どおりPR公開と外部CIの経路を利用します。
 コード変更用のCodex設定は入力上限1 MiB、1回の応答上限300秒です。参照済みの範囲を
 統合し、同じソースの再読込による入力枠の消費を抑えます。自己改善用の推定予算はRunあたり
-5,000,000 micro USDです。Codexサブスク認証を使い、この値はAPI請求額ではありません。
+10,000,000 micro USDです。Codexサブスク認証を使い、この値はAPI請求額ではありません。
 
 固定した Linux Codex バイナリと、対応する隔離 Runner の manifest を用意して起動します。
 

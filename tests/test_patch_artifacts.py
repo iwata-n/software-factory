@@ -75,3 +75,14 @@ def test_worker_credential_is_rejected_even_in_code_without_a_known_prefix(
     ).encode()
     reply, *_ = upload(world, body)
     assert reply.status_code == 409 and reply.json()["code"] == "SENSITIVE_ARTIFACT_REJECTED"
+
+
+def test_known_worker_credential_in_removed_context_is_still_rejected(world, monkeypatch, tmp_path):
+    monkeypatch.setenv("FACTORY_ARTIFACT_ROOT", str(tmp_path / "artifacts"))
+    body = (
+        "--- a/src/value.py\n+++ b/src/value.py\n@@ -1 +1 @@\n-value = '"
+        + world.worker_token
+        + "'\n+value = None\n"
+    ).encode()
+    reply, *_ = upload(world, body)
+    assert reply.status_code == 409 and reply.json()["code"] == "SENSITIVE_ARTIFACT_REJECTED"

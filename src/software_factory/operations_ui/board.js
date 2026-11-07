@@ -749,6 +749,7 @@ function runActionMessage(error) {
     RUN_REVISION_CONFLICT: "Run の状態が変わりました。「詳細を更新」で最新の状態を確認してください。",
     INTERVENTION_TARGET_STALE: "再開条件が変わりました。「詳細を更新」で確認してください。",
     BUDGET_NOT_RESOLVED: "予算が不足しています。",
+    INFRA_ATTEMPTS_EXHAUSTED: "この Run の試行上限です。「同じ仕様で新しく実行」を選んでください。",
     USAGE_NOT_RECONCILED: "利用量がまだ確定していません。",
     EVIDENCE_NOT_RESOLVED: "必要な検証結果がまだ揃っていません。",
     WORKSPACE_EXECUTION_STOPPED: "Workspace の実行が停止中です。管理者に確認してください。",
@@ -1062,10 +1063,10 @@ async function blockedRunView(root, run, signal, task) {
     resolve.prepend(attentionField("解消した内容", "reason", "", 4000, 2));
     panel.append(resolve);
   }
-  if (!canCorrectSpec && !recoverableBlocks.has(run.stop_reason) &&
+  if (!canCorrectSpec && run.cost_state === "KNOWN" &&
       !run.stop_reason?.includes("STOP_UNCONFIRMED") && task.value) {
     const retryKey = taskKey();
-    panel.append(blockedForm("同じ仕様で再実行", status, async () => {
+    panel.append(blockedForm("同じ仕様で新しく実行", status, async () => {
       const result = await postTask(`/v1/tasks/${encodeURIComponent(run.task_id)}/runs`,
         JSON.stringify({spec_version: task.value.latest_spec_version, reuse_existing: false}), retryKey, signal);
       if (signal.aborted) return;

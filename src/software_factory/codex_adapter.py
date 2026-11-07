@@ -20,7 +20,7 @@ from .contracts import FindingLocation, Name, Plan, digest, path_within, safe_pa
 from .metering import price_call
 from .project_reader import run_project_model
 from .sandbox import STOP_UNCONFIRMED, RunnerError
-from .security import introduces_secret, redact
+from .security import introduces_secret, redact, sensitive_patch
 
 
 class ModelOutput(BaseModel):
@@ -180,6 +180,8 @@ def model_context(job, files, policy):
                 "Each old_text must occur exactly once in the current source. Read the actual "
                 "lines first; do not guess anchors or include [REDACTED]. Preserve unrelated code. "
                 "New files use full UTF-8 content and edits=[]. content=null with edits=[] deletes."
+                " Return one entry per path. Do not embed real or sample credentials, even in "
+                "tests/docs. Construct authentication from existing runtime fixtures and values."
             ),
             "REPAIR": (
                 "Repair the supplied failures and list the corresponding IDs in "
@@ -274,7 +276,17 @@ def make_patch(changes, files, policy, plan, acceptance_ids):
         if new is None and path not in files:
             raise CodexError("MODEL_DELETE_MISSING_PATH", "POLICY")
         if new is not None and ("\x00" in new or introduces_secret(path, old, new)):
-            raise CodexError("MODEL_CHANGE_CONTENT_DENIED", "POLICY")
+            raise CodexError(
+                "MODEL_CHANGE_CONTENT_DENIED",
+                "POLICY",
+                details={
+                    "path": path,
+                    "hint": (
+                        "Use runtime authentication fixtures; do not embed credentials "
+                        "in code, tests or documentation."
+                    ),
+                },
+            )
         for line in difflib.unified_diff(
             old.splitlines(True),
             (new or "").splitlines(True),
@@ -388,6 +400,56 @@ class CodexAdapter:
                             }
                         )
 
+                def validate(value):
+                    try:
+                        changed = schema.model_validate(value)
+                        patch = make_patch(
+                            changed,
+                            files,
+                            policy,
+                            job["plan"],
+                            [
+                                criterion["id"]
+                                for criterion in snapshot["task_spec"]["task"][
+                                    "acceptance_criteria"
+                                ]
+                            ],
+                        )
+                        if job["kind"] == "REPAIR":
+                            known = {item["id"] for item in context["repair_failures"]}
+                            claimed = changed.addressed_failure_ids
+                            if len(set(claimed)) != len(claimed) or not set(claimed) <= known:
+                                raise CodexError(
+                                    "MODEL_REPAIR_FAILURE_IDS_INVALID",
+                                    details={
+                                        "hint": "Use only identifiers from repair_failures.",
+                                    },
+                                )
+                        if sensitive_patch(patch.decode()):
+                            raise CodexError(
+                                "MODEL_PATCH_CONTENT_DENIED",
+                                "POLICY",
+                                details={
+                                    "hint": (
+                                        "Use runtime authentication fixtures; do not embed "
+                                        "credentials in new code or documentation."
+                                    ),
+                                },
+                            )
+                    except CodexError as error:
+                        with self._lock:
+                            self._events.append(
+                                {
+                                    "kind": "PROGRESS",
+                                    "body": {
+                                        "message": "変更の検査結果を返し、自己修正中です。",
+                                        "code": error.code,
+                                        "details": redact(error.details),
+                                    },
+                                }
+                            )
+                        raise
+
                 response = run_project_model(
                     self.engine,
                     context,
@@ -398,6 +460,7 @@ class CodexAdapter:
                     write_paths=policy["allowed_write_paths"],
                     timeout=job["execution"]["timeout_seconds"],
                     progress=progress,
+                    validate_result=validate if job["kind"] in {"IMPLEMENT", "REPAIR"} else None,
                 )
             else:
                 response = self.engine.run(

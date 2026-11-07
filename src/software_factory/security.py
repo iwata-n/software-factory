@@ -70,6 +70,6 @@ def sensitive_patch(patch, known_secrets=()):
                 return True
             if target != "/dev/null":
                 path = target
-        elif line.startswith(("+", "-", " ")):
+        elif line.startswith("+"):
             pieces.append(line[1:])
     return introduces_secret(path, "", "".join(pieces))

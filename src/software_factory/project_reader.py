@@ -9,7 +9,7 @@ from pydantic import Field, ValidationError, create_model
 
 from .codex_engine import QUOTED_SECRET, CodexError, CodexResponse
 from .contracts import Contract, ModelCallUsage, Name, path_within, safe_path
-from .security import SECRETS
+from .security import SECRETS, redact
 
 
 class FileRead(Contract):
@@ -109,7 +109,17 @@ def readable_files(files, roots):
 
 
 def run_project_model(
-    engine, context, schema, cancelled, *, files, read_paths, write_paths, timeout, progress=None
+    engine,
+    context,
+    schema,
+    cancelled,
+    *,
+    files,
+    read_paths,
+    write_paths,
+    timeout,
+    progress=None,
+    validate_result=None,
 ):
     """The model can request file excerpts, never filesystem mutations or shell execution."""
     wrapper = create_model(
@@ -142,17 +152,18 @@ def run_project_model(
         ),
     }
     excerpts, searches = OrderedDict(), OrderedDict()
-    calls, diagnostics = [], 0
+    calls, diagnostics, corrections = [], 0, 0
+    max_calls = 18 if validate_result else 16
     deadline = time.monotonic() + timeout
     limit = getattr(engine.manifest, "max_input_bytes", 262144) - 4096
     try:
-        for round_number in range(16):
+        for round_number in range(max_calls):
             prompt = base | {
                 "project_file_excerpts": list(excerpts.values()),
                 "project_search_results": list(searches.values()),
                 "file_reader_state": {
                     "round": round_number + 1,
-                    "remaining_calls": 16 - round_number,
+                    "remaining_calls": max_calls - round_number,
                     "instruction": (
                         "This is a continuation. Prior read_requests have been fulfilled in "
                         "project_file_excerpts. Return the result now if those excerpts suffice."
@@ -174,12 +185,19 @@ def run_project_model(
                 raise CodexError(
                     "CODEX_CANCELLED" if cancelled.is_set() else "CODEX_TIMEOUT", before_launch=True
                 )
-            finalizing = round_number == 15
+            finalizing = round_number >= 15 or corrections > 0
             if finalizing:
+                prompt["file_reader_instructions"] = (
+                    "The reader is closed for this invocation. Return the result object directly "
+                    "using the supplied output schema, without a read_requests/result wrapper. "
+                    "Use cached source, fix generation_validation_error if present, and preserve "
+                    "every criterion. Do not invent anchors or weaken policy or credential checks."
+                )
                 prompt["file_reader_state"]["instruction"] = (
-                    "The read budget is exhausted. Return the requested final result using the "
+                    "Return the complete requested final result using the cached "
                     "provided source excerpts. Do not invent anchors or claim unexecuted tests. "
-                    "Report uncertainty in the result where the result schema permits it."
+                    "Fix generation_validation_error if present. No further reads are available. "
+                    "Report uncertainty where the result schema permits it."
                 )
             reply = engine.run(
                 prompt, schema if finalizing else wrapper, cancelled, timeout=remaining
@@ -188,23 +206,36 @@ def run_project_model(
                 raise CodexError("CODEX_NO_USAGE")
             calls.extend(getattr(reply, "calls", ()) or (reply.usage,))
             diagnostics += getattr(reply, "startup_diagnostics", 0)
-            if finalizing:
-                value = schema.model_validate(reply.value)
+            value = schema.model_validate(reply.value) if finalizing else None
+            if not finalizing:
+                result = wrapper.model_validate(reply.value)
+                if (
+                    result.result is not None
+                    and not result.read_requests
+                    and not result.search_requests
+                ):
+                    value = result.result
+            if value is not None:
+                if validate_result:
+                    try:
+                        validate_result(value.model_dump())
+                    except CodexError as error:
+                        corrections += 1
+                        if corrections > 2 or round_number + 1 >= max_calls:
+                            error.before_launch = True
+                            raise
+                        base["generation_validation_error"] = {
+                            "code": error.code,
+                            "details": redact(error.details),
+                            "instruction": (
+                                "Return a complete corrected result; keep every acceptance "
+                                "criterion and existing behavior. Do not weaken policy or "
+                                "credential checks."
+                            ),
+                        }
+                        continue
                 return CodexResponse(
                     value.model_dump(),
-                    aggregate_usage(calls),
-                    reply.thread_id,
-                    diagnostics,
-                    tuple(calls),
-                )
-            result = wrapper.model_validate(reply.value)
-            if (
-                result.result is not None
-                and not result.read_requests
-                and not result.search_requests
-            ):
-                return CodexResponse(
-                    result.result.model_dump(),
                     aggregate_usage(calls),
                     reply.thread_id,
                     diagnostics,

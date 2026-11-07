@@ -247,7 +247,7 @@ def main():
                 }
             ],
             "execution_image_digest": image,
-            "run_budget_microusd": 5_000_000,
+            "run_budget_microusd": 10_000_000,
             "job_reservation_microusd": 1_000_000,
         }
         with httpx.Client(
