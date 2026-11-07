@@ -75,7 +75,7 @@ class TaskChatOutcome(Contract):
     answer: Annotated[str, Field(min_length=1, max_length=500000)] | None = None
     error: Literal["CODEX_AUTH_OR_POLICY", "CODEX_UNAVAILABLE", "CODEX_NO_USAGE"] | None = None
     usage: ModelCallUsage | None = None
-    calls: list[ModelCallUsage] = Field(default_factory=list, max_length=8)
+    calls: list[ModelCallUsage] = Field(default_factory=list, max_length=16)
 
     @model_validator(mode="after")
     def complete_outcome(self):

@@ -372,6 +372,20 @@ class CodexAdapter:
             schema = {"PLAN": Plan, "IMPLEMENT": ChangeSet, "REPAIR": RepairSet}[job["kind"]]
             called = True
             if "allowed_read_paths" in policy:
+
+                def progress(round_number, paths):
+                    with self._lock:
+                        self._events.append(
+                            {
+                                "kind": "PROGRESS",
+                                "body": {
+                                    "message": "Codex がプロジェクトの参照・検索を進めています。",
+                                    "round": round_number,
+                                    "paths": paths,
+                                },
+                            }
+                        )
+
                 response = run_project_model(
                     self.engine,
                     context,
@@ -381,6 +395,7 @@ class CodexAdapter:
                     read_paths=policy["allowed_read_paths"],
                     write_paths=policy["allowed_write_paths"],
                     timeout=job["execution"]["timeout_seconds"],
+                    progress=progress,
                 )
             else:
                 response = self.engine.run(

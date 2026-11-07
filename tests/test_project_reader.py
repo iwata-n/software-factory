@@ -117,11 +117,11 @@ def test_large_excerpt_returns_bounded_error_and_can_retry_fewer_lines():
 
 
 def test_read_loop_has_call_limit_and_records_all_measured_calls():
-    engine = Engine([request(read("src/a"))] * 8)
+    engine = Engine([request(read("src/a"))] * 16)
     with pytest.raises(CodexError, match="PROJECT_READ_LIMIT") as failure:
         execute(engine, {"src/a": ("100644", b"content")})
-    assert len(failure.value.calls) == 8
-    assert failure.value.usage.input_tokens == 80
+    assert len(failure.value.calls) == 16
+    assert failure.value.usage.input_tokens == 160
 
 
 def test_unknown_later_usage_does_not_become_final_known_usage():
@@ -159,3 +159,51 @@ def test_edit_output_is_not_accepted_during_read_only_interview():
         from software_factory.project_reader import FileRead
 
         FileRead.model_validate(read("src/a", count=301))
+
+
+def test_literal_search_finds_exact_anchors_without_loading_entire_files():
+    engine = Engine(
+        [
+            {
+                "read_requests": [],
+                "search_requests": [{"query": "def owned", "path": "src", "max_matches": 1}],
+                "result": None,
+            },
+            FINISH,
+        ]
+    )
+    files = {
+        "src/service.py": (
+            "100644",
+            b"# header\ndef owned():\n    pass\n\ndef owned_other():\n    pass\n",
+        ),
+        "docs/service.md": ("100644", b"def owned in docs\n"),
+    }
+    execute(engine, files)
+    result = engine.contexts[1]["project_search_results"][0]
+    assert result["truncated"] and len(result["matches"]) == 1
+    assert result["matches"][0]["path"] == "src/service.py"
+    assert "def owned():" in result["matches"][0]["content"]
+
+
+def test_search_respects_read_scope_and_never_follows_links():
+    engine = Engine(
+        [
+            {
+                "read_requests": [],
+                "search_requests": [{"query": "hidden", "path": None, "max_matches": 10}],
+                "result": None,
+            },
+            FINISH,
+        ]
+    )
+    execute(
+        engine,
+        {
+            "src/hidden.py": ("100644", b"hidden\n"),
+            "docs/link": ("120000", b"hidden"),
+            "docs/spec": ("100644", b"public\n"),
+        },
+        roots=["docs"],
+    )
+    assert engine.contexts[1]["project_search_results"][0]["matches"] == []
