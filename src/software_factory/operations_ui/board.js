@@ -16,6 +16,7 @@ const resultLabels = new Map([
   ["CANCELLING", "取消処理中"],
 ]);
 const phaseLabels = new Map([
+  ["LOCAL_COMPLETE", "ローカル検証完了"],
   ["PLAN", "仕様の詳細化"],
   ["WAIT_PLAN_APPROVAL", "計画の承認待ち"],
   ["IMPLEMENT", "実装"],
@@ -1322,7 +1323,9 @@ async function loadDetail(notice = "") {
         WAITING_EXTERNAL: "外部処理の結果を待っています。",
         CANCELLING: "実行の取り消しを処理しています。",
         CANCELLED: "この実行は取り消されました。仕様と実行履歴を確認できます。",
-        SUCCEEDED: "実行が完了しました。成果物と検証結果は「実行履歴」で確認できます。",
+        SUCCEEDED: run.phase === "LOCAL_COMPLETE"
+          ? "ローカルでの実装・検証が完了しました。変更パッチは「実行履歴」で確認できます。"
+          : "実行が完了しました。成果物と検証結果は「実行履歴」で確認できます。",
         FAILED: "実行に失敗しました。「実行履歴」で停止理由と検証結果を確認してください。",
       }[run.status];
       if (guidance) conversation.append(element("p", guidance, "detail-guidance"));

@@ -174,6 +174,21 @@ class GateCommands:
         if stop:
             transition(session, run, "BLOCKED", stop)
         elif decision.status == "PASS":
+            if run.snapshot["policy"].get("delivery_mode") == "local_candidate":
+                run.status, run.phase, run.stop_reason = "SUCCEEDED", "LOCAL_COMPLETE", None
+                run.finished_at = db_now(session)
+                event(
+                    session,
+                    run,
+                    "LOCAL_CANDIDATE_READY",
+                    {
+                        "candidate_id": candidate.id,
+                        "gate_id": gate.id,
+                        "source_artifact_id": candidate.source_artifact_id,
+                        "publication": "not_requested",
+                    },
+                )
+                return gate
             run.status, run.phase, run.stop_reason = "QUEUED", "PUBLISH_DRAFT", None
             enqueue(
                 session,

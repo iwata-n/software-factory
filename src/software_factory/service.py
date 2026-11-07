@@ -793,7 +793,13 @@ class Service:
                 snapshot["source"].update(
                     {
                         name: source_details[name]
-                        for name in ("tree", "source_digest", "symlink_paths", "image_digest")
+                        for name in (
+                            "tree",
+                            "source_digest",
+                            "symlink_paths",
+                            "image_digest",
+                            "source_origin",
+                        )
                         if name in source_details
                     }
                 )

@@ -167,6 +167,7 @@ def main():
             "allowed_read_paths": ["."],
             "allowed_write_paths": ["."],
             "protected_paths": [],
+            "delivery_mode": "local_candidate",
             "verification": {
                 "profile_id": "self-host-project",
                 "required_checks": [CHECK, "review"],

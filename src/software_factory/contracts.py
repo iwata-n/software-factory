@@ -300,6 +300,7 @@ class ProjectPolicy(Contract):
     protected_manifest: dict[str, str] = Field(default_factory=dict, max_length=10000)
     allow_external_model: bool = False
     require_plan_approval: bool = False
+    delivery_mode: Literal["draft_pr", "local_candidate"] = "draft_pr"
     pricing_manifest: PricingManifest | None = None
     run_budget_microusd: int = Field(gt=0, le=10**12)
     job_reservation_microusd: int = Field(gt=0, le=10**12)
@@ -315,6 +316,8 @@ class ProjectPolicy(Contract):
             raise ValueError("policy paths must be relative canonical paths without wildcards")
         if self.job_reservation_microusd > self.run_budget_microusd:
             raise ValueError("a job reservation must fit within the run budget")
+        if self.delivery_mode == "local_candidate" and self.required_ci_checks:
+            raise ValueError("local delivery cannot satisfy required external CI checks")
         if any(
             not safe_path(path) or not re.fullmatch(r"[0-9a-f]{64}", value)
             for path, value in self.protected_manifest.items()

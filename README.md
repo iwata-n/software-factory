@@ -119,6 +119,16 @@ Git管理情報、プロジェクト外へのパス、シンボリックリン�
 指定できます。既存Runの権限は固定されるため、設定変更後はタスク詳細の
 「現在の設定で詳細化をやり直す」から新しい設定を適用してください。履歴は保存されます。
 
+未公開のローカルコミットを対象にする場合は、専用チェックアウトで
+`PYTHONPATH=.:src python scripts/export_source_snapshot.py --remote-url https://github.com/iwata-n/software-factory.git --output /private/tmp/factory-source/snapshot.json`
+を実行し、Source Runner の `FACTORY_SOURCE_SNAPSHOT_FILE` に出力先を指定します。
+タスクの `base_ref` は `local/self-host` です。ソースはコミットSHAで固定し、隔離Runnerで
+アーカイブ・Gitツリー・コミット・ファイル内容の一致を検査します。未コミット変更は含みません。
+これはローカルの改善・検証用で、GitHubへのpushやPR公開は行いません。
+ProjectPolicy の `delivery_mode: "local_candidate"` を指定すると、検証とAIレビューに合格した
+候補をローカル成果物として完了します。外部CIが必須の設定では指定できません。
+既定の `draft_pr` は従来どおりPR公開と外部CIの経路を利用します。
+
 固定した Linux Codex バイナリと、対応する隔離 Runner の manifest を用意して起動します。
 
 ```sh
