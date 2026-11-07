@@ -266,6 +266,70 @@ def test_no_code_change_and_incomplete_acceptance_coverage_are_not_success(job):
     assert result.reason == "MODEL_ACCEPTANCE_COVERAGE"
 
 
+def test_exact_edits_preserve_large_files_and_existing_code_without_full_regeneration(job):
+    original = "token = issue_token()\n" + "# unchanged\n" * 20000 + "value = 1\n"
+    changes = ChangeSet(
+        summary="Return 2",
+        acceptance_ids=["AC-1"],
+        changes=[
+            {
+                "path": "src/example.py",
+                "content": None,
+                "edits": [{"old_text": "value = 1\n", "new_text": "value = 2\n"}],
+            }
+        ],
+    )
+    patch = make_patch(
+        changes,
+        {"src/example.py": ("100644", original.encode())},
+        job["snapshot"]["policy"],
+        PLAN,
+        ["AC-1"],
+    )
+    assert b"-value = 1\n+value = 2\n" in patch and len(patch) < 500
+    assert original.endswith("value = 1\n")
+
+
+@pytest.mark.parametrize("source,old", [("same\nsame\n", "same\n"), ("original\n", "missing\n")])
+def test_edits_with_missing_or_ambiguous_anchors_never_produce_a_patch(job, source, old):
+    changes = ChangeSet(
+        summary="Denied",
+        acceptance_ids=["AC-1"],
+        changes=[
+            {
+                "path": "src/example.py",
+                "content": None,
+                "edits": [{"old_text": old, "new_text": "replacement\n"}],
+            }
+        ],
+    )
+    with pytest.raises(CodexError, match="MODEL_EDIT_ANCHOR_MISMATCH"):
+        make_patch(
+            changes,
+            {"src/example.py": ("100644", source.encode())},
+            job["snapshot"]["policy"],
+            PLAN,
+            ["AC-1"],
+        )
+
+
+def test_code_parameters_and_interpolation_are_not_mistaken_for_credentials(job):
+    code = 'def headers(token: Token):\n    return {"Authorization": f"Bearer {token}"}\n'
+    changes = ChangeSet(
+        summary="Add helper",
+        acceptance_ids=["AC-1"],
+        changes=[{"path": "src/example.py", "content": code}],
+    )
+    assert b"def headers" in make_patch(changes, {}, job["snapshot"]["policy"], PLAN, ["AC-1"])
+    denied = ChangeSet(
+        summary="Denied",
+        acceptance_ids=["AC-1"],
+        changes=[{"path": "src/example.py", "content": 'value = "ghp_REAL_CREDENTIAL_CANARY"\n'}],
+    )
+    with pytest.raises(CodexError, match="MODEL_CHANGE_CONTENT_DENIED"):
+        make_patch(denied, {}, job["snapshot"]["policy"], PLAN, ["AC-1"])
+
+
 def test_missing_usage_is_unknown_and_schema_failure_preserves_measured_usage(job):
     missing = execute(Engine(failure=CodexError("CODEX_EVENT_SCHEMA_INVALID")), job)
     assert missing.usage_microusd is None and missing.usage_deliveries == ()

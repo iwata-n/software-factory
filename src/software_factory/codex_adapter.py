@@ -6,6 +6,7 @@ import hashlib
 import io
 import json
 import tarfile
+from collections import Counter
 from pathlib import PurePosixPath
 from threading import Event, Lock, Thread
 from typing import Annotated, Literal
@@ -20,7 +21,7 @@ from .contracts import FindingLocation, Name, Plan, digest, path_within, safe_pa
 from .metering import price_call
 from .project_reader import run_project_model
 from .sandbox import STOP_UNCONFIRMED, RunnerError
-from .security import redact
+from .security import SECRETS, redact
 
 
 class ModelOutput(BaseModel):
@@ -30,6 +31,12 @@ class ModelOutput(BaseModel):
 class FileChange(ModelOutput):
     path: Name
     content: Annotated[str, Field(max_length=256 * 1024)] | None
+    edits: list["TextEdit"] = Field(default_factory=list, max_length=100)
+
+
+class TextEdit(ModelOutput):
+    old_text: Annotated[str, Field(min_length=1, max_length=32768)]
+    new_text: Annotated[str, Field(max_length=65536)]
 
 
 class ChangeSet(ModelOutput):
@@ -169,10 +176,17 @@ def model_context(job, files, policy):
         "source_files": {} if "allowed_read_paths" in policy else context_files(files, policy),
         "instructions": {
             "PLAN": "One unit covering every acceptance ID. Propose exact permitted file paths.",
-            "IMPLEMENT": "Return full UTF-8 content for changed files only. Null deletes a file.",
+            "IMPLEMENT": (
+                "For existing files, prefer content=null and edits of exact old_text/new_text. "
+                "Each old_text must occur exactly once in the current source. Read the actual "
+                "lines first; do not guess anchors or include [REDACTED]. Preserve unrelated code. "
+                "New files use full UTF-8 content and edits=[]. content=null with edits=[] deletes."
+            ),
             "REPAIR": (
                 "Repair the supplied failures and list the corresponding IDs in "
                 "addressed_failure_ids. Preserve protected tests and scope."
+                " Prefer exact old_text/new_text edits with content=null for existing files; "
+                "read the actual source first. New files use content and edits=[]."
             ),
             "REVIEW": "Inspect every AC. Cite existing source locations. Do not claim execution.",
         }[role],
@@ -187,6 +201,25 @@ def model_context(job, files, policy):
             {"id": digest(failure), "failure": failure} for failure in failures
         ]
     return context
+
+
+def introduces_secret(path, old, new):
+    code = PurePosixPath(path).suffix in {".py", ".js", ".ts", ".jsx", ".tsx"}
+    for index, pattern in enumerate(SECRETS):
+        if code and index == 1:
+            # Unquoted `token: Token` and `token = issue_token()` are code, not credentials.
+            continue
+
+        def matches(text, pattern=pattern, index=index):
+            return Counter(
+                match[0]
+                for match in pattern.finditer(text)
+                if not (code and index == 0 and match[0].split(None, 1)[-1].startswith(("{", "${")))
+            )
+
+        if matches(new) - matches(old):
+            return True
+    return False
 
 
 def make_patch(changes, files, policy, plan, acceptance_ids):
@@ -228,9 +261,17 @@ def make_patch(changes, files, policy, plan, acceptance_ids):
         paths.add(path)
         old = files[path][1].decode("utf-8") if path in files else ""
         new = change.content
+        if change.edits:
+            if path not in files or new is not None:
+                raise CodexError("MODEL_EDIT_MODE_INVALID", "POLICY")
+            new = old
+            for edit in change.edits:
+                if new.count(edit.old_text) != 1:
+                    raise CodexError("MODEL_EDIT_ANCHOR_MISMATCH", "INCONCLUSIVE")
+                new = new.replace(edit.old_text, edit.new_text, 1)
         if new is None and path not in files:
             raise CodexError("MODEL_DELETE_MISSING_PATH", "POLICY")
-        if new is not None and ("\x00" in new or redact(new) != new):
+        if new is not None and ("\x00" in new or introduces_secret(path, old, new)):
             raise CodexError("MODEL_CHANGE_CONTENT_DENIED", "POLICY")
         for line in difflib.unified_diff(
             old.splitlines(True),

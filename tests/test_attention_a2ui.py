@@ -113,7 +113,9 @@ def test_specification_interview_repeats_questions_until_the_operator_adopts(
     def model(context, schema, *_args, **_kwargs):
         if schema is TaskAnswerOptions:
             assert context["run"]["open_questions"] == [QUESTION]
-            value = {"questions": [{"question_number": 1, "options": ["Show No items yet."]}]}
+            value = {
+                "questions": [{"question_number": 1, "options": ["Show No items yet.（推奨）"]}]
+            }
         else:
             assert schema is InterviewReply
             assert context["role"] == "SPECIFICATION_INTERVIEW"

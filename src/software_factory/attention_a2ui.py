@@ -153,7 +153,15 @@ def attention_messages(run, state, *, review=False):
                 "variant": "mutuallyExclusive",
                 "label": "回答候補",
                 "options": [
-                    {"label": text + ("（推奨）" if number == 1 else ""), "value": str(number)}
+                    {
+                        "label": text
+                        + (
+                            "（推奨）"
+                            if number == 1 and not text.endswith(("（推奨）", "(推奨)"))
+                            else ""
+                        ),
+                        "value": str(number),
+                    }
                     for number, text in enumerate(state["options"], 1)
                 ]
                 + [{"label": "その他", "value": OTHER}],
