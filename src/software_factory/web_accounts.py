@@ -197,6 +197,19 @@ def web_accounts_router(service, token_type):
     @router.get("/session")
     def current_session(request: Request, response: Response):
         response.headers["Cache-Control"] = "no-store"
+        temporary = request.app.state.temporary_web_access
+        if temporary and (token := temporary.token_for(request)):
+            return service.read(
+                token,
+                lambda session, actor: {
+                    "id": actor.id,
+                    "username": "一時アクセス（操作者）",
+                    "access": actor.user_access,
+                    "active": actor.active,
+                    "authentication": "temporary",
+                    "authentication_expires_at": temporary.expires_at,
+                },
+            )
         lan = request.app.state.lan_access
         if lan and (token := lan.token_for(request)):
             return service.read(

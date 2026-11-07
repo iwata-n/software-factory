@@ -77,6 +77,7 @@ from .service import WEB_SESSION_PREFIX, DomainError, Service, owned, run_view
 from .slack_delivery import NOTIFICATION, SlackClient, SlackDispatcher
 from .task_chat import task_chat_router
 from .task_lifecycle import run_stage, task_stage
+from .temporary_web_access import TemporaryWebAccess
 from .web_accounts import browser_token, web_accounts_router
 
 security = HTTPBearer(auto_error=False)
@@ -92,6 +93,9 @@ def bearer(
         ):
             return credentials.credentials
     elif not request.headers.get("Authorization"):
+        temporary = request.app.state.temporary_web_access
+        if temporary and (token := temporary.token_for(request)):
+            return token
         lan = request.app.state.lan_access
         if lan and (token := lan.token_for(request)):
             return token
@@ -196,6 +200,7 @@ def create_app(
     )
     app.state.service = service
     app.state.lan_access = LANAccess.configured()
+    app.state.temporary_web_access = TemporaryWebAccess.configured()
     app.include_router(webhook_router(service, integrations, vault if vault.cipher else None))
     if jira := configured_jira():
         app.include_router(jira_router(service, *jira))

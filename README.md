@@ -90,6 +90,15 @@ HTTPSリバースプロキシは指定LANだけを許可し、受信した `X-Fa
 プロキシの接続だけを信頼します。設定ファイルとプロキシ設定に含まれる秘密値は
 ブラウザーへ配信しません。自動接続の書き込みにも同一Originが必要です。
 
+Tailscale経由のWebログインを一時的に省く場合は、所有者のみが読める `0600` の設定ファイルを
+`FACTORY_TEMPORARY_WEB_ACCESS_FILE` で指定します。内容は `origin`（この端末の正確なHTTPS
+Tailscale URL）、`user_token`（専用の操作者トークン）、`expires_at`（期限のUNIX秒）です。
+設定できる期限は現在から24時間以内です。Tailscale Serveの転送ヘッダーと接続元を照合し、
+指定URLでだけ共有の操作者として利用できます。公開Funnel経由の要求は対象に含めません。
+トークンはブラウザーへ配信せず、管理者権限のトークンはこのモードで利用できません。
+期限を迎えると自動で通常のログインへ戻ります。早めに戻す場合は設定ファイルの指定を
+起動環境から外し、Control Planeを再起動します。専用トークン自体にも同じ有効期限を設定します。
+
 ## Software Factory 自身の改善を試す
 
 `scripts/serve_self_host.py` は一時 PostgreSQL に Software Factory 専用 Workspace を作り、
