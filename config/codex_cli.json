@@ -7,7 +7,7 @@
   "model": "gpt-6.1-sol",
   "reasoning_effort": "low",
   "execution_mode": "structured_text_no_repo_checkout",
-  "timeout_seconds": 120,
-  "max_input_bytes": 262144,
+  "timeout_seconds": 300,
+  "max_input_bytes": 1048576,
   "max_output_bytes": 2097152
 }

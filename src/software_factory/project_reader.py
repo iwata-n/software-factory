@@ -174,11 +174,29 @@ def run_project_model(
                 raise CodexError(
                     "CODEX_CANCELLED" if cancelled.is_set() else "CODEX_TIMEOUT", before_launch=True
                 )
-            reply = engine.run(prompt, wrapper, cancelled, timeout=remaining)
+            finalizing = round_number == 15
+            if finalizing:
+                prompt["file_reader_state"]["instruction"] = (
+                    "The read budget is exhausted. Return the requested final result using the "
+                    "provided source excerpts. Do not invent anchors or claim unexecuted tests. "
+                    "Report uncertainty in the result where the result schema permits it."
+                )
+            reply = engine.run(
+                prompt, schema if finalizing else wrapper, cancelled, timeout=remaining
+            )
             if reply.usage is None:
                 raise CodexError("CODEX_NO_USAGE")
             calls.extend(getattr(reply, "calls", ()) or (reply.usage,))
             diagnostics += getattr(reply, "startup_diagnostics", 0)
+            if finalizing:
+                value = schema.model_validate(reply.value)
+                return CodexResponse(
+                    value.model_dump(),
+                    aggregate_usage(calls),
+                    reply.thread_id,
+                    diagnostics,
+                    tuple(calls),
+                )
             result = wrapper.model_validate(reply.value)
             if (
                 result.result is not None
@@ -226,6 +244,23 @@ def run_project_model(
                 if content is not None and len(content.encode()) > limit // 2:
                     record.update(content=None, error="Excerpt too large; request fewer lines.")
                 key = (request.path, request.start_line, request.line_count)
+                if record["content"] is not None:
+                    start = request.start_line
+                    end = min(len(lines), start + request.line_count - 1)
+                    # Overlapping reads must not fill the context with duplicate source text.
+                    for previous, cached in list(excerpts.items()):
+                        path, first, count = previous
+                        last = first + count - 1
+                        if (
+                            path == request.path
+                            and cached["content"] is not None
+                            and first <= end + 1
+                            and start <= last + 1
+                        ):
+                            start, end = min(start, first), max(end, last)
+                            del excerpts[previous]
+                    record.update(start_line=start, content="".join(lines[start - 1 : end]))
+                    key = (request.path, start, max(0, end - start + 1))
                 excerpts.pop(key, None)
                 excerpts[key] = record
         raise CodexError("PROJECT_READ_LIMIT", before_launch=True)

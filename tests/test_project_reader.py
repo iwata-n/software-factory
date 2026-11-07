@@ -116,12 +116,11 @@ def test_large_excerpt_returns_bounded_error_and_can_retry_fewer_lines():
     assert engine.contexts[2]["project_file_excerpts"][-1]["content"] == "small\n"
 
 
-def test_read_loop_has_call_limit_and_records_all_measured_calls():
-    engine = Engine([request(read("src/a"))] * 16)
-    with pytest.raises(CodexError, match="PROJECT_READ_LIMIT") as failure:
-        execute(engine, {"src/a": ("100644", b"content")})
-    assert len(failure.value.calls) == 16
-    assert failure.value.usage.input_tokens == 160
+def test_read_budget_requires_final_result_and_records_all_measured_calls():
+    engine = Engine([request(read("src/a"))] * 15 + [{"answer": "Source inspected"}])
+    result = execute(engine, {"src/a": ("100644", b"content")})
+    assert result.value == {"answer": "Source inspected"}
+    assert len(result.calls) == 16 and result.usage.input_tokens == 160
 
 
 def test_unknown_later_usage_does_not_become_final_known_usage():
@@ -207,3 +206,11 @@ def test_search_respects_read_scope_and_never_follows_links():
         roots=["docs"],
     )
     assert engine.contexts[1]["project_search_results"][0]["matches"] == []
+
+
+def test_overlapping_reads_are_merged_without_duplicate_source_context():
+    engine = Engine([request(read("src/a", 1, 3)), request(read("src/a", 2, 3)), FINISH])
+    execute(engine, {"src/a": ("100644", b"one\ntwo\nthree\nfour\nfive\n")})
+    excerpts = engine.contexts[2]["project_file_excerpts"]
+    assert len(excerpts) == 1 and excerpts[0]["start_line"] == 1
+    assert excerpts[0]["content"] == "one\ntwo\nthree\nfour\n"

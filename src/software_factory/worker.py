@@ -168,6 +168,26 @@ class Supervisor:
             next_heartbeat = time.monotonic() + self.heartbeat_interval
             pending_heartbeat = None
             buffered_events = []
+            streamed_events, pending_events, next_events = 0, None, 0.0
+
+            def stream_events(batch, count):
+                future = Future()
+
+                def send():
+                    try:
+                        reply = self.client.post(
+                            lease_path + "/events",
+                            json={"fence": lease["fence"], "events": batch},
+                            timeout=2,
+                        )
+                        reply.raise_for_status()
+                        future.set_result(count)
+                    except BaseException as error:
+                        future.set_exception(error)
+
+                Thread(target=send, daemon=True, name="factory-progress").start()
+                return future
+
             while preparation_error is None and (
                 (preparation is not None and not cancelled) or self.adapter.result() is None
             ):
@@ -227,6 +247,25 @@ class Supervisor:
                         started = True
                         self.adapter.start(job | {"source": source})
                 buffered_events.extend(self.adapter.events())
+                if pending_events is not None and pending_events.done():
+                    try:
+                        streamed_events = pending_events.result()
+                    except httpx.HTTPError:
+                        # Final delivery replays identical sequence numbers, including lost replies.
+                        pass
+                    pending_events, next_events = None, time.monotonic() + 1
+                if (
+                    pending_events is None
+                    and len(buffered_events) > streamed_events
+                    and now >= next_events
+                ):
+                    batch = [
+                        {**entry, "sequence": streamed_events + number + 1}
+                        for number, entry in enumerate(
+                            buffered_events[streamed_events : streamed_events + 100]
+                        )
+                    ]
+                    pending_events = stream_events(batch, streamed_events + len(batch))
                 if now >= next_heartbeat and pending_heartbeat is None:
                     pending_heartbeat = background_heartbeat()
                 time.sleep(min(0.1, max(0, stop_at - time.monotonic())))

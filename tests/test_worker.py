@@ -1,4 +1,5 @@
 import json
+from threading import Event
 
 import httpx
 import pytest
@@ -17,6 +18,50 @@ def assignment():
         },
         "lease": {"id": "lease", "fence": 1, "expires_in_seconds": 90},
     }
+
+
+def test_progress_is_delivered_before_agent_finishes_and_final_replay_is_identical():
+    seen = Event()
+    batches = []
+
+    class ProgressAgent:
+        capabilities = Capabilities()
+        sent = False
+
+        def start(self, job):
+            pass
+
+        def events(self):
+            if self.sent:
+                return []
+            self.sent = True
+            return [{"kind": "PROGRESS", "body": {"message": "Reading project source"}}]
+
+        def result(self):
+            return AgentResult("EXECUTED", {}) if seen.is_set() else None
+
+        def cancel(self):
+            pass
+
+    def handler(request):
+        if request.url.path.endswith("claims"):
+            return httpx.Response(200, json=assignment())
+        if request.url.path.endswith("heartbeat"):
+            return httpx.Response(
+                200, json={"cancel_requested": False, "lease_expires_in_seconds": 2}
+            )
+        if request.url.path.endswith("events"):
+            batches.append(json.loads(request.content))
+            seen.set()
+            return httpx.Response(200, json={"accepted": []})
+        assert request.url.path.endswith("complete") and seen.is_set()
+        return httpx.Response(200, json={"accepted": True})
+
+    with httpx.Client(
+        base_url="http://localhost", transport=httpx.MockTransport(handler)
+    ) as client:
+        assert Supervisor(client, ProgressAgent()).run_once()["accepted"]
+    assert len(batches) == 2 and batches[0] == batches[1]
 
 
 def test_worker_retries_lost_response_with_identical_key_and_body():
