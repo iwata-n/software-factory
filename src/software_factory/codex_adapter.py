@@ -21,7 +21,7 @@ from .contracts import FindingLocation, Name, Plan, digest, path_within, safe_pa
 from .metering import price_call
 from .project_reader import run_project_model
 from .sandbox import STOP_UNCONFIRMED, RunnerError
-from .security import SECRETS
+from .security import SECRETS, redact
 
 
 class ModelOutput(BaseModel):
@@ -232,6 +232,7 @@ def make_patch(changes, files, policy, plan, acceptance_ids):
     if "." not in policy["allowed_write_paths"]:
         protected += [".github", "migrations", "auth", "billing", "src/auth", "src/billing"]
     planned = [path for unit in plan["units"] for path in unit["proposed_write_paths"]]
+    project_scope = "." in policy["allowed_write_paths"] and not policy.get("require_plan_approval")
     links = [path for path, (mode, _) in files.items() if mode == "120000"]
     for change in changes.changes:
         path = change.path
@@ -242,7 +243,7 @@ def make_patch(changes, files, policy, plan, acceptance_ids):
             or any(part.lower() == ".git" for part in path.split("/"))
             or any(path_within(path, link) for link in links)
             or not any(path_within(path, root) for root in policy["allowed_write_paths"])
-            or not any(path_within(path, root) for root in planned)
+            or (not project_scope and not any(path_within(path, root) for root in planned))
             or any(path_within(path, root) for root in protected)
             or (
                 "." not in policy["allowed_write_paths"]
@@ -257,7 +258,21 @@ def make_patch(changes, files, policy, plan, acceptance_ids):
                 }
             )
         ):
-            raise CodexError("MODEL_CHANGE_PATH_DENIED", "POLICY")
+            raise CodexError(
+                "MODEL_CHANGE_PATH_DENIED",
+                "POLICY",
+                details={
+                    "path": path,
+                    "duplicate_path": path in paths,
+                    "outside_project": not any(
+                        path_within(path, root) for root in policy["allowed_write_paths"]
+                    ),
+                    "outside_approved_plan": not project_scope
+                    and not any(path_within(path, root) for root in planned),
+                    "protected_path": any(path_within(path, root) for root in protected),
+                    "symlink_path": any(path_within(path, link) for link in links),
+                },
+            )
         paths.add(path)
         old = files[path][1].decode("utf-8") if path in files else ""
         new = change.content
@@ -267,7 +282,14 @@ def make_patch(changes, files, policy, plan, acceptance_ids):
             new = old
             for edit in change.edits:
                 if new.count(edit.old_text) != 1:
-                    raise CodexError("MODEL_EDIT_ANCHOR_MISMATCH", "INCONCLUSIVE")
+                    raise CodexError(
+                        "MODEL_EDIT_ANCHOR_MISMATCH",
+                        "INCONCLUSIVE",
+                        details={
+                            "path": path,
+                            "anchor_matches": new.count(edit.old_text),
+                        },
+                    )
                 new = new.replace(edit.old_text, edit.new_text, 1)
         if new is None and path not in files:
             raise CodexError("MODEL_DELETE_MISSING_PATH", "POLICY")
@@ -431,6 +453,17 @@ class CodexAdapter:
                 usage_deliveries=receipts,
             )
         except CodexError as error:
+            if error.details:
+                with self._lock:
+                    self._events.append(
+                        {
+                            "kind": "LOG",
+                            "body": {
+                                "message": error.code,
+                                "details": redact(error.details),
+                            },
+                        }
+                    )
             if error.usage is not None:
                 receipts = delivery(job["snapshot"], error, job["attempt_id"])
             elif not called or error.before_launch:

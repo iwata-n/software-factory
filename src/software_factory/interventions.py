@@ -211,6 +211,37 @@ class InterventionCommands:
                     raise DomainError(409, "RESUME_JOB_MISSING")
                 run.status, run.stop_reason, run.wait_context = "QUEUED", None, None
                 reevaluation = {"cost_state": run.cost_state, "job_id": job.id if job else None}
+        elif cause in {
+            "POLICY: SENSITIVE_MODEL_INPUT",
+            "POLICY: MODEL_CHANGE_PATH_DENIED",
+            "INCONCLUSIVE: MODEL_EDIT_ANCHOR_MISMATCH",
+            "INCONCLUSIVE: PROJECT_READ_LIMIT",
+        }:
+            if run.phase not in {"PLAN", "IMPLEMENT", "REPAIR"}:
+                raise DomainError(409, "RESUME_PHASE_NOT_ALLOWED")
+            job = session.scalar(
+                select(Job)
+                .where(
+                    Job.workspace_id == run.workspace_id,
+                    Job.run_id == run.id,
+                    Job.kind == run.phase,
+                    Job.state.in_(["FAILED", "BLOCKED"]),
+                )
+                .order_by(Job.created_at.desc(), Job.id.desc())
+                .limit(1)
+            )
+            if job is None:
+                raise DomainError(409, "RESUME_JOB_MISSING")
+            if job.attempt_no >= run.snapshot["execution"]["max_infra_attempts_per_job"]:
+                raise DomainError(409, "INFRA_ATTEMPTS_EXHAUSTED")
+            if (
+                run.budget_microusd - run.spent_microusd
+                < run.snapshot["policy"]["job_reservation_microusd"]
+            ):
+                raise DomainError(409, "BUDGET_NOT_RESOLVED")
+            job.state, job.available_at = "RETRY_WAIT", db_now(session)
+            run.status, run.stop_reason, run.wait_context = "QUEUED", None, None
+            reevaluation = {"job_id": job.id, "cause": cause}
         elif cause in {"MANDATORY_EVIDENCE_MISSING", "EVIDENCE_TARGET_MISMATCH"}:
             if run.phase != "VERIFY_REVIEW":
                 raise DomainError(409, "RESUME_PHASE_NOT_ALLOWED")

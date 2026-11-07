@@ -330,6 +330,19 @@ def test_code_parameters_and_interpolation_are_not_mistaken_for_credentials(job)
         make_patch(denied, {}, job["snapshot"]["policy"], PLAN, ["AC-1"])
 
 
+def test_project_scope_allows_helpers_for_auto_plans_but_preserves_human_plan_scope(job):
+    policy = job["snapshot"]["policy"] | {"allowed_write_paths": ["."]}
+    changes = ChangeSet(
+        summary="Add helper",
+        acceptance_ids=["AC-1"],
+        changes=[{"path": "src/helper.py", "content": "value = 1\n"}],
+    )
+    assert b"+++ b/src/helper.py" in make_patch(changes, {}, policy, PLAN, ["AC-1"])
+    with pytest.raises(CodexError, match="MODEL_CHANGE_PATH_DENIED") as failure:
+        make_patch(changes, {}, policy | {"require_plan_approval": True}, PLAN, ["AC-1"])
+    assert failure.value.details["path"] == "src/helper.py"
+
+
 def test_missing_usage_is_unknown_and_schema_failure_preserves_measured_usage(job):
     missing = execute(Engine(failure=CodexError("CODEX_EVENT_SCHEMA_INVALID")), job)
     assert missing.usage_microusd is None and missing.usage_deliveries == ()

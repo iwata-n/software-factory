@@ -106,12 +106,14 @@ class CodexError(Exception):
         thread_id=None,
         before_launch=False,
         calls=(),
+        details=None,
     ):
         super().__init__(code)
         self.code, self.category = code, category
         self.usage, self.thread_id = usage, thread_id
         self.before_launch = before_launch
         self.calls = tuple(calls)
+        self.details = details or {}
 
 
 @dataclass(frozen=True)
