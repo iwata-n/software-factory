@@ -12,7 +12,19 @@ from .codex_engine import sensitive_input
 from .contracts import Contract
 from .db import db_now
 from .metering import price_call
-from .models import Attempt, PlanVersion, Run, SpecVersion, Task, TaskChatTurn, Worker, Workspace
+from .models import (
+    Attempt,
+    PlanVersion,
+    Repository,
+    Run,
+    SpecVersion,
+    Task,
+    TaskChatTurn,
+    Worker,
+    Workspace,
+)
+from .project_reader import aggregate_usage
+from .resolver import ReferenceNotFound, ResolutionUnavailable
 from .security import redact
 from .service import DomainError, owned
 from .task_chat_worker import CHAT_TIMEOUT, InterviewReply, TaskAnswerOptions, TaskChatOutcome
@@ -411,7 +423,10 @@ def task_chat_router(service, token_type, key_type, workspace):
                 turn.status, turn.error = "FAILED", "ATTENTION_SURFACE_STALE"
                 return Response(status_code=204)
             turn.status, turn.worker_id = "RUNNING", actor.id
-            turn.deadline_at = now + CHAT_TIMEOUT + 45
+            project_source = bool(
+                run.snapshot.get("source") and "allowed_read_paths" in run.snapshot["policy"]
+            )
+            turn.deadline_at = now + CHAT_TIMEOUT + (180 if project_source else 45)
             response.headers["Cache-Control"] = "no-store"
             return {
                 "id": turn.id,
@@ -420,8 +435,63 @@ def task_chat_router(service, token_type, key_type, workspace):
                 ],
                 "answer_options": turn.plan_id is not None and not turn.interview,
                 "interview": turn.interview is not None,
+                "project_source": (
+                    {
+                        "read_paths": run.snapshot["policy"]["allowed_read_paths"],
+                        "write_paths": run.snapshot["policy"]["allowed_write_paths"],
+                    }
+                    if project_source
+                    else None
+                ),
                 "context": context(session, run, turn, plan),
             }
+
+    @router.get("/v1/worker/task-chat/{identifier}/source")
+    def project_source(identifier: UUID, token: token_type, response: Response):
+        def authorized(session):
+            actor = worker(session, token)
+            turn = owned(session, TaskChatTurn, str(identifier), actor.workspace_id)
+            run = owned(session, Run, turn.run_id, actor.workspace_id)
+            if turn.worker_id != actor.id:
+                raise DomainError(404, "NOT_FOUND")
+            if turn.status != "RUNNING" or turn.deadline_at <= db_now(session):
+                raise DomainError(409, "TASK_CHAT_STALE")
+            if (
+                session.get(Workspace, actor.workspace_id).execution_stopped
+                or not owned(session, Repository, run.repository_id, actor.workspace_id).active
+            ):
+                raise DomainError(409, "TASK_CHAT_UNAVAILABLE")
+            if not available(run) or "allowed_read_paths" not in run.snapshot["policy"]:
+                raise DomainError(409, "TASK_CHAT_UNAVAILABLE")
+            plan = latest_plan(session, run)
+            if turn.plan_id and (run.status != "BLOCKED" or not plan or plan.id != turn.plan_id):
+                raise DomainError(409, "ATTENTION_SURFACE_STALE")
+            if turn.interview and (
+                turn.interview["revision"] != run.state_revision
+                or turn.interview["spec_version"]
+                != owned(session, Task, run.task_id, actor.workspace_id).latest_spec_version
+            ):
+                raise DomainError(409, "ATTENTION_SURFACE_STALE")
+            return run.snapshot.get("source"), run.base_sha
+
+        with service.db.transaction() as session:
+            source, sha = authorized(session)
+        if not source or not hasattr(service.resolver, "fetch"):
+            raise DomainError(409, "PROJECT_SOURCE_UNAVAILABLE")
+        try:
+            result = service.resolver.fetch(source["remote_url"], sha)
+        except (ReferenceNotFound, ResolutionUnavailable):
+            raise DomainError(503, "PROJECT_SOURCE_UNAVAILABLE") from None
+        if result.get("sha") != sha or any(
+            source.get(name) and result.get(name) != source[name]
+            for name in ("tree", "source_digest", "image_digest")
+        ):
+            raise DomainError(409, "SOURCE_TARGET_MISMATCH")
+        with service.db.transaction() as session:
+            if authorized(session) != (source, sha):
+                raise DomainError(409, "TASK_CHAT_STALE")
+        response.headers["Cache-Control"] = "no-store"
+        return result
 
     @router.put("/v1/worker/task-chat/{identifier}", status_code=204)
     def complete(identifier: UUID, data: TaskChatOutcome, token: token_type):
@@ -435,10 +505,15 @@ def task_chat_router(service, token_type, key_type, workspace):
             if not timely and not expired:
                 return Response(status_code=204)
             run = owned(session, Run, turn.run_id, actor.workspace_id)
-            if data.usage and turn.usage is None:
+            if (data.usage or data.calls) and turn.usage is None:
                 pricing = run.snapshot["policy"]["pricing_manifest"]
-                turn.usage = data.usage.model_dump() | {
-                    "estimated_microusd": price_call(pricing, data.usage)
+                measured = data.usage or aggregate_usage(data.calls)
+                turn.usage = measured.model_dump() | {
+                    "estimated_microusd": sum(price_call(pricing, call) for call in data.calls)
+                    if data.calls
+                    else price_call(pricing, measured),
+                    "calls": [call.model_dump() for call in data.calls],
+                    "complete": data.usage is not None,
                 }
             if not timely:
                 turn.status, turn.error = "FAILED", "CHAT_TIMEOUT"

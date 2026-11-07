@@ -165,6 +165,51 @@ def test_implementation_produces_real_patch_without_executing_generated_code(job
     )
 
 
+@pytest.mark.parametrize("role", ["PLAN", "IMPLEMENT"])
+def test_adapter_reads_project_source_then_returns_plan_or_patch(job, role):
+    job["kind"] = role
+    job["snapshot"]["policy"].update(allowed_read_paths=["."], allowed_write_paths=["."])
+
+    class ProjectEngine(Engine):
+        def run(self, context, schema, cancelled, **kwargs):
+            self.calls.append(context)
+            if len(self.calls) == 1:
+                assert {item["path"] for item in context["project_file_index"]} == {
+                    "src/example.py",
+                    "checks/golden.py",
+                }
+                output = {
+                    "read_requests": [
+                        {"path": "src/example.py", "start_line": 1, "line_count": 10}
+                    ],
+                    "result": None,
+                }
+            else:
+                assert context["project_file_excerpts"][0]["content"] == "value = 1\n"
+                output = {"read_requests": [], "result": PLAN if role == "PLAN" else CHANGES}
+            schema.model_validate(output)
+            return CodexResponse(
+                output,
+                ModelCallUsage(
+                    call_id=f"call-{len(self.calls)}",
+                    input_tokens=10,
+                    cached_input_tokens=2,
+                    output_tokens=3,
+                ),
+                "thread",
+            )
+
+    result = execute(ProjectEngine(), job)
+    assert result.outcome == "EXECUTED"
+    receipt = result.usage_deliveries[0]
+    assert receipt["total_microusd"] == 94 and len(receipt["calls"]) == 2
+    if role == "PLAN":
+        assert result.result == PLAN
+        assert all(artifact.kind != "PATCH" for artifact in result.artifacts)
+    else:
+        assert any(artifact.kind == "PATCH" for artifact in result.artifacts)
+
+
 @pytest.mark.parametrize("attack", ["policy", "manifest", "pricing", "source_digest", "sensitive"])
 @pytest.mark.ac("SF-20-AC05")
 def test_denied_or_invalid_context_never_calls_codex(job, attack, evidence):

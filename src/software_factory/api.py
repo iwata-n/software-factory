@@ -31,6 +31,7 @@ from .contracts import (
     Heartbeat,
     Intervention,
     ProjectCreate,
+    ProjectPolicyUpdate,
     PublicationBegin,
     PublicationReconcile,
     PublicationReport,
@@ -252,6 +253,20 @@ def create_app(
             key,
             data.model_dump(),
             command,
+            user_access="ADMIN",
+        )
+
+    @app.patch("/v1/projects/{project_id}/policy", tags=["Projects"])
+    def project_policy_update(
+        project_id: str, data: ProjectPolicyUpdate, token: Token, key: Key = None
+    ):
+        return service.write(
+            token,
+            "USER",
+            f"project-policy:{project_id}",
+            key,
+            data.model_dump(),
+            lambda session, actor: service.update_project_policy(session, actor, project_id, data),
             user_access="ADMIN",
         )
 

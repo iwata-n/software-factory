@@ -283,10 +283,13 @@ class BudgetRequest(Contract):
 
 class ProjectPolicy(Contract):
     version: Literal[1] = 1
-    allowed_write_paths: list[Name] = Field(min_length=1, max_length=100)
-    protected_paths: list[Name] = Field(
-        default_factory=lambda: [".github", "migrations", "auth", "billing"]
+    allowed_read_paths: list[Name] = Field(
+        default_factory=lambda: ["."], min_length=1, max_length=100
     )
+    allowed_write_paths: list[Name] = Field(
+        default_factory=lambda: ["."], min_length=1, max_length=100
+    )
+    protected_paths: list[Name] = Field(default_factory=list, max_length=100)
     symlink_paths: list[Name] = Field(default_factory=list, max_length=100)
     agent_configuration: dict[str, str] = Field(default_factory=lambda: {"version": "1"})
     verification: Verification
@@ -306,9 +309,9 @@ class ProjectPolicy(Contract):
     @model_validator(mode="after")
     def valid_paths_and_budget(self):
         if not all(
-            safe_path(path)
-            for path in self.allowed_write_paths + self.protected_paths + self.symlink_paths
-        ):
+            path == "." or safe_path(path)
+            for path in self.allowed_read_paths + self.allowed_write_paths
+        ) or not all(safe_path(path) for path in self.protected_paths + self.symlink_paths):
             raise ValueError("policy paths must be relative canonical paths without wildcards")
         if self.job_reservation_microusd > self.run_budget_microusd:
             raise ValueError("a job reservation must fit within the run budget")
@@ -346,7 +349,7 @@ class Plan(Contract):
 
 
 def path_within(path: str, root: str) -> bool:
-    return path == root or path.startswith(root + "/")
+    return safe_path(path) if root == "." else path == root or path.startswith(root + "/")
 
 
 def validate_plan(plan: Plan, spec: TaskSpec, policy: ProjectPolicy) -> str | None:
@@ -366,21 +369,28 @@ def validate_plan(plan: Plan, spec: TaskSpec, policy: ProjectPolicy) -> str | No
     for path in unit.proposed_write_paths:
         if any(path_within(path, root) for root in policy.symlink_paths):
             return "PLAN_SYMLINK_PATH"
-        if not safe_path(path) or not any(
-            path_within(path, root) for root in policy.allowed_write_paths
+        if (
+            not safe_path(path)
+            or any(part.lower() == ".git" for part in path.split("/"))
+            or not any(path_within(path, root) for root in policy.allowed_write_paths)
         ):
             return "PLAN_WRITE_PATH_DENIED"
         if any(
             path_within(path, root) or path_within(root, path)
             for root in policy.protected_paths
-            + [
-                ".github",
-                "migrations",
-                "auth",
-                "billing",
-                "src/auth",
-                "src/billing",
-            ]
+            + list(policy.protected_manifest)
+            + (
+                [
+                    ".github",
+                    "migrations",
+                    "auth",
+                    "billing",
+                    "src/auth",
+                    "src/billing",
+                ]
+                if "." not in policy.allowed_write_paths
+                else []
+            )
         ):
             return "PLAN_PROTECTED_PATH"
     return None
@@ -388,6 +398,11 @@ def validate_plan(plan: Plan, spec: TaskSpec, policy: ProjectPolicy) -> str | No
 
 class ProjectCreate(Contract):
     name: Name
+    policy: ProjectPolicy
+
+
+class ProjectPolicyUpdate(Contract):
+    expected_policy_hash: Annotated[str, Field(pattern=r"^[0-9a-f]{64}$")]
     policy: ProjectPolicy
 
 

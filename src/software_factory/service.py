@@ -16,6 +16,7 @@ from .contracts import (
     Fail,
     ProjectCreate,
     ProjectPolicy,
+    ProjectPolicyUpdate,
     RepositoryCreate,
     RunStart,
     TaskSpec,
@@ -536,6 +537,27 @@ class Service:
         if not set(policy.verification.required_checks).issubset(spec.verification.required_checks):
             raise DomainError(422, "REQUIRED_CHECK_REMOVAL")
 
+    def update_project_policy(self, session, actor, project_id: str, data: ProjectPolicyUpdate):
+        project = owned(session, Project, project_id, actor.workspace_id)
+        if digest(project.policy) != data.expected_policy_hash:
+            raise DomainError(409, "PROJECT_POLICY_STALE")
+        body = {"name": project.name, "policy": data.policy.model_dump()}
+        project.policy = scrub_project_body(body, request_secrets.get())["policy"]
+        session.add(
+            AuditEvent(
+                workspace_id=actor.workspace_id,
+                actor_id=actor.id,
+                operation="project.policy.update",
+                body={
+                    "project_id": project.id,
+                    "previous_hash": data.expected_policy_hash,
+                    "policy_hash": digest(project.policy),
+                },
+                created_at=db_now(session),
+            )
+        )
+        return {"project_id": project.id, "policy_hash": digest(project.policy)}
+
     def create_task(
         self,
         session: Session,
@@ -706,6 +728,8 @@ class Service:
             raise DomainError(403, "REPOSITORY_ACCESS_REVOKED")
         if not repo.remote_url and repo.base_ref != spec.task.base_ref:
             raise DomainError(422, "BASE_REF_NOT_REGISTERED")
+        project = owned(session, Project, task.project_id, actor.workspace_id)
+        policy = ProjectPolicy.model_validate(project.policy)
         if data.reuse_existing:
             existing = session.scalar(
                 select(Run)
@@ -714,6 +738,7 @@ class Service:
                     Run.task_id == task.id,
                     Run.spec_version == version.version,
                     Run.snapshot["workflow_type"].as_string() == data.strategy,
+                    Run.snapshot["policy_hash"].as_string() == digest(project.policy),
                     (Run.snapshot["clarification_only"].as_boolean().is_(True))
                     if data.clarification_only
                     else (Run.snapshot["clarification_only"].as_boolean().is_not(True)),
@@ -723,8 +748,6 @@ class Service:
             )
             if existing:
                 return run_view(existing)
-        project = owned(session, Project, task.project_id, actor.workspace_id)
-        policy = ProjectPolicy.model_validate(project.policy)
         base_sha = resolved_sha if resolved_sha is not None else repo.base_sha
         if not valid_sha(base_sha):
             raise DomainError(422, "INVALID_BASE_SHA")

@@ -1,5 +1,6 @@
 """Protocol and isolated Codex worker for task conversations."""
 
+import base64
 import json
 import time
 from threading import Event
@@ -8,8 +9,10 @@ from typing import Annotated, Literal
 import httpx
 from pydantic import Field, model_validator
 
+from .codex_adapter import archive_files
 from .codex_engine import CodexError
 from .contracts import Contract, Criterion, ModelCallUsage
+from .project_reader import aggregate_usage, run_project_model
 from .sandbox import STOP_UNCONFIRMED
 
 CHAT_TIMEOUT = 90
@@ -72,6 +75,7 @@ class TaskChatOutcome(Contract):
     answer: Annotated[str, Field(min_length=1, max_length=500000)] | None = None
     error: Literal["CODEX_AUTH_OR_POLICY", "CODEX_UNAVAILABLE", "CODEX_NO_USAGE"] | None = None
     usage: ModelCallUsage | None = None
+    calls: list[ModelCallUsage] = Field(default_factory=list, max_length=8)
 
     @model_validator(mode="after")
     def complete_outcome(self):
@@ -79,6 +83,15 @@ class TaskChatOutcome(Contract):
             self.answer is not None and self.usage is None
         ):
             raise ValueError("Chat outcome must include an answer and usage or an error")
+        if len({call.call_id for call in self.calls}) != len(self.calls):
+            raise ValueError("Model call IDs must be unique")
+        if self.calls and self.usage:
+            measured = aggregate_usage(self.calls)
+            if any(
+                getattr(measured, key) != getattr(self.usage, key)
+                for key in ("input_tokens", "cached_input_tokens", "output_tokens")
+            ):
+                raise ValueError("Combined usage must match the recorded model calls")
         return self
 
 
@@ -99,14 +112,37 @@ def claim_chat(client, engine):
                 schema = TaskAnswerOptions
             else:
                 schema = TaskChatReply
-            reply = engine.run(job["context"], schema, Event(), timeout=CHAT_TIMEOUT)
+            if job.get("project_source"):
+                source = (
+                    client.get(f"/v1/worker/task-chat/{job['id']}/source", timeout=120)
+                    .raise_for_status()
+                    .json()
+                )
+                files = archive_files(
+                    base64.b64decode(source["archive"], validate=True), source["source_digest"]
+                )
+                access = job["project_source"]
+                reply = run_project_model(
+                    engine,
+                    job["context"],
+                    schema,
+                    Event(),
+                    files=files,
+                    read_paths=access["read_paths"],
+                    write_paths=access["write_paths"],
+                    timeout=CHAT_TIMEOUT,
+                )
+            else:
+                reply = engine.run(job["context"], schema, Event(), timeout=CHAT_TIMEOUT)
             answer = (
                 reply.value["answer"]
                 if schema is TaskChatReply
                 else json.dumps(reply.value, ensure_ascii=False)
             )
             result = (
-                TaskChatOutcome(answer=answer, usage=reply.usage)
+                TaskChatOutcome(
+                    answer=answer, usage=reply.usage, calls=list(getattr(reply, "calls", ()))
+                )
                 if reply.usage is not None
                 else TaskChatOutcome(error="CODEX_NO_USAGE")
             )
@@ -115,7 +151,10 @@ def claim_chat(client, engine):
             result = TaskChatOutcome(
                 error="CODEX_AUTH_OR_POLICY" if error.category == "POLICY" else "CODEX_UNAVAILABLE",
                 usage=error.usage,
+                calls=list(error.calls),
             )
+        except (httpx.HTTPError, ValueError, KeyError):
+            result = TaskChatOutcome(error="CODEX_UNAVAILABLE")
     for attempt in range(3):
         try:
             client.put(

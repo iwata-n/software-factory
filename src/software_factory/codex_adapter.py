@@ -18,6 +18,7 @@ from .candidate_mount import readonly_tar
 from .codex_engine import CodexError, sensitive_input
 from .contracts import FindingLocation, Name, Plan, digest, path_within, safe_path
 from .metering import price_call
+from .project_reader import run_project_model
 from .sandbox import STOP_UNCONFIRMED, RunnerError
 from .security import redact
 
@@ -90,7 +91,9 @@ def archive_files(archive, expected_digest):
 
 def context_files(files, policy):
     selected = {}
-    roots = policy["allowed_write_paths"] + list(policy.get("protected_manifest", {}))
+    roots = policy.get("allowed_read_paths", policy["allowed_write_paths"]) + list(
+        policy.get("protected_manifest", {})
+    )
     for path, (mode, body) in files.items():
         if mode != "120000" and any(path_within(path, root) for root in roots):
             try:
@@ -123,16 +126,17 @@ def delivery(snapshot, response, attempt_id):
     if response.usage is None:
         return ()
     rates = snapshot["policy"]["pricing_manifest"]
+    calls = getattr(response, "calls", ()) or (response.usage,)
     return (
         {
             "provider": "codex_cli",
             "delivery_id": "codex-" + attempt_id,
             "sequence": 1,
-            "total_microusd": price_call(rates, response.usage),
+            "total_microusd": sum(price_call(rates, call) for call in calls),
             "currency": "USD",
             "final": True,
             "pricing_manifest_hash": digest(rates),
-            "calls": [response.usage.model_dump()],
+            "calls": [call.model_dump() for call in calls],
         },
     )
 
@@ -162,7 +166,7 @@ def model_context(job, files, policy):
         "task": job["snapshot"]["task_spec"]["task"],
         "allowed_write_paths": policy["allowed_write_paths"],
         "protected_paths": policy["protected_paths"] + list(policy.get("protected_manifest", {})),
-        "source_files": context_files(files, policy),
+        "source_files": {} if "allowed_read_paths" in policy else context_files(files, policy),
         "instructions": {
             "PLAN": "One unit covering every acceptance ID. Propose exact permitted file paths.",
             "IMPLEMENT": "Return full UTF-8 content for changed files only. Null deletes a file.",
@@ -192,7 +196,8 @@ def make_patch(changes, files, policy, plan, acceptance_ids):
         raise CodexError("MODEL_ACCEPTANCE_COVERAGE", "INCONCLUSIVE")
     paths, output = set(), []
     protected = policy["protected_paths"] + list(policy.get("protected_manifest", {}))
-    protected += [".github", "migrations", "auth", "billing", "src/auth", "src/billing"]
+    if "." not in policy["allowed_write_paths"]:
+        protected += [".github", "migrations", "auth", "billing", "src/auth", "src/billing"]
     planned = [path for unit in plan["units"] for path in unit["proposed_write_paths"]]
     links = [path for path, (mode, _) in files.items() if mode == "120000"]
     for change in changes.changes:
@@ -206,15 +211,18 @@ def make_patch(changes, files, policy, plan, acceptance_ids):
             or not any(path_within(path, root) for root in policy["allowed_write_paths"])
             or not any(path_within(path, root) for root in planned)
             or any(path_within(path, root) for root in protected)
-            or PurePosixPath(path).name
-            in {
-                "conftest.py",
-                "pytest.ini",
-                "pyproject.toml",
-                "tox.ini",
-                "setup.cfg",
-                ".coveragerc",
-            }
+            or (
+                "." not in policy["allowed_write_paths"]
+                and PurePosixPath(path).name
+                in {
+                    "conftest.py",
+                    "pytest.ini",
+                    "pyproject.toml",
+                    "tox.ini",
+                    "setup.cfg",
+                    ".coveragerc",
+                }
+            )
         ):
             raise CodexError("MODEL_CHANGE_PATH_DENIED", "POLICY")
         paths.add(path)
@@ -253,6 +261,7 @@ def audit(engine, response, role):
         "cached_input_count": response.usage.cached_input_tokens,
         "output_count": response.usage.output_tokens,
         "currency_basis": "budget_estimate",
+        "model_call_count": len(getattr(response, "calls", ()) or (response.usage,)),
         "token_basis": "cli_turn_total",
         "supports_resume": False,
         "startup_diagnostics": response.startup_diagnostics,
@@ -322,12 +331,21 @@ class CodexAdapter:
                 raise CodexError("SENSITIVE_MODEL_INPUT", "POLICY")
             schema = {"PLAN": Plan, "IMPLEMENT": ChangeSet, "REPAIR": RepairSet}[job["kind"]]
             called = True
-            response = self.engine.run(
-                context,
-                schema,
-                cancelled,
-                timeout=job["execution"]["timeout_seconds"],
-            )
+            if "allowed_read_paths" in policy:
+                response = run_project_model(
+                    self.engine,
+                    context,
+                    schema,
+                    cancelled,
+                    files=files,
+                    read_paths=policy["allowed_read_paths"],
+                    write_paths=policy["allowed_write_paths"],
+                    timeout=job["execution"]["timeout_seconds"],
+                )
+            else:
+                response = self.engine.run(
+                    context, schema, cancelled, timeout=job["execution"]["timeout_seconds"]
+                )
             receipts = delivery(snapshot, response, job["attempt_id"])
             record = audit(self.engine, response, job["kind"])
             log = ProducedArtifact("codex-log", "LOG", json.dumps(record).encode())
@@ -471,9 +489,21 @@ class CodexReviewer:
             if sensitive_input(prompt):
                 raise CodexError("SENSITIVE_MODEL_INPUT", "POLICY")
             called = True
-            response = self.engine.run(
-                prompt, ReviewSet, cancelled, timeout=job["execution"]["timeout_seconds"]
-            )
+            if "allowed_read_paths" in policy:
+                response = run_project_model(
+                    self.engine,
+                    prompt,
+                    ReviewSet,
+                    cancelled,
+                    files=files,
+                    read_paths=policy["allowed_read_paths"],
+                    write_paths=policy["allowed_write_paths"],
+                    timeout=job["execution"]["timeout_seconds"],
+                )
+            else:
+                response = self.engine.run(
+                    prompt, ReviewSet, cancelled, timeout=job["execution"]["timeout_seconds"]
+                )
             receipts = delivery(snapshot, response, job["attempt_id"])
             reviewed = ReviewSet.model_validate(response.value)
             required = {c["id"] for c in snapshot["task_spec"]["task"]["acceptance_criteria"]}
@@ -482,9 +512,25 @@ class CodexReviewer:
                 raise CodexError("CODEX_REVIEW_COVERAGE")
 
             def location(item):
-                if item.path not in prompt["source_files"]:
+                if "allowed_read_paths" in policy:
+                    source = files.get(item.path)
+                    if (
+                        not source
+                        or source[0] == "120000"
+                        or not any(
+                            path_within(item.path, root) for root in policy["allowed_read_paths"]
+                        )
+                    ):
+                        raise CodexError("CODEX_REVIEW_LOCATION_INVALID")
+                    try:
+                        lines = len(source[1].decode("utf-8").splitlines())
+                    except UnicodeError:
+                        raise CodexError("CODEX_REVIEW_LOCATION_INVALID") from None
+                elif item.path in prompt["source_files"]:
+                    lines = len(prompt["source_files"][item.path].splitlines())
+                else:
                     raise CodexError("CODEX_REVIEW_LOCATION_INVALID")
-                if item.end_line > max(1, len(prompt["source_files"][item.path].splitlines())):
+                if item.end_line > max(1, lines):
                     raise CodexError("CODEX_REVIEW_LOCATION_INVALID")
                 return item.model_dump()
 

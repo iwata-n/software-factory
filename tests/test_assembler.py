@@ -4,6 +4,7 @@ import io
 import os
 import subprocess
 import tarfile
+from pathlib import Path
 
 import pytest
 
@@ -85,6 +86,77 @@ def test_real_assembler_exact_content_parent_reproducibility_and_isolation(sourc
     assert actual["user"] == "65532:65532" and actual["mounts"] == []
     assert actual["cap_drop"] == ["ALL"] and "no-new-privileges" in actual["security_opt"]
     assert actual["image"] == runner.image_digest
+
+
+def test_whole_project_assembler_accepts_code_and_config_but_keeps_explicit_protections(
+    source_bundle, runner
+):
+    patch = PATCH + b"--- /dev/null\n+++ b/pyproject.toml\n@@ -0,0 +1 @@\n+[project]\n"
+    policy = request(source_bundle, patch) | {"allowed_write_paths": ["."]}
+    result = runner.execute(policy)
+    assert result.body["changed_paths"] == ["pyproject.toml", "src/example.py"]
+    # This explicit protected file remains immutable even with root write access.
+    protected = (
+        b"--- a/checks/golden.py\n+++ b/checks/golden.py\n@@ -1 +1 @@\n"
+        b"-# immutable required check\n+# disabled\n"
+    )
+    with pytest.raises(RunnerError) as failure:
+        runner.execute(policy | {"patch": base64.b64encode(protected).decode()})
+    assert failure.value.category == "POLICY"
+    for path in [".git/config", "../../outside"]:
+        attack = (f"--- /dev/null\n+++ b/{path}\n@@ -0,0 +1 @@\n+bad\n").encode()
+        with pytest.raises(RunnerError):
+            runner.execute(policy | {"patch": base64.b64encode(attack).decode()})
+
+
+@pytest.mark.parametrize(
+    "path,content,passes",
+    [
+        ("ui/added.js", "export const value = 2;", True),
+        ("pytest.py", "raise RuntimeError('candidate must not replace trusted pytest')", True),
+        ("src/added.py", "def broken(:", False),
+        ("ui/added.js", "export const = ;", False),
+    ],
+)
+def test_self_host_verifier_checks_python_and_javascript_syntax(
+    source_bundle, runner, monkeypatch, path, content, passes
+):
+    monkeypatch.syspath_prepend(str(Path(__file__).resolve().parents[1] / "scripts"))
+    from serve_self_host import CHECK_ARGV
+
+    patch = (f"--- /dev/null\n+++ b/{path}\n@@ -0,0 +1 @@\n+{content}\n").encode()
+    assembled = runner.execute(request(source_bundle, patch) | {"allowed_write_paths": ["."]}).body
+    candidate = {
+        "head_sha": assembled["head_sha"],
+        "tree_sha": assembled["tree"],
+        "source_digest": assembled["source_digest"],
+        "metadata_body": {
+            "file_manifest": assembled["file_manifest"],
+            "commit_object": assembled["commit_object"],
+        },
+    }
+    result = runner.execute_candidate(
+        {
+            "operation": "verify",
+            "candidate": candidate,
+            "profile": {
+                "commands": [
+                    {
+                        "check_id": "project_syntax",
+                        "argv": CHECK_ARGV,
+                        "junit_path": ".factory/project.xml",
+                        "timeout_seconds": 30,
+                    }
+                ],
+            },
+        },
+        base64.b64decode(assembled["archive"]),
+    )
+    check = result.body["checks"][0]
+    assert check["execution_state"] == "EXECUTED"
+    assert (check["exit_code"] == 0) is passes
+    assert check["junit"]
+    assert result.body["source_digest"] == assembled["source_digest"]
 
 
 @pytest.mark.parametrize(

@@ -286,8 +286,11 @@ def assemble(data):
     ]
     protected = data["protected_paths"] + list(data.get("protected_manifest", {}))
     baseline = [".github", "migrations", "auth", "billing", "src/auth", "src/billing"]
+    whole_project = "." in data["allowed_write_paths"]
+    if whole_project:
+        baseline = []
     for path in paths:
-        if path.rsplit("/", 1)[-1] in {
+        if not whole_project and path.rsplit("/", 1)[-1] in {
             "conftest.py",
             "pytest.ini",
             "tox.ini",
@@ -299,7 +302,8 @@ def assemble(data):
         if any(path == root or path.startswith(root + "/") for root in protected + baseline):
             raise Refused("PROTECTED_VERIFICATION_CHANGE")
         if not canonical_path(path) or not any(
-            path == root or path.startswith(root + "/") for root in data["allowed_write_paths"]
+            root == "." or path == root or path.startswith(root + "/")
+            for root in data["allowed_write_paths"]
         ):
             raise Refused("POLICY_DENIED")
     tree = git("write-tree").decode().strip()

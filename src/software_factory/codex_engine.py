@@ -98,12 +98,20 @@ class EngineManifest(BaseModel):
 
 class CodexError(Exception):
     def __init__(
-        self, code, category="INCONCLUSIVE", *, usage=None, thread_id=None, before_launch=False
+        self,
+        code,
+        category="INCONCLUSIVE",
+        *,
+        usage=None,
+        thread_id=None,
+        before_launch=False,
+        calls=(),
     ):
         super().__init__(code)
         self.code, self.category = code, category
         self.usage, self.thread_id = usage, thread_id
         self.before_launch = before_launch
+        self.calls = tuple(calls)
 
 
 @dataclass(frozen=True)
@@ -112,6 +120,7 @@ class CodexResponse:
     usage: ModelCallUsage
     thread_id: str
     startup_diagnostics: int = 0
+    calls: tuple[ModelCallUsage, ...] = ()
 
 
 def file_hash(path):

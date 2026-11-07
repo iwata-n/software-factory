@@ -1,6 +1,7 @@
 """Run a loopback Software Factory workspace against its GitHub repository."""
 
 import argparse
+import base64
 import json
 import os
 import secrets
@@ -21,21 +22,31 @@ from software_factory.codex_engine import CodexCLI
 
 ROOT = Path(__file__).resolve().parents[1]
 REMOTE = "https://github.com/iwata-n/software-factory.git"
-TARGET = "docs/Operations_Recovery_Runbook.md"
-CHECK = "runbook_smoke"
+CHECK = "project_syntax"
 # The verifier is supplied by the operator policy, outside the candidate tree.
 TEST = (
     "from pathlib import Path\n"
-    "def test_runbook():\n"
-    "    text=Path('/candidate/docs/Operations_Recovery_Runbook.md').read_text()\n"
-    "    assert all(x in text for x in "
-    "('## 1. 停止と失効', '## 2. 復元と公開照合', '## 演習記録'))\n"
+    "import subprocess\n"
+    "def test_project():\n"
+    "    root = Path('/candidate')\n"
+    "    sources = sorted(root.rglob('*.py'))\n"
+    "    assert sources, 'Python source files are missing'\n"
+    "    for path in sources:\n"
+    "        compile(path.read_text(encoding='utf-8'), str(path), 'exec')\n"
+    "    for path in sorted(root.rglob('*.js')):\n"
+    "        subprocess.run(['node', '--input-type=module', '--check'], "
+    "input=path.read_bytes(), check=True, capture_output=True)\n"
 )
 PYTEST = (
-    "import sys,pathlib,pytest; p=pathlib.Path('test_runbook.py'); "
-    "p.write_text(sys.argv[1]); raise SystemExit(pytest.main([str(p), "
-    "'--junitxml=.factory/runbook.xml','-q','-p','no:cacheprovider']))"
+    "import sys,base64,pytest;open('test_project.py','wb').write("
+    "base64.b64decode(''.join(sys.argv[1:])));"
+    "sys.exit(pytest.main(['test_project.py','--junitxml=.factory/project.xml','-q']))"
 )
+_TEST_ENCODED = base64.b64encode(TEST.encode()).decode()
+# Command arguments are capped at 200 characters by the policy contract.
+CHECK_ARGV = ["python", "-I", "-c", PYTEST] + [
+    _TEST_ENCODED[start : start + 200] for start in range(0, len(_TEST_ENCODED), 200)
+]
 
 
 def start(stack, output, name, module, env, *args):
@@ -153,17 +164,19 @@ def main():
             "allow_external_model": True,
             "agent_configuration": {"version": "1", "engine_manifest_hash": engine.manifest_hash},
             "pricing_manifest": pricing,
-            "allowed_write_paths": [TARGET],
+            "allowed_read_paths": ["."],
+            "allowed_write_paths": ["."],
+            "protected_paths": [],
             "verification": {
-                "profile_id": "self-host-runbook",
+                "profile_id": "self-host-project",
                 "required_checks": [CHECK, "review"],
             },
             "verification_commands": [
                 {
                     "check_id": CHECK,
-                    "argv": ["python", "-c", PYTEST, TEST],
-                    "expected_test_ids": ["test_runbook::test_runbook"],
-                    "junit_path": ".factory/runbook.xml",
+                    "argv": CHECK_ARGV,
+                    "expected_test_ids": ["test_project::test_project"],
+                    "junit_path": ".factory/project.xml",
                     "timeout_seconds": 30,
                 }
             ],

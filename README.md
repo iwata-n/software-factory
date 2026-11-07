@@ -102,9 +102,22 @@ Tailscale URL）、`user_token`（専用の操作者トークン）、`expires_a
 ## Software Factory 自身の改善を試す
 
 `scripts/serve_self_host.py` は一時 PostgreSQL に Software Factory 専用 Workspace を作り、
-`iwata-n/software-factory` の指定ブランチをコミット SHA で固定します。変更できるのは
-`docs/Operations_Recovery_Runbook.md` です。既存の Codex CLI 認証で PLAN、IMPLEMENT、
-REVIEW を実行し、候補とは別に定義したテストで復旧手順書の主要な節が残っていることを確認します。
+`iwata-n/software-factory` の指定ブランチをコミット SHA で固定します。
+詳細化ではプロジェクト内のファイルを読み取り専用で参照し、実行ではコード・テスト・設定を
+含むプロジェクト全体を編集対象にします。既存の Codex CLI 認証で PLAN、IMPLEMENT、
+REVIEW を実行し、候補とは別に定義した検証で Python と JavaScript の構文を確認します。
+構文検証とAIレビューだけで機能全体の動作を保証するものではありません。
+
+ProjectPolicy の `allowed_read_paths` と `allowed_write_paths` は、どちらも既定値が `["."]`
+（プロジェクト全体）です。明示した `protected_paths` と `protected_manifest` は引き続き優先します。
+Git管理情報、プロジェクト外へのパス、シンボリックリンク経由の変更は許可しません。
+詳細化の対話は固定したソースのファイル一覧と必要な行を取得し、ファイル編集やコマンド実行を行いません。
+対象は指定コミットのGit管理下ファイルであり、端末の未コミット変更やGit管理外ファイルは含みません。
+
+既存プロジェクトの明示的な編集許可範囲は自動で広げません。管理者は
+`PATCH /v1/projects/{project_id}/policy` に現在の `expected_policy_hash` と更新後の `policy` を
+指定できます。既存Runの権限は固定されるため、設定変更後はタスク詳細の
+「現在の設定で詳細化をやり直す」から新しい設定を適用してください。履歴は保存されます。
 
 固定した Linux Codex バイナリと、対応する隔離 Runner の manifest を用意して起動します。
 

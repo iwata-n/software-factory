@@ -73,7 +73,7 @@ class FakeAgent:
                         "acceptance_ids": [c["id"] for c in spec["task"]["acceptance_criteria"]],
                         "depends_on": [],
                         "proposed_write_paths": [
-                            root + "/fake_change.py"
+                            "fake_change.py" if root == "." else root + "/fake_change.py"
                             for root in job["snapshot"]["policy"]["allowed_write_paths"]
                         ],
                     }

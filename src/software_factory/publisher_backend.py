@@ -213,18 +213,24 @@ class GitObjectPublisher:
             protected = target["policy"]["protected_paths"] + list(
                 target["policy"].get("protected_manifest", {})
             )
-            protected += [".github", "migrations", "auth", "billing", "src/auth", "src/billing"]
+            whole_project = "." in target["policy"]["allowed_write_paths"]
+            if not whole_project:
+                protected += [".github", "migrations", "auth", "billing", "src/auth", "src/billing"]
             for name in filter(None, changed):
                 if (
-                    name.rsplit("/", 1)[-1]
-                    in {
-                        "conftest.py",
-                        "pytest.ini",
-                        "tox.ini",
-                        "setup.cfg",
-                        "pyproject.toml",
-                        ".coveragerc",
-                    }
+                    (
+                        not whole_project
+                        and name.rsplit("/", 1)[-1]
+                        in {
+                            "conftest.py",
+                            "pytest.ini",
+                            "tox.ini",
+                            "setup.cfg",
+                            "pyproject.toml",
+                            ".coveragerc",
+                        }
+                    )
+                    or any(part.lower() == ".git" for part in name.split("/"))
                     or any(path_within(name, path) for path in protected)
                     or not any(
                         path_within(name, path) for path in target["policy"]["allowed_write_paths"]

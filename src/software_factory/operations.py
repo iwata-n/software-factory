@@ -11,7 +11,7 @@ from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from sqlalchemy import func, select, tuple_
 from starlette.concurrency import run_in_threadpool
 
-from .contracts import ProjectPolicy
+from .contracts import ProjectPolicy, digest
 from .db import db_now
 from .models import Attempt, Principal, Project, Repository, Run, RunEvent, Task, Worker
 from .service import DomainError, owned
@@ -159,6 +159,8 @@ def operations_router(service, token_type):
                         "name": project.name,
                         "verification": policy.verification.model_dump(),
                         "allowed_write_paths": policy.allowed_write_paths,
+                        "allowed_read_paths": policy.allowed_read_paths,
+                        "policy_hash": digest(project.policy),
                         "repositories": [],
                     }
                 projects[project.id]["repositories"].append(

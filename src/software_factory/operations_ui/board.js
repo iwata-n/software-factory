@@ -436,6 +436,10 @@ function fields(rows) {
   return list;
 }
 
+function scopeLabel(paths) {
+  return paths?.includes(".") ? "プロジェクト全体" : paths?.join("、") || "未設定";
+}
+
 function section(title, ...children) {
   const node = element("section", undefined, "detail-section");
   node.append(element("h3", title), ...children);
@@ -1010,15 +1014,28 @@ async function blockedRunView(root, run, signal, task) {
   const repositoryId = task.value?.spec_versions.at(-1)?.body.task.repository_id;
   const project = targets.value?.projects.find(({repositories}) =>
     repositories.some(({id}) => id === repositoryId));
-  if (project?.allowed_write_paths?.length) {
-    panel.append(foldSection(section("変更できる範囲",
-      element("p", project.allowed_write_paths.join("、")))));
-  }
+  const policy = run.snapshot.policy;
+  panel.append(foldSection(section("ファイルの参照・編集範囲", fields([
+    ["詳細化中の参照", `${scopeLabel(policy.allowed_read_paths ?? policy.allowed_write_paths)}（読み取り専用）`],
+    ["実行時の編集", scopeLabel(policy.allowed_write_paths)],
+  ]))));
   if (!operator) {
     panel.append(element("p", "対応するには操作者または管理者の権限が必要です。"));
     return panel;
   }
   panel.append(status);
+  if (project && project.policy_hash !== run.snapshot.policy_hash) {
+    panel.append(element("p", "プロジェクトの設定が更新されています。現在の設定で詳細化を始め直せます。"));
+    const restartKey = taskKey();
+    panel.append(blockedForm("現在の設定で詳細化をやり直す", status, async () => {
+      const result = await postTask(`/v1/tasks/${encodeURIComponent(run.task_id)}/runs`,
+        JSON.stringify({spec_version: task.value.latest_spec_version, clarification_only: true, reuse_existing: true}), restartKey, signal);
+      if (signal.aborted) return;
+      selected = {...selected, run_id: result.run_id, task_status: undefined};
+      void loadBoard();
+      void loadDetail("現在のプロジェクト設定で詳細化を開始しました。");
+    }));
+  }
   const canCorrectSpec = ["PLAN", "WAIT_PLAN_APPROVAL"].includes(run.phase) ||
     run.stop_reason === "SPEC_CHANGE_REQUIRED";
   if (canCorrectSpec && !questions?.length) {
@@ -1744,7 +1761,7 @@ function updateTaskRepositories() {
   const project = selectedProject();
   taskOptions(get("task-repository"), project?.repositories ?? []);
   get("task-write-scope").textContent = project?.allowed_write_paths?.length
-    ? `変更を許可する範囲 · ${project.allowed_write_paths.join("、")}` : "";
+    ? `詳細化：${scopeLabel(project.allowed_read_paths)}を読み取り専用で参照 · 実行：${scopeLabel(project.allowed_write_paths)}を編集` : "";
 }
 
 get("task-project").addEventListener("change", updateTaskRepositories);
