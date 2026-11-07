@@ -28,6 +28,7 @@ from .resolver import ReferenceNotFound, ResolutionUnavailable
 from .security import redact
 from .service import DomainError, owned
 from .task_chat_worker import CHAT_TIMEOUT, InterviewReply, TaskAnswerOptions, TaskChatOutcome
+from .task_lifecycle import active_task, lock_run_task
 from .web_accounts import browser_write
 
 ACTIVE = ("QUEUED", "RUNNING")
@@ -267,6 +268,9 @@ def automatic_proposal(session, workspace):
         )
         .where(
             Run.workspace_id == workspace,
+            Run.task_id.in_(
+                select(Task.id).where(Task.workspace_id == workspace, Task.deleted_at.is_(None))
+            ),
             Run.status == "BLOCKED",
             Run.evidence_expired_at.is_(None),
             Run.snapshot["policy"]["agent_adapter"].as_string() == "codex_cli",
@@ -302,6 +306,7 @@ def automatic_proposal(session, workspace):
 
 
 def enqueue_turn(session, run, question, *, plan_id=None, interview=None):
+    lock_run_task(session, run)
     if session.get(Workspace, run.workspace_id).execution_stopped:
         raise DomainError(409, "WORKSPACE_EXECUTION_STOPPED")
     now = db_now(session)
@@ -352,6 +357,7 @@ def task_chat_router(service, token_type, key_type, workspace):
 
         def query(session, actor):
             run = owned(session, Run, run_id, actor.workspace_id)
+            active_task(session, run.task_id, actor.workspace_id)
             now = db_now(session)
             return {
                 "available": available(run),
@@ -368,6 +374,7 @@ def task_chat_router(service, token_type, key_type, workspace):
 
         def command(session, actor):
             run = owned(session, Run, run_id, actor.workspace_id)
+            lock_run_task(session, run)
             if not available(run):
                 raise DomainError(409, "TASK_CHAT_UNAVAILABLE")
             if sensitive_input(data.message):
@@ -400,6 +407,14 @@ def task_chat_router(service, token_type, key_type, workspace):
                 .where(
                     TaskChatTurn.workspace_id == actor.workspace_id,
                     TaskChatTurn.status == "QUEUED",
+                    TaskChatTurn.run_id.in_(
+                        select(Run.id)
+                        .join(
+                            Task,
+                            (Task.id == Run.task_id) & (Task.workspace_id == Run.workspace_id),
+                        )
+                        .where(Task.deleted_at.is_(None))
+                    ),
                 )
                 .order_by(TaskChatTurn.created_at, TaskChatTurn.id)
                 .limit(1)
@@ -409,6 +424,7 @@ def task_chat_router(service, token_type, key_type, workspace):
             if turn is None:
                 return Response(status_code=204)
             run = owned(session, Run, turn.run_id, actor.workspace_id)
+            lock_run_task(session, run)
             plan = latest_plan(session, run)
             if not available(run) or (
                 turn.plan_id and (run.status != "BLOCKED" or not plan or plan.id != turn.plan_id)
@@ -452,6 +468,7 @@ def task_chat_router(service, token_type, key_type, workspace):
             actor = worker(session, token)
             turn = owned(session, TaskChatTurn, str(identifier), actor.workspace_id)
             run = owned(session, Run, turn.run_id, actor.workspace_id)
+            lock_run_task(session, run)
             if turn.worker_id != actor.id:
                 raise DomainError(404, "NOT_FOUND")
             if turn.status != "RUNNING" or turn.deadline_at <= db_now(session):

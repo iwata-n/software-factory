@@ -4,8 +4,8 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Run カンバン | Software Factory</title>
-  <link rel="stylesheet" href="/operations/board.css?v=local-delivery">
-  <script type="module" src="/operations/board.js?v=local-delivery"></script>
+  <link rel="stylesheet" href="/operations/board.css?v=task-delete">
+  <script type="module" src="/operations/board.js?v=task-delete"></script>
 </head>
 <body>
   <header class="masthead">
@@ -148,6 +148,17 @@
     <p id="integration-status" role="status"></p>
     <div id="integration-providers"></div>
   </dialog>
+  <dialog id="delete-task-dialog" aria-labelledby="delete-task-heading"
+    aria-describedby="delete-task-description delete-task-warning">
+    <h2 id="delete-task-heading">タスクを削除</h2>
+    <p id="delete-task-description"></p>
+    <p id="delete-task-warning">削除は取り消せません。実行履歴と監査記録は保持されます。</p>
+    <p id="delete-task-status" role="status"></p>
+    <div class="delete-task-actions">
+      <button id="delete-task-cancel" type="button" autofocus>キャンセル</button>
+      <button id="delete-task-confirm" type="button">削除を確定</button>
+    </div>
+  </dialog>
   <dialog id="detail" closedby="any" aria-labelledby="detail-title">
     <div id="detail-resize" class="detail-resize" role="separator" tabindex="0"
       aria-orientation="vertical" aria-label="タスク詳細の幅" aria-controls="detail"
@@ -158,6 +169,7 @@
         <h2 id="detail-title">タスク詳細</h2>
       </div>
       <div class="dialog-actions">
+        <button id="delete-task" type="button" hidden>削除</button>
         <button id="reload-detail" class="detail-icon-button" type="button" aria-label="詳細を更新" title="詳細を更新">
           <svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M20 7v5h-5M4 17v-5h5M6.1 7a7 7 0 0 1 11.6-1L20 9M4 15l2.3 3A7 7 0 0 0 17.9 17"/></svg>
         </button>

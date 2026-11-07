@@ -345,6 +345,11 @@ details.detail-disclosure > summary { padding: 12px; font-size: .875rem; font-we
 .detail-resize:is(:hover, :focus-visible, :active)::before { background: var(--accent); }
 .detail-resize:focus-visible { outline-offset: -3px; }
 #reload-detail { color: var(--muted); }
+#delete-task, #delete-task-confirm { color: #9f3026; }
+#delete-task-dialog { max-width: min(30rem, calc(100vw - 28px)); }
+#delete-task-description { overflow-wrap: anywhere; white-space: pre-wrap; }
+.delete-task-actions { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 8px; }
+#delete-task-status:empty { display: none; }
 .detail-section { border-top: 1px solid var(--line); padding: 16px 0; }
 .attention-section { border-top: 0; padding-top: 0; }
 .attention-section > h4 { margin: 16px 0 6px; }

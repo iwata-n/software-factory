@@ -79,7 +79,7 @@ from .slack_delivery import NOTIFICATION, SlackClient, SlackDispatcher
 from .task_chat import task_chat_router
 from .task_lifecycle import run_stage, task_stage
 from .temporary_web_access import TemporaryWebAccess
-from .web_accounts import browser_token, web_accounts_router
+from .web_accounts import browser_token, browser_write, web_accounts_router
 
 security = HTTPBearer(auto_error=False)
 
@@ -292,6 +292,11 @@ def create_app(
             data.model_dump(),
             lambda s, a: service.create_task(s, a, project_id, data),
         )
+
+    @app.delete("/v1/tasks/{task_id}", tags=["Tasks"])
+    def task_delete(task_id: str, request: Request, token: Token):
+        browser_write(request)
+        return service.delete_task_request(token, task_id)
 
     @app.get("/v1/tasks/{task_id}", tags=["Tasks"])
     def task_get(task_id: str, token: Token):

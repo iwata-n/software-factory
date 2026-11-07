@@ -229,6 +229,10 @@ class PlanCommands:
         from .service import DomainError, event, owned, run_view, transition
 
         request = owned(session, ApprovalRequest, approval_id, actor.workspace_id)
+        run = owned(session, Run, request.run_id, actor.workspace_id)
+        from .task_lifecycle import lock_run_task
+
+        lock_run_task(session, run)
         if request.action == "approve_budget":
             return self.service.budgets.decide(session, actor, request, data)
         run = owned(session, Run, request.run_id, actor.workspace_id)
@@ -364,6 +368,9 @@ class PlanCommands:
         from .service import DomainError, owned, run_view, transition
 
         run = owned(session, Run, run_id, actor.workspace_id)
+        from .task_lifecycle import lock_run_task
+
+        lock_run_task(session, run)
         if run.state_revision != data.expected_run_revision:
             raise DomainError(409, "RUN_REVISION_CONFLICT")
         if run.status in TERMINAL or run.status == "CANCELLING":

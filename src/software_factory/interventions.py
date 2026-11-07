@@ -153,6 +153,9 @@ class InterventionCommands:
         from .service import DomainError, event, owned, run_view
 
         run = owned(session, Run, run_id, actor.workspace_id)
+        from .task_lifecycle import lock_run_task
+
+        lock_run_task(session, run)
         if run.state_revision != data.expected_run_revision:
             raise DomainError(409, "RUN_REVISION_CONFLICT")
         if run.status != "BLOCKED":

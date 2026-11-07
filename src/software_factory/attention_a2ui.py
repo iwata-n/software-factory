@@ -224,6 +224,7 @@ def attention_router(service, token_type, codex_workspace):
 
     def subject(session, actor, run_id):
         run = owned(session, Run, run_id, actor.workspace_id)
+        owned(session, Task, run.task_id, actor.workspace_id)
         plan = latest_plan(session, run) if run.status == "BLOCKED" else None
         return run, plan, plan_questions(plan)
 

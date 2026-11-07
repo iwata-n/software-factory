@@ -1,5 +1,26 @@
 """Task-facing stages, independent of the internal Run execution states."""
 
+from sqlalchemy import select
+
+from .models import Task
+
+
+def active_task(session, task_id, workspace_id, *, lock=False):
+    from .service import DomainError
+
+    statement = select(Task).where(Task.id == task_id, Task.workspace_id == workspace_id)
+    if lock:
+        # Mutation callers hold the existing Workspace mutex before taking this lock.
+        statement = statement.with_for_update().execution_options(populate_existing=True)
+    task = session.scalar(statement)
+    if task is None or task.deleted_at is not None:
+        raise DomainError(404, "NOT_FOUND")
+    return task
+
+
+def lock_run_task(session, run):
+    return active_task(session, run.task_id, run.workspace_id, lock=True)
+
 
 def run_stage(run):
     if run.status in {"SUCCEEDED", "CANCELLED"}:

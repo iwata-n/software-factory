@@ -118,7 +118,7 @@ def operations_router(service, token_type):
 
     @router.get("/operations/{asset}", include_in_schema=False)
     def operations_asset(asset: str):
-        if asset not in {"board.js", "board.css", "a2ui.js"}:
+        if asset not in {"board.js", "board.css", "a2ui.js", "task_deletion.js"}:
             return Response(status_code=404)
         return FileResponse(UI_DIR / asset, headers={"X-Content-Type-Options": "nosniff"})
 
@@ -225,7 +225,7 @@ def operations_router(service, token_type):
                 select(Task, Run)
                 .select_from(Task)
                 .outerjoin(Run, Run.id == latest_run)
-                .where(Task.workspace_id == actor.workspace_id)
+                .where(Task.workspace_id == actor.workspace_id, Task.deleted_at.is_(None))
             )
             if before:
                 anchor = owned(session, Task, before, actor.workspace_id)
@@ -289,7 +289,7 @@ def operations_router(service, token_type):
                     ),
                 )
                 .join(Task, (Task.id == Run.task_id) & (Task.workspace_id == Run.workspace_id))
-                .where(Run.workspace_id == actor.workspace_id)
+                .where(Run.workspace_id == actor.workspace_id, Task.deleted_at.is_(None))
             )
             if latest_per_task:
                 # Choose the latest Run before applying the page cursor, so older Runs

@@ -1,4 +1,5 @@
 import { renderAttention } from "./a2ui.js?v=spec-interview";
+import { installTaskDeletion } from "./task_deletion.js?v=task-delete";
 
 const get = (id) => document.getElementById(id);
 const lanes = new Map([
@@ -74,6 +75,23 @@ let selected;
 let executionContext;
 let executionRequest;
 let pendingExecution;
+const taskDeletion = installTaskDeletion({
+  get,
+  currentTask: () => detail.open && selected?.task_id ? selected : null,
+  canDelete: () => ["ADMIN", "OPERATOR"].includes(executionContext?.access),
+  request: (path, options) => fetch(path, {...options, headers: authHeaders()}),
+  onDeleted: (taskId) => {
+    boardRequest?.abort();
+    if (selected?.task_id === taskId) {
+      detailRequest?.abort();
+      selected = null;
+      detail.close();
+    }
+    runs = runs.filter((row) => row.task_id !== taskId);
+    renderBoard();
+    void loadBoard();
+  },
+});
 
 function element(tag, text, className) {
   const node = document.createElement(tag);
@@ -114,6 +132,7 @@ function disconnect(text = "接続を終了しました。", error = false) {
   executionRequest = undefined;
   executionButtons.forEach((id) => { get(id).disabled = false; });
   executionContext = undefined;
+  taskDeletion.reset();
   closeExecutionForm();
   closeTaskDialog();
   get("task-open").hidden = true;
@@ -220,6 +239,7 @@ function renderExecution(context) {
     closeExecutionForm();
   }
   executionContext = context;
+  taskDeletion.update();
   const panel = get("execution");
   panel.dataset.stopped = String(execution.stopped);
   panel.hidden = false;
@@ -1214,6 +1234,7 @@ function readyToExecute(run, task, signal) {
 }
 
 async function loadTaskDetail(notice = "") {
+  taskDeletion.update();
   detailRequest?.abort();
   detailRequest = new AbortController();
   const {signal} = detailRequest;
@@ -1275,6 +1296,8 @@ async function loadTaskDetail(notice = "") {
 }
 
 async function loadDetail(notice = "") {
+  if (!selected) return;
+  taskDeletion.update();
   if (!selected.run_id || selected.task_status === "DRAFT") return loadTaskDetail(notice);
   detailRequest?.abort();
   detailRequest = new AbortController();
@@ -1300,13 +1323,14 @@ async function loadDetail(notice = "") {
     if (runResult.status === "rejected") throw runResult.reason;
     const run = runResult.value;
     selected = {...selected, task_id: run.task_id, task_status: run.task_status};
+    const localComplete = run.status === "SUCCEEDED" && run.phase === "LOCAL_COMPLETE";
     const candidateId = run.current_candidate_id;
     const candidatePath = `/v1/candidates/${encodeURIComponent(candidateId)}`;
     const [candidateResults, verifiedResults, [taskResult]] = await Promise.all([
       candidateId ? Promise.allSettled([
         read(candidatePath, signal), read(`${candidatePath}/verification`, signal),
       ]) : [],
-      run.status === "SUCCEEDED" ? Promise.allSettled([
+      run.status === "SUCCEEDED" && !localComplete ? Promise.allSettled([
         read(`${root}/result`, signal), read(`${root}/result/current-pr`, signal),
       ]) : [],
       Promise.allSettled([read(`/v1/tasks/${encodeURIComponent(run.task_id)}`, signal)]),
@@ -1361,6 +1385,9 @@ async function loadDetail(notice = "") {
     const outputs = section("成果物・検証結果");
     if (verifiedResults[0]?.status === "fulfilled") {
       outputs.append(verifiedResultView(verifiedResults[0].value, verifiedResults[1].value));
+    } else if (localComplete) {
+      outputs.append(section("ローカルでの検証結果", element("p", "変更パッチとローカル検証結果を保存しました。"),
+        fields([["Candidate ID", candidateId], ["完了日時", date(run.finished_at)]])));
     } else if (run.status === "SUCCEEDED") {
       outputs.append(element("p", "検証済みの結果を取得できませんでした。", "error"));
     }
@@ -1570,6 +1597,7 @@ if (detail.closedBy !== "any") {
 get("reload-detail").addEventListener("click", () => loadDetail());
 detail.addEventListener("close", () => {
   if (detail.open) return;
+  taskDeletion.update();
   detailRequest?.abort();
   get("detail-content").replaceChildren();
 });

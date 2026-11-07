@@ -166,6 +166,15 @@ class Task(Tenant, Base):
     __table_args__ = (
         UniqueConstraint("workspace_id", "id"),
         ForeignKeyConstraint(
+            ["workspace_id", "deleted_by"],
+            ["principals.workspace_id", "principals.id"],
+            name="fk_tasks_deleted_by",
+        ),
+        CheckConstraint(
+            "(deleted_at IS NULL) = (deleted_by IS NULL)",
+            name="ck_tasks_deletion_identity",
+        ),
+        ForeignKeyConstraint(
             ["workspace_id", "project_id"], ["projects.workspace_id", "projects.id"]
         ),
         ForeignKeyConstraint(
@@ -179,6 +188,8 @@ class Task(Tenant, Base):
     latest_spec_version: Mapped[int] = mapped_column(Integer, default=1)
     clarified_spec_version: Mapped[int | None] = mapped_column(Integer, nullable=True)
     retention_touched_at: Mapped[float | None] = mapped_column(Float, nullable=True)
+    deleted_at: Mapped[float | None] = mapped_column(Float, nullable=True)
+    deleted_by: Mapped[str | None] = mapped_column(String(36), nullable=True)
 
 
 class SpecVersion(Tenant, Base):

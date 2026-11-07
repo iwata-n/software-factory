@@ -60,7 +60,7 @@ from .resolver import (
 )
 from .security import redact
 from .slack_delivery import enqueue_result
-from .task_lifecycle import run_stage
+from .task_lifecycle import active_task, lock_run_task, run_stage
 from .worker_credentials import rotated_token
 
 WEB_SESSION_PREFIX = "web."
@@ -102,6 +102,8 @@ def issue_token() -> str:
 
 
 def owned(session: Session, model: type[T], item_id: str, workspace_id: str) -> T:
+    if model is Task:
+        return active_task(session, item_id, workspace_id)
     item = session.scalar(
         select(model).where(model.id == item_id, model.workspace_id == workspace_id)
     )
@@ -444,6 +446,7 @@ class Service:
                 if cleaned != body:
                     raise DomainError(422, "SENSITIVE_INPUT")
             request_hash = digest(body)
+            self.check_task_command(session, actor, operation)
             previous = session.scalar(
                 select(IdempotencyRecord).where(
                     IdempotencyRecord.workspace_id == actor.workspace_id,
@@ -485,6 +488,23 @@ class Service:
             session.flush()
             self.checkpoint("write.before_commit")
             return response
+
+    @staticmethod
+    def check_task_command(session, actor, operation):
+        # Validate the parent even when a pre-deletion idempotency receipt exists.
+        parts = operation.split(":")
+        if len(parts) < 2:
+            return
+        kind, identifier = parts[:2]
+        if kind in {"runs", "specs"} and len(parts) == 2:
+            active_task(session, identifier, actor.workspace_id, lock=True)
+        elif kind in {"chat", "attention", "cancel", "resolve-blocked", "runs"}:
+            run = owned(session, Run, identifier, actor.workspace_id)
+            lock_run_task(session, run)
+        elif kind == "approval":
+            request = owned(session, ApprovalRequest, identifier, actor.workspace_id)
+            run = owned(session, Run, request.run_id, actor.workspace_id)
+            lock_run_task(session, run)
 
     def create_project(self, session: Session, actor: Principal, data: ProjectCreate) -> dict:
         project = Project(
@@ -593,6 +613,65 @@ class Service:
         task.retention_touched_at = db_now(session)
         return {"task_id": task.id, "spec_version": version, "spec_hash": digest(body)}
 
+    def delete_task_request(self, token, task_id):
+        # The Workspace mutex is also held by Run starts, chat claims and human
+        # interventions. Keep the existing lock order: Workspace, Task, Run/chat.
+        with self.db.transaction() as session:
+            actor = self.locked_principal(session, token, "USER")
+            self.require_user_access(actor, "OPERATOR")
+            task = session.scalar(
+                select(Task)
+                .where(Task.id == task_id, Task.workspace_id == actor.workspace_id)
+                .with_for_update()
+                .execution_options(populate_existing=True)
+            )
+            if task is None:
+                raise DomainError(404, "NOT_FOUND")
+            if task.deleted_at is not None:
+                return {"task_id": task.id, "deleted_at": task.deleted_at}
+            active_run = session.scalar(
+                select(Run.id)
+                .where(
+                    Run.workspace_id == actor.workspace_id,
+                    Run.task_id == task.id,
+                    Run.status.in_(["QUEUED", "RUNNING", "WAITING_EXTERNAL", "CANCELLING"]),
+                )
+                .limit(1)
+            )
+            if active_run is not None:
+                raise DomainError(409, "TASK_DELETE_ACTIVE_RUN")
+            now = db_now(session)
+            active_chat = session.scalar(
+                select(TaskChatTurn.id)
+                .join(
+                    Run,
+                    (Run.id == TaskChatTurn.run_id)
+                    & (Run.workspace_id == TaskChatTurn.workspace_id),
+                )
+                .where(
+                    Run.workspace_id == actor.workspace_id,
+                    Run.task_id == task.id,
+                    TaskChatTurn.status.in_(["QUEUED", "RUNNING"]),
+                    TaskChatTurn.deadline_at > now,
+                )
+                .limit(1)
+            )
+            if active_chat is not None:
+                raise DomainError(409, "TASK_DELETE_ACTIVE_CHAT")
+            task.deleted_at, task.deleted_by = now, actor.id
+            session.add(
+                AuditEvent(
+                    workspace_id=actor.workspace_id,
+                    actor_id=actor.id,
+                    operation="task.delete",
+                    body={"task_id": task.id, "deleted_at": now},
+                    created_at=now,
+                )
+            )
+            session.flush()
+            self.checkpoint("task.deleted")
+            return {"task_id": task.id, "deleted_at": now}
+
     def new_spec(
         self,
         session: Session,
@@ -600,7 +679,7 @@ class Service:
         task_id: str,
         spec: TaskSpec,
     ) -> dict:
-        task = owned(session, Task, task_id, actor.workspace_id)
+        task = active_task(session, task_id, actor.workspace_id, lock=True)
         self.check_spec(session, actor, task.project_id, spec)
         if spec.task.repository_id != task.repository_id:
             raise DomainError(422, "REPOSITORY_CHANGE_REQUIRES_NEW_TASK")
@@ -628,6 +707,7 @@ class Service:
                     IdempotencyRecord.key == key,
                 )
             )
+            active_task(session, task_id, actor.workspace_id)
             if previous:
                 if previous.request_hash != digest(body):
                     raise DomainError(409, "IDEMPOTENCY_CONFLICT")
@@ -709,7 +789,7 @@ class Service:
         resolved_sha: str | None = None,
         source_details: dict | None = None,
     ) -> dict:
-        task = owned(session, Task, task_id, actor.workspace_id)
+        task = active_task(session, task_id, actor.workspace_id, lock=True)
         version = session.scalar(
             select(SpecVersion).where(
                 SpecVersion.workspace_id == actor.workspace_id,
@@ -842,6 +922,9 @@ class Service:
         return run_view(run)
 
     def repository_allowed(self, session: Session, run: Run) -> bool:
+        task = session.get(Task, run.task_id)
+        if task is None or task.deleted_at is not None:
+            return False
         repo = owned(session, Repository, run.repository_id, run.workspace_id)
         if repo.active:
             return True
@@ -1077,6 +1160,7 @@ class Service:
                     continue
                 if not self.repository_allowed(session, run):
                     continue
+                lock_run_task(session, run)
                 adapter = run.snapshot["agent_adapter"]
                 if (
                     job.kind not in worker.capabilities
