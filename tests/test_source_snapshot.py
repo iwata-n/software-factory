@@ -62,6 +62,40 @@ def test_operator_snapshot_is_verified_by_real_isolated_runner(source_bundle, ru
         )
 
 
+def test_previous_snapshot_remains_fetchable_after_current_ref_changes(source_bundle, runner):
+    from runner import entry
+
+    old = snapshot(source_bundle)
+    entry.git("commit", "--allow-empty", "-qm", "next source snapshot")
+    sha = entry.git("rev-parse", "HEAD").decode().strip()
+    current = old.model_copy(
+        update={
+            "source": old.source
+            | {
+                "sha": sha,
+                "commit_object": base64.b64encode(entry.git("cat-file", "commit", sha)).decode(),
+            }
+        }
+    )
+    app = create_source_app(
+        SourcePolicy((REMOTE,)), runner, TOKEN, snapshot=current, history=(old,)
+    )
+    headers = {"Authorization": "Bearer " + TOKEN}
+    with TestClient(app) as http:
+        resolved = http.post(
+            "/v1/sources/resolve",
+            json={"remote_url": REMOTE, "base_ref": current.base_ref},
+            headers=headers,
+        )
+        assert resolved.status_code == 200 and resolved.json()["sha"] == sha
+        previous = http.post(
+            "/v1/sources/fetch",
+            json={"remote_url": REMOTE, "sha": old.source["sha"]},
+            headers=headers,
+        )
+        assert previous.status_code == 200 and previous.json()["sha"] == old.source["sha"]
+
+
 @pytest.mark.parametrize("field", ["sha", "tree", "source_digest", "file_manifest"])
 def test_snapshot_content_identity_mismatch_is_denied(source_bundle, runner, field):
     frozen = snapshot(source_bundle)

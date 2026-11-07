@@ -8,7 +8,7 @@ import os
 from pathlib import Path
 
 from runner import entry
-from software_factory.source_runner import SourceSnapshot, canonical_remote
+from software_factory.source_runner import SourceSnapshot, canonical_remote, read_snapshot
 
 
 def main():
@@ -40,6 +40,16 @@ def main():
     args.output.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     with args.output.open("x") as output:
         output.write(value.model_dump_json() + "\n")
+    history = args.output.parent / "snapshots"
+    history.mkdir(mode=0o700, exist_ok=True)
+    previous = history / (sha + ".json")
+    if previous.exists():
+        saved = read_snapshot(previous)
+        if saved.source["sha"] != sha or saved.source["source_digest"] != source_digest:
+            raise ValueError("conflicting source snapshot history")
+    else:
+        with previous.open("x") as output:
+            output.write(value.model_dump_json() + "\n")
     print(json.dumps({"sha": sha, "base_ref": args.base_ref, "files": len(entries)}))
 
 

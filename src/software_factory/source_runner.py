@@ -80,7 +80,10 @@ def configured_snapshot():
     name = os.environ.get("FACTORY_SOURCE_SNAPSHOT_FILE")
     if not name:
         return None
-    path = Path(name)
+    return read_snapshot(Path(name))
+
+
+def read_snapshot(path):
     info = path.lstat()
     if (
         not stat.S_ISREG(info.st_mode)
@@ -96,17 +99,33 @@ def configured_snapshot():
     return snapshot
 
 
+def configured_snapshot_history():
+    name = os.environ.get("FACTORY_SOURCE_SNAPSHOT_HISTORY_DIR")
+    if not name:
+        return ()
+    root = Path(name)
+    info = root.lstat()
+    if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid() or info.st_mode & 0o077:
+        raise ValueError("source snapshot history must be an owner-only directory")
+    files = sorted(root.glob("*.json"))
+    if len(files) > 100 or sum(path.lstat().st_size for path in files) > 128 * 1024 * 1024:
+        raise ValueError("source snapshot history is too large")
+    return tuple(read_snapshot(path) for path in files)
+
+
 def create_source_app(
     policy: SourcePolicy,
     runner: DockerRunner,
     token: str,
     *,
     snapshot: SourceSnapshot | None = None,
+    history: tuple[SourceSnapshot, ...] = (),
 ) -> FastAPI:
     if len(token) < 20:
         raise ValueError("a dedicated source-runner credential is required")
     app = FastAPI(title="Factory read-only source runner")
     snapshot_remote = policy.authorize(snapshot.remote_url) if snapshot else None
+    previous = [(policy.authorize(item.remote_url), item) for item in history]
 
     @app.exception_handler(RequestValidationError)
     def validation_error(request, error):
@@ -117,12 +136,26 @@ def create_source_app(
             return JSONResponse({"code": "UNAUTHENTICATED"}, status_code=401)
         try:
             url = policy.authorize(remote)
-            if (
+            frozen = (
                 snapshot
-                and url == snapshot_remote
-                and ref == (snapshot.source["sha"] if pinned else snapshot.base_ref)
-            ):
-                source = snapshot.source
+                if (
+                    snapshot
+                    and url == snapshot_remote
+                    and ref == (snapshot.source["sha"] if pinned else snapshot.base_ref)
+                )
+                else None
+            )
+            if frozen is None and pinned:
+                frozen = next(
+                    (
+                        item
+                        for remote, item in previous
+                        if remote == url and item.source.get("sha") == ref
+                    ),
+                    None,
+                )
+            if frozen:
+                source = frozen.source
                 # The existing isolated inspector checks archive, tree, commit SHA and manifest.
                 result = runner.execute_candidate(
                     {
@@ -190,7 +223,11 @@ def main():
     policy = SourcePolicy(tuple(filter(None, os.environ["FACTORY_ALLOWED_REMOTES"].split(","))))
     runner = DockerRunner(os.environ["FACTORY_RUNNER_IMAGE_DIGEST"])
     app = create_source_app(
-        policy, runner, os.environ["FACTORY_SOURCE_RUNNER_TOKEN"], snapshot=configured_snapshot()
+        policy,
+        runner,
+        os.environ["FACTORY_SOURCE_RUNNER_TOKEN"],
+        snapshot=configured_snapshot(),
+        history=configured_snapshot_history(),
     )
     uvicorn.run(
         app, host="127.0.0.1", port=int(os.environ.get("FACTORY_SOURCE_RUNNER_PORT", "8010"))
