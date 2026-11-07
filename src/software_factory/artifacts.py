@@ -7,7 +7,7 @@ from sqlalchemy import select
 
 from .db import db_now
 from .models import Artifact, AuditEvent, new_id
-from .security import redact
+from .security import redact, sensitive_patch
 from .storage import LocalArtifactStorage, StorageError, content_hash
 
 MAX_ARTIFACT_BYTES = 16 * 1024 * 1024
@@ -115,6 +115,9 @@ class ArtifactCommands:
                 stored = redact(body.decode("utf-8"), request_secrets.get()).encode()
             except UnicodeDecodeError:
                 raise DomainError(422, "LOG_ENCODING_INVALID") from None
+        elif artifact.kind == "PATCH":
+            if sensitive_patch(patch, request_secrets.get()):
+                raise DomainError(409, "SENSITIVE_ARTIFACT_REJECTED")
         elif any(secret.encode() in body for secret in request_secrets.get()) or redact(
             body.decode("utf-8", errors="replace")
         ) != body.decode("utf-8", errors="replace"):

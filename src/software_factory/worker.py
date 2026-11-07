@@ -506,9 +506,25 @@ def main():
                     return
             except (httpx.HTTPError, TimeoutError) as error:
                 # Never log tokens, request bodies, or arbitrary Agent output here.
-                print(json.dumps({"worker_error": type(error).__name__}))
+                diagnostic = {"worker_error": type(error).__name__}
+                if isinstance(error, httpx.HTTPStatusError):
+                    diagnostic.update(
+                        status=error.response.status_code, path=error.request.url.path
+                    )
+                    try:
+                        code = error.response.json().get("code")
+                        if (
+                            isinstance(code, str)
+                            and code.isascii()
+                            and code.replace("_", "").isalnum()
+                        ):
+                            diagnostic["code"] = code[:100]
+                    except (ValueError, AttributeError):
+                        pass
+                print(json.dumps(diagnostic), flush=True)
                 permanent = isinstance(error, httpx.HTTPStatusError) and (
-                    error.response.status_code < 500 and error.response.status_code != 429
+                    error.response.status_code < 500
+                    and error.response.status_code not in {404, 409, 429}
                 )
                 if args.once or args.drain or permanent:
                     raise SystemExit(1) from None

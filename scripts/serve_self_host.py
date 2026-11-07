@@ -50,10 +50,10 @@ CHECK_ARGV = ["python", "-I", "-c", PYTEST] + [
 
 
 def start(stack, output, name, module, env, *args):
-    log = stack.enter_context((output / f"{name}.log").open("wb"))
-    process = subprocess.Popen(
-        [sys.executable, "-m", module, *args], cwd=ROOT, env=env, stdout=log, stderr=log
-    )
+    with (output / f"{name}.log").open("wb") as log:
+        process = subprocess.Popen(
+            [sys.executable, "-m", module, *args], cwd=ROOT, env=env, stdout=log, stderr=log
+        )
     stack.callback(stop, process)
     return process
 
@@ -66,6 +66,71 @@ def stop(process):
         except subprocess.TimeoutExpired:
             process.kill()
             process.wait()
+
+
+def start_managed_worker(
+    stack, output, name, worker_env, server_env, workspace, url, kinds, arguments
+):
+    enrollment = json.loads(
+        subprocess.check_output(
+            [
+                sys.executable,
+                "-m",
+                "software_factory.cli",
+                "issue-enrollment",
+                "--workspace-id",
+                workspace,
+                "--managed",
+                "--usage-authority",
+                "--adapter",
+                "codex_cli",
+                "--kinds",
+                *kinds,
+            ],
+            cwd=ROOT,
+            env=server_env,
+        )
+    )
+    with httpx.Client(base_url=url, timeout=30, trust_env=False) as client:
+        credential = post(
+            client,
+            "/v1/worker/enroll",
+            {
+                "token": enrollment["enrollment_token"],
+                "name": f"Self-host {name}",
+            },
+        )
+    return start(
+        stack,
+        output,
+        name,
+        "software_factory.worker",
+        worker_env | {"FACTORY_WORKER_TOKEN": credential["worker_token"]},
+        *arguments,
+    )
+
+
+def monitor_services(server, services, restart):
+    """A failed source runner/worker must not take the operations UI offline."""
+    failures, retry_at = [0] * len(services), [0.0] * len(services)
+    while server.poll() is None:
+        for index, process in enumerate(services):
+            if process.poll() is None or time.monotonic() < retry_at[index]:
+                continue
+            failures[index] += 1
+            retry_at[index] = time.monotonic() + min(30, 2 ** min(failures[index], 5))
+            try:
+                services[index] = restart(index)
+                print(
+                    json.dumps({"service_restarted": index, "generation": failures[index]}),
+                    flush=True,
+                )
+            except Exception as error:
+                print(
+                    json.dumps({"service_restart_failed": index, "error": type(error).__name__}),
+                    flush=True,
+                )
+        time.sleep(1)
 
 
 def main():
@@ -206,8 +271,7 @@ def main():
                     "remote_url": REMOTE,
                 },
             )
-            workers = []
-            for adapter, kinds, extra in (
+            worker_specs = [
                 (
                     "codex_cli",
                     ["PLAN", "IMPLEMENT", "REPAIR"],
@@ -218,51 +282,38 @@ def main():
                     ["ASSEMBLE_CANDIDATE", "VERIFY", "REVIEW"],
                     ["--reviewer", "codex_cli"],
                 ),
-            ):
-                enrollment = admin(
-                    "issue-enrollment",
-                    "--workspace-id",
-                    workspace,
-                    "--managed",
-                    "--usage-authority",
+            ]
+            generations = [0, 0]
+
+            def provision(index):
+                adapter, kinds, extra = worker_specs[index]
+                generations[index] += 1
+                name = f"{adapter}-{generations[index]}"
+                env = (
+                    common
+                    | codex_root
+                    | {
+                        "FACTORY_RUNNER_IMAGE_DIGEST": image,
+                        "FACTORY_RUNNER_STATE_ROOT": str(output / adapter),
+                        "FACTORY_CODEX_AUTH_FILE": str(engine.auth_file),
+                    }
+                )
+                arguments = [
+                    "--api-url",
+                    url,
                     "--adapter",
-                    "codex_cli",
-                    "--kinds",
-                    *kinds,
+                    adapter,
+                    "--codex-binary",
+                    str(args.codex_binary.resolve()),
+                    "--codex-manifest",
+                    str(args.codex_manifest.resolve()),
+                    *extra,
+                ]
+                return start_managed_worker(
+                    stack, output, name, env, server_env, workspace, url, kinds, arguments
                 )
-                credential = post(
-                    client,
-                    "/v1/worker/enroll",
-                    {
-                        "token": enrollment["enrollment_token"],
-                        "name": f"Self-host {adapter}",
-                    },
-                )
-                workers.append(
-                    start(
-                        stack,
-                        output,
-                        adapter,
-                        "software_factory.worker",
-                        common
-                        | codex_root
-                        | {
-                            "FACTORY_WORKER_TOKEN": credential["worker_token"],
-                            "FACTORY_RUNNER_IMAGE_DIGEST": image,
-                            "FACTORY_RUNNER_STATE_ROOT": str(output / adapter),
-                            "FACTORY_CODEX_AUTH_FILE": str(engine.auth_file),
-                        },
-                        "--api-url",
-                        url,
-                        "--adapter",
-                        adapter,
-                        "--codex-binary",
-                        str(args.codex_binary.resolve()),
-                        "--codex-manifest",
-                        str(args.codex_manifest.resolve()),
-                        *extra,
-                    )
-                )
+
+            workers = [provision(index) for index in range(len(worker_specs))]
         if args.admin_username:
             password = secrets.token_urlsafe(24)
             with httpx.Client(
@@ -297,8 +348,15 @@ def main():
             )
         )
         print(f"{url}/operations\n{credential_path}\n{base['sha']}", flush=True)
-        while all(process.poll() is None for process in [source_process, server, *workers]):
-            time.sleep(1)
+
+        def restart(index):
+            if index == 0:
+                return start(
+                    stack, output, "source-restarted", "software_factory.source_runner", source_env
+                )
+            return provision(index - 1)
+
+        monitor_services(server, [source_process, *workers], restart)
         raise RuntimeError(f"Self-host service stopped. See logs in {output}")
 
 

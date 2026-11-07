@@ -6,7 +6,6 @@ import hashlib
 import io
 import json
 import tarfile
-from collections import Counter
 from pathlib import PurePosixPath
 from threading import Event, Lock, Thread
 from typing import Annotated, Literal
@@ -21,7 +20,7 @@ from .contracts import FindingLocation, Name, Plan, digest, path_within, safe_pa
 from .metering import price_call
 from .project_reader import run_project_model
 from .sandbox import STOP_UNCONFIRMED, RunnerError
-from .security import SECRETS, redact
+from .security import introduces_secret, redact
 
 
 class ModelOutput(BaseModel):
@@ -201,25 +200,6 @@ def model_context(job, files, policy):
             {"id": digest(failure), "failure": failure} for failure in failures
         ]
     return context
-
-
-def introduces_secret(path, old, new):
-    code = PurePosixPath(path).suffix in {".py", ".js", ".ts", ".jsx", ".tsx"}
-    for index, pattern in enumerate(SECRETS):
-        if code and index == 1:
-            # Unquoted `token: Token` and `token = issue_token()` are code, not credentials.
-            continue
-
-        def matches(text, pattern=pattern, index=index):
-            return Counter(
-                match[0]
-                for match in pattern.finditer(text)
-                if not (code and index == 0 and match[0].split(None, 1)[-1].startswith(("{", "${")))
-            )
-
-        if matches(new) - matches(old):
-            return True
-    return False
 
 
 def make_patch(changes, files, policy, plan, acceptance_ids):

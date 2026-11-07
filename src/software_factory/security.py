@@ -1,6 +1,8 @@
 """Redact credentials before persisting untrusted agent input or reporting errors."""
 
 import re
+from collections import Counter
+from pathlib import PurePosixPath
 
 SECRET_KEY = re.compile(r"(?:token|password|secret|authorization|api[_-]?key|credential)", re.I)
 SECRETS = (
@@ -31,3 +33,43 @@ def redact(value, known_secrets: tuple[str, ...] = ()):
         for pattern in SECRETS:
             value = pattern.sub("[REDACTED]", value)
     return value
+
+
+def introduces_secret(path, old, new):
+    code = PurePosixPath(path).suffix in {".py", ".js", ".ts", ".jsx", ".tsx"}
+    for index, pattern in enumerate(SECRETS):
+        if code and index == 1:
+            continue  # Unquoted variable bindings and type annotations are code.
+
+        def matches(text, pattern=pattern, index=index):
+            return Counter(
+                match[0]
+                for match in pattern.finditer(text)
+                if not (code and index == 0 and match[0].split(None, 1)[-1].startswith(("{", "${")))
+            )
+
+        if matches(new) - matches(old):
+            return True
+    return False
+
+
+def sensitive_patch(patch, known_secrets=()):
+    if any(secret and secret in patch for secret in known_secrets):
+        return True
+    path, pieces = "", []
+    for line in patch.splitlines(keepends=True):
+        if line.startswith("--- "):
+            if introduces_secret(path, "", "".join(pieces)):
+                return True
+            path, pieces = line[4:].strip().removeprefix("a/"), []
+            if redact(path) != path:
+                return True
+        elif line.startswith("+++ "):
+            target = line[4:].strip().removeprefix("b/")
+            if redact(target) != target:
+                return True
+            if target != "/dev/null":
+                path = target
+        elif line.startswith(("+", "-", " ")):
+            pieces.append(line[1:])
+    return introduces_secret(path, "", "".join(pieces))
