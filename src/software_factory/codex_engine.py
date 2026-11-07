@@ -329,7 +329,7 @@ class CodexCLI:
             "were executed. Preserve existing behavior outside the requested criteria.\n"
         )
         body = instructions + json.dumps(context, ensure_ascii=False)
-        if sensitive_input(context) or redact(body) != body:
+        if sensitive_input(context):
             raise CodexError("SENSITIVE_MODEL_INPUT", "POLICY", before_launch=True)
         if len(body.encode()) > self.manifest.max_input_bytes:
             raise CodexError("CODEX_CONTEXT_TOO_LARGE", "POLICY", before_launch=True)

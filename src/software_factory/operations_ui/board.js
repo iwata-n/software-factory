@@ -1060,6 +1060,18 @@ async function blockedRunView(root, run, signal, task) {
     resolve.prepend(attentionField("解消した内容", "reason", "", 4000, 2));
     panel.append(resolve);
   }
+  if (!canCorrectSpec && !recoverableBlocks.has(run.stop_reason) &&
+      !run.stop_reason?.includes("STOP_UNCONFIRMED") && task.value) {
+    const retryKey = taskKey();
+    panel.append(blockedForm("同じ仕様で再実行", status, async () => {
+      const result = await postTask(`/v1/tasks/${encodeURIComponent(run.task_id)}/runs`,
+        JSON.stringify({spec_version: task.value.latest_spec_version, reuse_existing: false}), retryKey, signal);
+      if (signal.aborted) return;
+      selected = {...selected, run_id: result.run_id, task_status: undefined};
+      void loadBoard();
+      void loadDetail("同じ仕様で再実行を開始しました。以前の結果は実行履歴に残ります。");
+    }));
+  }
   const key = taskKey();
   const cancel = blockedForm("この Run を取り消す", status, async (form) => {
     const reason = new FormData(form).get("reason").trim();

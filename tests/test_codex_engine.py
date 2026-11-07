@@ -322,6 +322,17 @@ def test_quoted_source_credentials_are_rejected_before_serializing_context(cli, 
     )
 
 
+def test_json_escaping_of_a_bearer_prefix_in_source_is_not_a_credential(cli):
+    from software_factory.project_reader import visible_text
+
+    source = b'const header = "Bearer " + currentToken;\n'
+    context = {
+        "project_file_excerpts": [{"path": "src/header.js", "content": visible_text(source)}]
+    }
+    reply = cli().run(context, Reply, Event())
+    assert reply.value == {"value": "ok"}
+
+
 def test_nonzero_exit_preserves_validated_usage(cli):
     engine = cli("metered-exit")
     with pytest.raises(CodexError, match="CODEX_PROCESS_FAILED") as caught:

@@ -8,7 +8,6 @@ import time
 
 from .codex_engine import CodexError, CodexResponse, sensitive_input, strict_schema
 from .contracts import AgentToolCall, ModelCallUsage
-from .security import redact
 
 TOOL_NAME = "lookup_acceptance_criterion"
 TOOL = {
@@ -173,7 +172,7 @@ def run_app_server(engine, scratch, context, output_model, cancelled, timeout):
     """Bound the stdio exchange to the same lease and output limits as exec."""
     manifest = engine.manifest
     encoded = json.dumps(context, ensure_ascii=False)
-    if sensitive_input(context) or redact(encoded) != encoded:
+    if sensitive_input(context):
         raise CodexError("SENSITIVE_MODEL_INPUT", "POLICY", before_launch=True)
     if len(encoded.encode()) > manifest.max_input_bytes:
         raise CodexError("CODEX_CONTEXT_TOO_LARGE", "POLICY", before_launch=True)

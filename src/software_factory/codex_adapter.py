@@ -21,7 +21,7 @@ from .contracts import FindingLocation, Name, Plan, digest, path_within, safe_pa
 from .metering import price_call
 from .project_reader import run_project_model
 from .sandbox import STOP_UNCONFIRMED, RunnerError
-from .security import SECRETS, redact
+from .security import SECRETS
 
 
 class ModelOutput(BaseModel):
@@ -367,8 +367,7 @@ class CodexAdapter:
                 )
             context = model_context(job, files, policy)
             # Validate sensitivity/size before marking a provider invocation as possible.
-            encoded = json.dumps(context, ensure_ascii=False)
-            if sensitive_input(context) or redact(encoded) != encoded:
+            if sensitive_input(context):
                 raise CodexError("SENSITIVE_MODEL_INPUT", "POLICY")
             schema = {"PLAN": Plan, "IMPLEMENT": ChangeSet, "REPAIR": RepairSet}[job["kind"]]
             called = True
