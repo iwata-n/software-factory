@@ -399,7 +399,7 @@ Lease失効時は予約額を保守的に計上し、後日の確定usageで調�
 
 `POST /v1/runs/{id}/interventions` は `action`、`subject_id`、整数の `expected_run_revision`、`reason` を必須とします。許可actionは `approve_plan`、`approve_budget`、`cancel`、`resolve_blocked` です。承認対象はApproval IDで、`target_hash` と `decision=approve/deny` を追加します。個別decisions APIと同じ認可・対象検証・意思決定・再送台帳を使い、同じキーによる経路間再送も同じ結果を返します。取消はRun IDを対象とし、両経路とも202を返します。
 
-`GET /v1/runs/{id}/interventions` は停止解除用の現対象/hashを返します。`resolve_blocked` はそのhashを固定し、台帳・現Spec/Policy/Profile・稼働Lease・停止原因を再確認します。費用が確定し残額が十分なら同じJobを上限内で再試行します。証拠不足は現Candidateの信頼済み証拠からGateを再計算し、解消を確認できる場合にだけ再開します。CIの金融停止を解除しても元の待機期限を保持します。
+`GET /v1/runs/{id}/interventions` は停止解除用の現対象/hashを返します。`resolve_blocked` はそのhashを固定し、台帳・現Spec/Policy/Profile・稼働Lease・停止原因を再確認します。費用が確定し残額が十分なら同じJobを上限内で再試行します。証拠不足は現Candidateの信頼済み証拠からGateを再計算します。未確定・欠落・対象不一致の結果が残る場合は「不足した検証を再実行」から該当するVERIFY／REVIEW Jobだけを再試行できます。合格済みの別Job、Candidate、証拠の履歴を保持し、元の試行上限と予算を適用します。再試行を承認してもGateを合格にはせず、実際の結果で再判定します。Codexレビューには固定したRun開始時のソースとの差分を参照・秘匿化・サイズ上限の下で渡します。CIの金融停止を解除しても元の待機期限を保持します。
 
 一般の介入では、不変候補・無進展・修正/試行上限・保護差分・Spec変更・CI期限切れを解除できません。許可された介入はactor、action、固定対象、前後revision、reason、時刻を状態と同じTXで監査します。
 

@@ -143,13 +143,17 @@ def test_resolution_cannot_turn_missing_real_verifier_evidence_into_pass(pipelin
     assert world.run()["status"] == "BLOCKED"
     before = dump(world.database)
     response = world.post(f"/v1/runs/{world.run_id}/interventions", resolution_body(world))
-    assert response.status_code == 409, response.text
-    assert response.json()["code"] == "EVIDENCE_NOT_RESOLVED"
-    assert dump(world.database) == before
-    assert not [j for j in before["jobs"] if j["kind"] == "PUBLISH_DRAFT"]
+    assert response.status_code == 200, response.text
+    assert response.json()["reevaluation"]["status"] == "RETRY_SCHEDULED"
+    after = dump(world.database)
+    assert world.run()["status"] == "QUEUED"
+    assert world.run()["phase"] == "VERIFY_REVIEW"
+    assert len(before["jobs"]) == len(after["jobs"])
+    assert not [j for j in after["jobs"] if j["kind"] == "PUBLISH_DRAFT"]
+    assert not [gate for gate in after["gates"] if gate["status"] == "PASS"]
     evidence(
-        "a missing actual JUnit and Reviewer evidence remain inconclusive after human resolution",
-        {"status": 409, "reason": world.run()["stop_reason"], "publication_jobs": 0},
+        "missing actual evidence is retried without synthesizing a PASS or publication intent",
+        {"status": 200, "phase": world.run()["phase"], "publication_jobs": 0},
     )
 
 

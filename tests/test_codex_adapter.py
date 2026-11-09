@@ -16,6 +16,7 @@ from software_factory.codex_adapter import (
     CodexReviewer,
     archive_files,
     make_patch,
+    review_comparison,
 )
 from software_factory.codex_engine import CodexError, CodexResponse
 from software_factory.contracts import ModelCallUsage, digest
@@ -465,6 +466,89 @@ def test_codex_review_binds_evidence_to_current_candidate_and_real_locations(
         "REVIEW accepts the current source line and rejects an out-of-range location",
         {"line": location["end_line"], "accepted": not invalid},
     )
+
+
+@pytest.mark.parametrize("tamper", [None, "sha", "digest", "archive", "missing"])
+@pytest.mark.parametrize("project_access", [False, True])
+def test_review_compares_the_candidate_with_verified_pinned_base(job, tamper, project_access):
+    job["kind"] = "REVIEW"
+    if project_access:
+        job["snapshot"]["policy"]["allowed_read_paths"] = ["src"]
+    job["snapshot"]["source"] = {
+        "base_sha": job["base_sha"],
+        "source_digest": job["source"]["source_digest"],
+    }
+    files = archive_files(
+        base64.b64decode(job["source"]["archive"]), job["source"]["source_digest"]
+    )
+    records = [
+        (path, mode, b"value = 2\n" if path == "src/example.py" else body)
+        for path, (mode, body) in files.items()
+    ]
+    candidate_digest, archive, _ = entry.pack(records)
+    base = dict(job["source"])
+    if tamper == "sha":
+        base["sha"] = "b" * 40
+    elif tamper == "digest":
+        base["source_digest"] = "0" * 64
+    elif tamper == "archive":
+        base["archive"] = base64.b64encode(archive).decode()
+    reviewed = {
+        "criteria": [
+            {
+                "criterion_id": "AC-1",
+                "status": "PASS",
+                "explanation": "Compared the change from 1 to 2",
+                "locations": [{"path": "src/example.py", "start_line": 1, "end_line": 1}],
+            }
+        ],
+        "findings": [],
+    }
+    engine = Engine({"read_requests": [], "result": reviewed} if project_access else reviewed)
+    context = {
+        "source_archive": archive,
+        "source_artifact_id": "candidate-source",
+        "target": {"source_digest": candidate_digest, "candidate_id": "candidate"},
+        "base_source": None if tamper == "missing" else base,
+    }
+    reviewer = CodexReviewer(engine).for_job(job)
+    if tamper:
+        with pytest.raises(AgentExecutionError):
+            reviewer.review(context, Event())
+        assert not engine.calls
+    else:
+        assert reviewer.review(context, Event())["criteria"][0]["status"] == "PASS"
+        comparison = engine.calls[0]["change_comparison"]
+        assert comparison["base_sha"] == job["base_sha"]
+        assert comparison["changed_paths"] == ["src/example.py"]
+        assert "-value = 1\n+value = 2\n" in comparison["unified_diff"]
+        assert not comparison["diff_truncated"] and not comparison["omitted_paths"]
+
+
+def test_review_comparison_respects_read_scope_redacts_and_reports_incomplete_context():
+    before = {
+        "src/main.py": ("100644", b'api_key = "secret-canary"\nvalue = 1\n'),
+        "private/hidden.py": ("100644", b"private_before = True\n"),
+        "src/removed.py": ("100644", b"removed = True\n"),
+        "src/binary": ("100644", b"\xff"),
+    }
+    after = before | {
+        "src/main.py": ("100644", b'api_key = "another-secret"\nvalue = 2\n'),
+        "private/hidden.py": ("100644", b"private_after = True\n"),
+        "src/binary": ("100644", b"\xfe"),
+        "src/added.py": ("100644", b"added = True\n"),
+    }
+    del after["src/removed.py"]
+    policy = {"allowed_read_paths": ["src"], "allowed_write_paths": ["src"]}
+    comparison = review_comparison(before, after, policy, "a" * 40)
+    rendered = json.dumps(comparison)
+    assert "secret-canary" not in rendered and "another-secret" not in rendered
+    assert "[REDACTED]" in rendered and "private" not in rendered
+    assert comparison["omitted_paths"] == ["src/binary"]
+    assert "+added = True" in comparison["unified_diff"]
+    assert "-removed = True" in comparison["unified_diff"]
+    limited = review_comparison(before, after, policy, "a" * 40, limit=40)
+    assert len(limited["unified_diff"].encode()) <= 40 and limited["diff_truncated"]
 
 
 @pytest.mark.ac("SF-20-AC05")

@@ -754,8 +754,8 @@ const blockedGuidance = {
   BUDGET_EXHAUSTED: "予算の残額を確認し、必要に応じて予算を変更してから再開してください。",
   BUDGET_EXCEEDED: "使用額と予算を確認し、原因を解消してから再開してください。",
   USAGE_UNKNOWN: "利用量を確定してから再開してください。",
-  MANDATORY_EVIDENCE_MISSING: "不足している検証結果を確認してください。",
-  EVIDENCE_TARGET_MISMATCH: "検証の対象と現在の候補が一致しているか確認してください。",
+  MANDATORY_EVIDENCE_MISSING: "テスト・レビューに未確定の結果があります。「不足した検証を再実行」で同じ候補を検証し直せます。",
+  EVIDENCE_TARGET_MISMATCH: "現在の候補に対応する検証結果を取り直してください。「不足した検証を再実行」で再試行できます。",
 };
 const recoverableBlocks = new Set([
   "POLICY: SENSITIVE_MODEL_INPUT", "POLICY: MODEL_CHANGE_PATH_DENIED",
@@ -771,7 +771,8 @@ function runActionMessage(error) {
     BUDGET_NOT_RESOLVED: "予算が不足しています。",
     INFRA_ATTEMPTS_EXHAUSTED: "この Run の試行上限です。「同じ仕様で新しく実行」を選んでください。",
     USAGE_NOT_RECONCILED: "利用量がまだ確定していません。",
-    EVIDENCE_NOT_RESOLVED: "必要な検証結果がまだ揃っていません。",
+    EVIDENCE_NOT_RESOLVED: "検証を再開できません。「実行履歴」のチェック結果と現在の候補を確認してください。",
+    RESUME_JOB_MISSING: "再開する処理が見つかりません。「同じ仕様で新しく実行」を選んでください。",
     WORKSPACE_EXECUTION_STOPPED: "Workspace の実行が停止中です。管理者に確認してください。",
   }[error.message] ?? `操作できませんでした（${error.message}）。`;
 }
@@ -1067,20 +1068,25 @@ async function blockedRunView(root, run, signal, task) {
     panel.append(correction ?? element("p", "タスクの仕様を取得できませんでした。", "error"));
   }
   if (recoverableBlocks.has(run.stop_reason)) {
+    const retryEvidence = ["MANDATORY_EVIDENCE_MISSING", "EVIDENCE_TARGET_MISMATCH"].includes(run.stop_reason);
     const key = taskKey();
-    const resolve = blockedForm("解消を確認して再開", status, async (form) => {
+    const resolve = blockedForm(retryEvidence ? "不足した検証を再実行" : "解消を確認して再開", status, async (form) => {
       const reason = new FormData(form).get("reason").trim();
       const target = await read(`${root}/interventions`, signal);
-      await postTask(`${root}/interventions`, JSON.stringify({
+      const result = await postTask(`${root}/interventions`, JSON.stringify({
         action: "resolve_blocked", subject_id: run.run_id, reason,
-        target_hash: target.target_hash, expected_run_revision: run.state_revision,
+        target_hash: target.target_hash, expected_run_revision: target.target.run_revision,
       }), key, signal);
       if (!signal.aborted) {
+        selected = {...selected, ...result.run};
         void loadBoard();
-        void loadDetail("Run を再開しました。");
+        void loadDetail(result.reevaluation.status === "RETRY_SCHEDULED"
+          ? "不足した検証の再実行を開始しました。完了後に結果を再判定します。"
+          : "Run を再開しました。");
       }
     });
-    resolve.prepend(attentionField("解消した内容", "reason", "", 4000, 2));
+    resolve.prepend(attentionField(retryEvidence ? "再実行する理由" : "解消した内容", "reason",
+      retryEvidence ? "不足した検証結果を取得するため" : "", 4000, 2));
     panel.append(resolve);
   }
   if (!canCorrectSpec && run.cost_state === "KNOWN" &&

@@ -142,7 +142,7 @@ class Supervisor:
             elif not cancelled and time.monotonic() < deadline:
                 if (
                     job["snapshot"].get("source")
-                    and job["kind"] in {"PLAN", "IMPLEMENT", "ASSEMBLE_CANDIDATE"}
+                    and job["kind"] in {"PLAN", "IMPLEMENT", "ASSEMBLE_CANDIDATE", "REVIEW"}
                     and not job.get("input", {}).get("source_candidate_id")
                 ):
                     preparation = Future()

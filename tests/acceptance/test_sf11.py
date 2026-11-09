@@ -170,6 +170,7 @@ class Reviewer:
             "profile",
             "source_archive",
             "source_artifact_id",
+            "base_source",
         }
         cid = context["target"]["candidate_id"]
         result = {

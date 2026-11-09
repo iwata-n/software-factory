@@ -20,6 +20,45 @@ def assignment():
     }
 
 
+def test_review_fetches_pinned_base_source_before_starting_the_adapter():
+    source = {"sha": "a" * 40, "archive": "immutable base archive"}
+
+    class ReviewAgent(FakeAgent):
+        capabilities = Capabilities(kinds=("REVIEW",))
+
+        def start(self, job):
+            assert job["source"] == source
+            self._result = AgentResult("EXECUTED", {})
+
+    paths = []
+
+    def handler(request):
+        paths.append(request.url.path)
+        if request.url.path.endswith("claims"):
+            assigned = assignment()
+            assigned["job"]["kind"] = "REVIEW"
+            assigned["job"]["base_sha"] = source["sha"]
+            assigned["job"]["snapshot"]["source"] = {"base_sha": source["sha"]}
+            return httpx.Response(200, json=assigned)
+        if request.url.path.endswith("heartbeat"):
+            return httpx.Response(
+                200, json={"cancel_requested": False, "lease_expires_in_seconds": 90}
+            )
+        if request.url.path.endswith("source"):
+            assert request.url.params["fence"] == "1"
+            return httpx.Response(200, json=source)
+        assert request.url.path.endswith("complete")
+        return httpx.Response(200, json={"accepted": True})
+
+    with httpx.Client(
+        base_url="http://localhost", transport=httpx.MockTransport(handler)
+    ) as client:
+        assert Supervisor(client, ReviewAgent()).run_once()["accepted"]
+    assert paths.index("/v1/worker/leases/lease/source") < paths.index(
+        "/v1/worker/leases/lease/complete"
+    )
+
+
 def test_progress_is_delivered_before_agent_finishes_and_final_replay_is_identical():
     seen = Event()
     batches = []

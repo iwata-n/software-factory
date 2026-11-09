@@ -276,6 +276,7 @@ class PipelineAdapter:
                         "profile": profile,
                         "source_artifact_id": job["input"]["source_artifact_id"],
                         "source_archive": archive,
+                        "base_source": job.get("source"),
                     },
                     cancelled,
                 )

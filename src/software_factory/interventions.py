@@ -248,36 +248,52 @@ class InterventionCommands:
         elif cause in {"MANDATORY_EVIDENCE_MISSING", "EVIDENCE_TARGET_MISMATCH"}:
             if run.phase != "VERIFY_REVIEW":
                 raise DomainError(409, "RESUME_PHASE_NOT_ALLOWED")
-            *_, decision = self.service.gates.inputs(session, run)
-            if (
-                decision.status in {"WAIT", "INCONCLUSIVE"}
-                or decision.evidence_digest == target["evidence_digest"]
-            ):
+            candidate, _, jobs, checks, _, decision = self.service.gates.inputs(session, run)
+            if decision.status == "INCONCLUSIVE":
+                reevaluation = self.retry_evidence(session, run, candidate, jobs, checks, decision)
+            elif decision.status == "WAIT":
                 raise DomainError(409, "EVIDENCE_NOT_RESOLVED")
-            run.status, run.stop_reason = "QUEUED", None
-            gate = self.service.gates.local(session, run)
-            if not gate:
-                raise DomainError(409, "EVIDENCE_NOT_RESOLVED")
-            if gate.status == "PASS" and run.phase == "VERIFY_REVIEW":
-                publication = session.scalar(
-                    select(Job).where(
-                        Job.run_id == run.id,
-                        Job.kind == "PUBLISH_DRAFT",
-                        Job.state.in_(["READY", "PENDING", "RETRY_WAIT"]),
-                        Job.payload["gate_id"].as_string() == gate.id,
-                        Job.payload["candidate_id"].as_string() == run.current_candidate_id,
-                    )
-                )
-                if publication is None:
-                    raise DomainError(409, "RESUME_JOB_MISSING")
-                run.phase = "PUBLISH_DRAFT"
-            if run.status == "BLOCKED":
-                raise DomainError(409, "EVIDENCE_NOT_RESOLVED")
-            if run.phase == "VERIFY_REVIEW" and not session.scalar(
-                select(Job.id).where(Job.run_id == run.id, Job.state == "RETRY_WAIT")
-            ):
-                raise DomainError(409, "EVIDENCE_NOT_RESOLVED")
-            reevaluation = {"gate_id": gate.id, "status": gate.status}
+            else:
+                run.status, run.stop_reason, run.wait_context = "QUEUED", None, None
+                gate = self.service.gates.local(session, run)
+                if not gate:
+                    raise DomainError(409, "EVIDENCE_NOT_RESOLVED")
+                if gate.status == "PASS" and run.phase == "VERIFY_REVIEW":
+                    # An existing PASS gate is immutable and local() has no new side effects.
+                    if run.snapshot["policy"].get("delivery_mode") == "local_candidate":
+                        run.status, run.phase = "SUCCEEDED", "LOCAL_COMPLETE"
+                        run.finished_at = db_now(session)
+                        event(
+                            session,
+                            run,
+                            "LOCAL_CANDIDATE_READY",
+                            {
+                                "candidate_id": candidate.id,
+                                "gate_id": gate.id,
+                                "source_artifact_id": candidate.source_artifact_id,
+                                "publication": "not_requested",
+                            },
+                        )
+                    else:
+                        publication = session.scalar(
+                            select(Job).where(
+                                Job.run_id == run.id,
+                                Job.kind == "PUBLISH_DRAFT",
+                                Job.state.in_(["READY", "PENDING", "RETRY_WAIT"]),
+                                Job.payload["gate_id"].as_string() == gate.id,
+                                Job.payload["candidate_id"].as_string() == candidate.id,
+                            )
+                        )
+                        if publication is None:
+                            raise DomainError(409, "RESUME_JOB_MISSING")
+                        run.phase = "PUBLISH_DRAFT"
+                if run.status == "BLOCKED":
+                    raise DomainError(409, "EVIDENCE_NOT_RESOLVED")
+                if run.phase == "VERIFY_REVIEW" and not session.scalar(
+                    select(Job.id).where(Job.run_id == run.id, Job.state == "RETRY_WAIT")
+                ):
+                    raise DomainError(409, "EVIDENCE_NOT_RESOLVED")
+                reevaluation = {"gate_id": gate.id, "status": gate.status}
         else:
             raise DomainError(409, "BLOCK_REQUIRES_SPECIFIC_ACTION")
         event(
@@ -306,3 +322,57 @@ class InterventionCommands:
         session.flush()
         self.service.checkpoint("intervention.resolved")
         return {"run": run_view(run), "reevaluation": reevaluation}
+
+    def retry_evidence(self, session, run, candidate, jobs, checks, decision):
+        from .evidence import target_of
+        from .service import DomainError
+
+        if decision.reason not in {"MANDATORY_EVIDENCE_MISSING", "EVIDENCE_TARGET_MISMATCH"}:
+            raise DomainError(409, "EVIDENCE_NOT_RESOLVED")
+        if run.cost_state != "KNOWN":
+            raise DomainError(409, "USAGE_NOT_RECONCILED")
+        profile = run.snapshot["verification_profile"]
+        review_ids = profile.get("review_check_ids", ["review", "acceptance_review"])
+        required = {("VERIFY", key) for key in profile["required_checks"] if key not in review_ids}
+        required |= {
+            ("REVIEW", item["id"])
+            for item in run.snapshot["task_spec"]["task"]["acceptance_criteria"]
+        }
+        selected = {}
+        for check in checks:
+            if check["id"] in decision.evidence_ids:
+                selected.setdefault((check["kind"], check["key"]), []).append(check)
+        kinds = set()
+        for kind, key in required:
+            records = selected.get((kind, key), [])
+            origin = "managed_verifier" if kind == "VERIFY" else "managed_reviewer"
+            if len(records) != 1 or any(
+                item["status"] == "INCONCLUSIVE"
+                or not item["eligible"]
+                or item["target"] != target_of(candidate)
+                or item["origin"] != origin
+                for item in records
+            ):
+                kinds.add(kind)
+        if not kinds:
+            raise DomainError(409, "EVIDENCE_NOT_RESOLVED")
+        retry = []
+        for kind in sorted(kinds):
+            matching = [job for job in jobs if job.kind == kind]
+            if len(matching) != 1:
+                raise DomainError(409, "RESUME_JOB_MISSING")
+            job = matching[0]
+            if job.state not in {"SUCCEEDED", "FAILED", "BLOCKED"}:
+                raise DomainError(409, "RESUME_JOB_NOT_BLOCKED")
+            if job.attempt_no >= run.snapshot["execution"]["max_infra_attempts_per_job"]:
+                raise DomainError(409, "INFRA_ATTEMPTS_EXHAUSTED")
+            retry.append(job)
+        if (
+            run.budget_microusd - run.spent_microusd
+            < run.snapshot["policy"]["job_reservation_microusd"]
+        ):
+            raise DomainError(409, "BUDGET_NOT_RESOLVED")
+        for job in retry:
+            job.state, job.available_at = "RETRY_WAIT", db_now(session)
+        run.status, run.stop_reason, run.wait_context = "QUEUED", None, None
+        return {"status": "RETRY_SCHEDULED", "job_ids": [job.id for job in retry]}
