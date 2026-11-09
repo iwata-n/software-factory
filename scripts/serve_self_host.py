@@ -19,6 +19,13 @@ from evaluate_codex import available_port, post, wait_ready
 from sqlalchemy.engine import make_url
 
 from software_factory.codex_engine import CodexCLI
+from software_factory.codex_worker_pool import (
+    DEFAULT_CODEX_WORKERS,
+    MAX_CODEX_WORKERS,
+    CodexWorkerPool,
+)
+from software_factory.db import Database
+from software_factory.models import Principal, Workspace
 
 ROOT = Path(__file__).resolve().parents[1]
 REMOTE = "https://github.com/iwata-n/software-factory.git"
@@ -100,7 +107,7 @@ def start_managed_worker(
                 "name": f"Self-host {name}",
             },
         )
-    return start(
+    process = start(
         stack,
         output,
         name,
@@ -108,12 +115,66 @@ def start_managed_worker(
         worker_env | {"FACTORY_WORKER_TOKEN": credential["worker_token"]},
         *arguments,
     )
+    process.factory_worker_id = credential["worker_id"]
+    return process
 
 
-def monitor_services(server, services, restart):
+def start_codex_pool(
+    stack, output, worker_env, server_env, workspace, url, binary, manifest, *, task_chat=True
+):
+    database = Database(server_env["FACTORY_DATABASE_URL"])
+    stack.callback(database.engine.dispose)
+    generations = {}
+
+    def desired():
+        with database.transaction() as session:
+            return session.get(Workspace, workspace).codex_worker_count
+
+    def retire(process):
+        with database.transaction() as session:
+            actor = session.get(Principal, process.factory_worker_id)
+            if actor and actor.workspace_id == workspace:
+                actor.active = False
+
+    def provision(slot, drain):
+        generations[slot] = generations.get(slot, 0) + 1
+        name = f"codex_cli-{slot + 1}-{generations[slot]}"
+        return start_managed_worker(
+            stack,
+            output,
+            name,
+            worker_env | {"FACTORY_RUNNER_STATE_ROOT": str(output / f"codex-state-{slot + 1}")},
+            server_env,
+            workspace,
+            url,
+            ["PLAN", "IMPLEMENT", "REPAIR"],
+            [
+                "--api-url",
+                url,
+                "--adapter",
+                "codex_cli",
+                "--codex-binary",
+                str(binary),
+                "--codex-manifest",
+                str(manifest),
+                "--stop-when-idle-file",
+                str(drain),
+                *(["--task-chat"] if task_chat else []),
+            ],
+        )
+
+    return CodexWorkerPool(output / "codex-pool", desired, provision, retire)
+
+
+def monitor_services(server, services, restart, *, tick=None):
     """A failed source runner/worker must not take the operations UI offline."""
     failures, retry_at = [0] * len(services), [0.0] * len(services)
     while server.poll() is None:
+        if tick:
+            try:
+                tick()
+            except Exception as error:
+                print(json.dumps({"pool_refresh_failed": type(error).__name__}), flush=True)
         for index, process in enumerate(services):
             if process.poll() is None or time.monotonic() < retry_at[index]:
                 continue
@@ -140,6 +201,13 @@ def main():
     parser.add_argument("--codex-binary", required=True, type=Path)
     parser.add_argument("--codex-manifest", required=True, type=Path)
     parser.add_argument("--port", type=int)
+    parser.add_argument(
+        "--codex-workers",
+        type=int,
+        choices=range(1, MAX_CODEX_WORKERS + 1),
+        default=DEFAULT_CODEX_WORKERS,
+        help="Initial number of parallel isolated Codex workers (default: 10)",
+    )
     parser.add_argument("--codex-login-binary", default=shutil.which("codex"))
     parser.add_argument("--admin-username", help="Provision a web administrator for this preview")
     args = parser.parse_args()
@@ -212,6 +280,10 @@ def main():
             )
         account = admin("bootstrap", "--name", "Software Factory")
         workspace = account["workspace_id"]
+        database = Database(db)
+        with database.transaction() as session:
+            session.get(Workspace, workspace).codex_worker_count = args.codex_workers
+        database.engine.dispose()
         codex_root = {}
         if args.codex_login_binary:
             codex_root["FACTORY_CODEX_AUTH_ROOT"] = str(output / "codex-account")
@@ -273,28 +345,24 @@ def main():
             )
             worker_specs = [
                 (
-                    "codex_cli",
-                    ["PLAN", "IMPLEMENT", "REPAIR"],
-                    ["--task-chat"] if codex_root else [],
-                ),
-                (
                     "pipeline",
                     ["ASSEMBLE_CANDIDATE", "VERIFY", "REVIEW"],
                     ["--reviewer", "codex_cli"],
                 ),
             ]
-            generations = [0, 0]
+            generations = [0] * len(worker_specs)
 
             def provision(index):
                 adapter, kinds, extra = worker_specs[index]
                 generations[index] += 1
-                name = f"{adapter}-{generations[index]}"
+                slot = f"{adapter}-{index + 1}"
+                name = f"{slot}-{generations[index]}"
                 env = (
                     common
                     | codex_root
                     | {
                         "FACTORY_RUNNER_IMAGE_DIGEST": image,
-                        "FACTORY_RUNNER_STATE_ROOT": str(output / adapter),
+                        "FACTORY_RUNNER_STATE_ROOT": str(output / slot),
                         "FACTORY_CODEX_AUTH_FILE": str(engine.auth_file),
                     }
                 )
@@ -314,6 +382,22 @@ def main():
                 )
 
             workers = [provision(index) for index in range(len(worker_specs))]
+            pool = start_codex_pool(
+                stack,
+                output,
+                common
+                | codex_root
+                | {
+                    "FACTORY_RUNNER_IMAGE_DIGEST": image,
+                    "FACTORY_CODEX_AUTH_FILE": str(engine.auth_file),
+                },
+                server_env,
+                workspace,
+                url,
+                args.codex_binary.resolve(),
+                args.codex_manifest.resolve(),
+                task_chat=bool(codex_root),
+            )
         if args.admin_username:
             password = secrets.token_urlsafe(24)
             with httpx.Client(
@@ -356,7 +440,7 @@ def main():
                 )
             return provision(index - 1)
 
-        monitor_services(server, [source_process, *workers], restart)
+        monitor_services(server, [source_process, *workers], restart, tick=pool.tick)
         raise RuntimeError(f"Self-host service stopped. See logs in {output}")
 
 

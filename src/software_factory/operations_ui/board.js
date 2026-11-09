@@ -138,6 +138,8 @@ function disconnect(text = "接続を終了しました。", error = false) {
   get("task-open").hidden = true;
   get("integration-settings").close();
   get("integration-open").hidden = true;
+  get("codex-workers-open").hidden = true;
+  get("codex-workers-dialog").close();
   get("execution").hidden = true;
   get("worker-panel").hidden = true;
   get("worker-panel").open = false;
@@ -249,6 +251,7 @@ function renderExecution(context) {
   get("execution-action").hidden = access !== "ADMIN";
   get("task-open").hidden = !["ADMIN", "OPERATOR"].includes(access);
   get("integration-open").hidden = access !== "ADMIN";
+  get("codex-workers-open").hidden = !["ADMIN", "OPERATOR"].includes(access);
   get("accounts-open").hidden = access !== "ADMIN" || !secureAccounts;
   get("disconnect").textContent = account ? "ログアウト" : "切断";
   get("disconnect").hidden = ["lan", "tailscale", "temporary"].includes(account?.authentication);
@@ -902,12 +905,15 @@ function mountAttentionSurface(root, run, container, signal) {
       notice.textContent = {
         ATTENTION_ANSWER_REQUIRED: "候補を選ぶか、「その他」から回答を入力してください。",
         ATTENTION_SURFACE_STALE: "質問や仕様が変わりました。「詳細を更新」で確認してください。",
-        TASK_CHAT_BUSY: "Codex が別の応答を処理中です。少し待って送信してください。",
+        TASK_CHAT_BUSY: "このタスクの Codex が応答中です。完了後に回答を送れます。",
         TASK_CHAT_DAILY_LIMIT: "本日の Codex 対話の上限に達しました。",
         INTERVIEW_SPECIFICATION_INVALID: "仕様案を保存できませんでした。",
       }[error.message] ?? runActionMessage(error);
       notice.classList.add("error");
-      if (error.message === "TASK_CHAT_BUSY") refreshTimer = setTimeout(poll, 2000);
+      if (error.message === "TASK_CHAT_BUSY") {
+        snapshot = undefined;
+        refreshTimer = setTimeout(poll, 2000);
+      }
     } finally {
       sending = false;
     }
@@ -1197,7 +1203,7 @@ function taskChat(root, signal) {
     } catch (error) {
       if (signal.aborted) return;
       status.textContent = {
-        TASK_CHAT_BUSY: "別のチャットが処理中です。少し待ってから再送してください。",
+        TASK_CHAT_BUSY: "このタスクのチャットが応答中です。完了後に送信してください。",
         TASK_CHAT_DAILY_LIMIT: "この Workspace のチャット利用上限に達しました。",
         SENSITIVE_INPUT: "認証情報を含まないメッセージにしてください。",
       }[error.message] ?? runActionMessage(error);
@@ -1614,6 +1620,55 @@ get("execution-dismiss").addEventListener("click", () => {
   get("execution-action").focus();
 });
 get("execution-form").addEventListener("submit", submitExecution);
+
+const codexWorkersDialog = get("codex-workers-dialog");
+let codexWorkersRequest;
+let codexWorkersPending;
+
+get("codex-workers-open").addEventListener("click", async () => {
+  codexWorkersRequest?.abort();
+  codexWorkersRequest = new AbortController();
+  const {signal} = codexWorkersRequest;
+  codexWorkersPending = undefined;
+  get("codex-workers-count").value = "";
+  get("codex-workers-save").disabled = true;
+  message("codex-workers-status", "設定を取得中…");
+  codexWorkersDialog.showModal();
+  try {
+    const state = await read("/v1/operations/codex-workers", signal);
+    if (signal.aborted) return;
+    get("codex-workers-count").value = state.worker_count;
+    get("codex-workers-count").max = state.max_worker_count;
+    get("codex-workers-save").disabled = false;
+    message("codex-workers-status", "");
+  } catch (error) {
+    if (!signal.aborted) message("codex-workers-status", "設定を取得できませんでした。開き直してください。", true);
+  }
+});
+
+get("codex-workers-form").addEventListener("submit", async (event) => {
+  event.preventDefault();
+  if (!codexWorkersRequest || get("codex-workers-save").disabled) return;
+  const {signal} = codexWorkersRequest;
+  const body = JSON.stringify({worker_count: Number(get("codex-workers-count").value)});
+  if (codexWorkersPending?.body !== body) codexWorkersPending = {body, key: taskKey()};
+  get("codex-workers-save").disabled = true;
+  message("codex-workers-status", "保存中…");
+  try {
+    const result = await postTask("/v1/operations/codex-workers", body, codexWorkersPending.key, signal);
+    if (signal.aborted) return;
+    codexWorkersPending = undefined;
+    message("codex-workers-status", `Codex ワーカー数を ${result.worker_count} 個に保存しました。順次反映します。`);
+  } catch (error) {
+    if (!signal.aborted) message("codex-workers-status", runActionMessage(error), true);
+  } finally {
+    if (!signal.aborted) get("codex-workers-save").disabled = false;
+  }
+});
+
+codexWorkersDialog.addEventListener("close", () => {
+  if (!codexWorkersDialog.open) codexWorkersRequest?.abort();
+});
 
 const accountsDialog = get("accounts-dialog");
 const accountForm = get("account-create");

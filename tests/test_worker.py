@@ -439,3 +439,51 @@ def test_pipeline_never_reports_stop_while_execution_thread_is_live():
     # A late result from the same generation cannot clear the quarantine.
     adapter.execute({"snapshot": {}}, adapter._cancel, adapter._generation, None)
     assert adapter.result().reason == "STOP_UNCONFIRMED"
+
+
+def test_supervised_worker_finishes_accepted_work_before_draining(monkeypatch, tmp_path):
+    import sys
+
+    from software_factory import worker
+
+    drain = tmp_path / "drain"
+    calls = []
+
+    def run_once(self, **kwargs):
+        calls.append("accepted work and usage delivered")
+        drain.touch()
+        return {"completed": True}
+
+    monkeypatch.setenv("FACTORY_WORKER_TOKEN", "fixture-worker")
+    monkeypatch.delenv("FACTORY_WORKER_CREDENTIAL_FILE", raising=False)
+    monkeypatch.setattr(sys, "argv", ["worker", "--stop-when-idle-file", str(drain)])
+    monkeypatch.setattr(worker.Supervisor, "run_once", run_once)
+    worker.main()
+    assert calls == ["accepted work and usage delivered"]
+
+
+def test_draining_worker_retries_pending_usage_without_claiming_more_work(monkeypatch, tmp_path):
+    import sys
+
+    from software_factory import worker
+
+    drain = tmp_path / "drain"
+    drain.touch()
+    flushes = []
+
+    def flush(self):
+        flushes.append(True)
+        if len(flushes) == 1:
+            raise httpx.ConnectError("fixture disconnected")
+
+    def claim(self, **kwargs):
+        raise AssertionError("A draining worker must not claim more work")
+
+    monkeypatch.setenv("FACTORY_WORKER_TOKEN", "fixture-worker")
+    monkeypatch.delenv("FACTORY_WORKER_CREDENTIAL_FILE", raising=False)
+    monkeypatch.setattr(sys, "argv", ["worker", "--stop-when-idle-file", str(drain)])
+    monkeypatch.setattr(worker.Supervisor, "_flush_usage", flush)
+    monkeypatch.setattr(worker.Supervisor, "run_once", claim)
+    monkeypatch.setattr(worker.time, "sleep", lambda _: None)
+    worker.main()
+    assert len(flushes) == 2

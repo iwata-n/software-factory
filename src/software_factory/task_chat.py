@@ -299,7 +299,9 @@ def automatic_proposal(session, workspace):
                     session, run, "Propose answers to the plan questions.", plan_id=plan.id
                 )
             except DomainError as error:
-                if error.code in {"TASK_CHAT_BUSY", "TASK_CHAT_DAILY_LIMIT"}:
+                if error.code == "TASK_CHAT_BUSY":
+                    continue
+                if error.code == "TASK_CHAT_DAILY_LIMIT":
                     return None
                 raise
     return None
@@ -313,7 +315,11 @@ def enqueue_turn(session, run, question, *, plan_id=None, interview=None):
     expire_turns(session, run.workspace_id, now)
     if session.scalar(
         select(TaskChatTurn.id)
-        .where(TaskChatTurn.workspace_id == run.workspace_id, TaskChatTurn.status.in_(ACTIVE))
+        .where(
+            TaskChatTurn.workspace_id == run.workspace_id,
+            TaskChatTurn.run_id == run.id,
+            TaskChatTurn.status.in_(ACTIVE),
+        )
         .limit(1)
     ):
         raise DomainError(409, "TASK_CHAT_BUSY")
@@ -400,7 +406,15 @@ def task_chat_router(service, token_type, key_type, workspace):
                 )
                 .limit(1)
             )
-            if busy:
+            if busy or session.scalar(
+                select(TaskChatTurn.id)
+                .where(
+                    TaskChatTurn.workspace_id == actor.workspace_id,
+                    TaskChatTurn.worker_id == actor.id,
+                    TaskChatTurn.status == "RUNNING",
+                )
+                .limit(1)
+            ):
                 return Response(status_code=204)
             turn = session.scalar(
                 select(TaskChatTurn)

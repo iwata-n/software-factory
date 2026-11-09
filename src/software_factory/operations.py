@@ -6,19 +6,26 @@ import time
 from pathlib import Path
 from typing import Annotated
 
-from fastapi import APIRouter, Header, Query, Response
+from fastapi import APIRouter, Header, Query, Request, Response
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
+from pydantic import Field
 from sqlalchemy import func, select, tuple_
 from starlette.concurrency import run_in_threadpool
 
-from .contracts import ProjectPolicy, digest
+from .codex_worker_pool import MAX_CODEX_WORKERS
+from .contracts import Contract, ProjectPolicy, digest
 from .db import db_now
-from .models import Attempt, Principal, Project, Repository, Run, RunEvent, Task, Worker
+from .models import Attempt, Principal, Project, Repository, Run, RunEvent, Task, Worker, Workspace
 from .service import DomainError, owned
 from .task_lifecycle import task_stage
+from .web_accounts import browser_write
 
 UI_DIR = Path(__file__).with_name("operations_ui")
 HEARTBEAT_STALE_SECONDS = 30
+
+
+class CodexWorkersInput(Contract):
+    worker_count: Annotated[int, Field(strict=True, ge=1, le=MAX_CODEX_WORKERS)]
 
 
 def event_view(event):
@@ -133,6 +140,35 @@ def operations_router(service, token_type):
             }
 
         return service.read(token, query)
+
+    @router.get("/v1/operations/codex-workers", tags=["Operations"])
+    def codex_workers(token: token_type, response: Response):
+        response.headers["Cache-Control"] = "no-store"
+
+        def query(session, actor):
+            return {
+                "worker_count": session.get(Workspace, actor.workspace_id).codex_worker_count,
+                "max_worker_count": MAX_CODEX_WORKERS,
+            }
+
+        return service.read(token, query)
+
+    @router.post("/v1/operations/codex-workers", tags=["Operations"])
+    def set_codex_workers(data: CodexWorkersInput, request: Request, token: token_type):
+        browser_write(request)
+
+        def command(session, actor):
+            session.get(Workspace, actor.workspace_id).codex_worker_count = data.worker_count
+            return {"worker_count": data.worker_count, "max_worker_count": MAX_CODEX_WORKERS}
+
+        return service.write(
+            token,
+            "USER",
+            "codex:workers",
+            request.headers.get("Idempotency-Key"),
+            data.model_dump(),
+            command,
+        )
 
     @router.get("/v1/operations/task-targets", tags=["Operations"])
     def task_targets(token: token_type, response: Response):

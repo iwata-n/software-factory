@@ -9,6 +9,7 @@ import time
 from concurrent.futures import Future
 from contextlib import nullcontext
 from dataclasses import replace
+from pathlib import Path
 from threading import Thread
 from urllib.parse import urlparse
 
@@ -414,6 +415,11 @@ def main():
     parser.add_argument("--reviewer", choices=["none", "codex_cli"], default="none")
     parser.add_argument("--task-chat", action="store_true", help="Handle task chats while idle")
     parser.add_argument(
+        "--stop-when-idle-file",
+        type=Path,
+        help="Exit after accepted work finishes when this supervisor-owned file exists",
+    )
+    parser.add_argument(
         "--host-codex-evaluation",
         action="store_true",
         help="Allow the fixed local evaluation harness to drain a loopback Worker on the host",
@@ -490,6 +496,9 @@ def main():
             try:
                 if credentials:
                     credentials.prepare(client)
+                if args.stop_when_idle_file and args.stop_when_idle_file.exists():
+                    supervisor._flush_usage()
+                    return
                 result = supervisor.run_once(
                     wait_seconds=0 if args.once or args.drain or args.task_chat else 20
                 )

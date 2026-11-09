@@ -5,7 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Run カンバン | Software Factory</title>
   <link rel="stylesheet" href="/operations/board.css?v=task-delete">
-  <script type="module" src="/operations/board.js?v=evidence-retry"></script>
+  <script type="module" src="/operations/board.js?v=parallel-codex"></script>
 </head>
 <body>
   <header class="masthead">
@@ -55,6 +55,7 @@
           </section>
           <button id="run-history-toggle" type="button" aria-pressed="false">過去の Run も表示</button>
           <button id="integration-open" type="button" hidden>連携設定</button>
+          <button id="codex-workers-open" type="button" hidden>Codex ワーカー設定</button>
           <button id="accounts-open" type="button" hidden>アカウント管理</button>
           <button id="disconnect" type="button">切断</button>
         </div>
@@ -139,6 +140,21 @@
       </details>
       <button id="task-submit" type="submit">タスクを作成</button>
     </form>
+  </dialog>
+  <dialog id="codex-workers-dialog" aria-labelledby="codex-workers-title">
+    <header class="detail-header">
+      <h2 id="codex-workers-title">Codex ワーカー設定</h2>
+      <form method="dialog"><button>閉じる</button></form>
+    </header>
+    <p>別タスクの詳細化・実装・対話を並列に処理します。既定は10個です。</p>
+    <form id="codex-workers-form">
+      <label>Codex ワーカー数
+        <input id="codex-workers-count" type="number" min="1" max="32" step="1" required>
+      </label>
+      <p>1〜32個で設定できます。保存すると順次反映されます。減らす場合、処理中のワーカーは完了後に停止します。</p>
+      <button id="codex-workers-save" type="submit" disabled>ワーカー数を保存</button>
+    </form>
+    <p id="codex-workers-status" role="status"></p>
   </dialog>
   <dialog id="integration-settings" aria-labelledby="integration-title">
     <header class="detail-header">
