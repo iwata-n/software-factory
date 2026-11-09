@@ -17,6 +17,7 @@ from software_factory.models import (
     Artifact,
     Attempt,
     AuditEvent,
+    IdempotencyRecord,
     Job,
     OutboxEvent,
     Run,
@@ -337,6 +338,14 @@ def test_encrypted_backup_restore(world, artifacts, tmp_path, monkeypatch, capsy
 
 @pytest.mark.ac("SF-24-AC06")
 def test_run_purge_preserves_command_receipt_for_ninety_more_days(world, artifacts, evidence):
+    with world.database.transaction() as session:
+        receipt = session.scalar(
+            select(IdempotencyRecord).where(
+                IdempotencyRecord.operation == f"runs:{world.task_id}",
+                IdempotencyRecord.workspace_id == world.workspace_id,
+            )
+        )
+        start_key, start_response = receipt.key, dict(receipt.response)
     root = world.client.app.state.service.artifacts.storage.root
     artifact = artifacts.reserve().json()["id"]
     uploaded = artifacts.upload(artifact, key="retention-upload")
@@ -373,8 +382,28 @@ def test_run_purge_preserves_command_receipt_for_ninety_more_days(world, artifac
         assert collected["runs_purged"] == collected["tasks_purged"] == 1
         assert world.get(run_path).status_code == world.get(task_path).status_code == 404
         assert (
+            world.post(task_path + "/runs", {"spec_version": 1}, key=start_key).json()
+            == start_response
+        )
+        assert (
+            world.post(
+                task_path + "/runs", {"spec_version": 1}, key="new-start-after-purge"
+            ).status_code
+            == 404
+        )
+        with world.database.transaction() as session:
+            assert session.scalar(select(Run.id).where(Run.task_id == world.task_id)) is None
+        assert (
             world.post(task_path + "/spec-versions", spec, key="retention-spec").json()
             == updated.json()
+        )
+        assert (
+            world.post(task_path + "/spec-versions", spec, key="new-after-purge").status_code == 404
+        )
+        changed = spec | {"task": spec["task"] | {"title": "Changed after purge"}}
+        assert (
+            world.post(task_path + "/spec-versions", changed, key="retention-spec").status_code
+            == 409
         )
         assert artifacts.upload(artifact, key="retention-upload").json() == uploaded.json()
         assert (
@@ -385,6 +414,10 @@ def test_run_purge_preserves_command_receipt_for_ninety_more_days(world, artifac
         assert (
             world.post(run_path + "/cancel", payload, key="retention-cancel").json()
             == cancelled.json()
+        )
+        assert (
+            world.post(run_path + "/cancel", payload, key="new-cancel-after-purge").status_code
+            == 404
         )
         assert (
             world.post(

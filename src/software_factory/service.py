@@ -446,7 +446,6 @@ class Service:
                 if cleaned != body:
                     raise DomainError(422, "SENSITIVE_INPUT")
             request_hash = digest(body)
-            self.check_task_command(session, actor, operation)
             previous = session.scalar(
                 select(IdempotencyRecord).where(
                     IdempotencyRecord.workspace_id == actor.workspace_id,
@@ -454,6 +453,9 @@ class Service:
                     IdempotencyRecord.operation == operation,
                     IdempotencyRecord.key == key,
                 )
+            )
+            self.check_task_command(
+                session, actor, operation, retained_receipt=previous is not None
             )
             if previous:
                 if replay_check:
@@ -490,12 +492,36 @@ class Service:
             return response
 
     @staticmethod
-    def check_task_command(session, actor, operation):
+    def check_task_command(session, actor, operation, *, retained_receipt=False):
         # Validate the parent even when a pre-deletion idempotency receipt exists.
         parts = operation.split(":")
         if len(parts) < 2:
             return
         kind, identifier = parts[:2]
+        model = (
+            Task
+            if kind in {"runs", "specs"} and len(parts) == 2
+            else Run
+            if kind in {"chat", "attention", "cancel", "resolve-blocked", "runs"}
+            else ApprovalRequest
+            if kind == "approval"
+            else None
+        )
+        if model is None:
+            return
+        if (
+            retained_receipt
+            and session.scalar(
+                select(model.id).where(
+                    model.id == identifier, model.workspace_id == actor.workspace_id
+                )
+            )
+            is None
+        ):
+            # Retention keeps actor-scoped receipts after physical history removal.
+            # Return only that recorded response; no command is executed. Soft-deleted
+            # Tasks still exist and must pass the strict parent checks below.
+            return
         if kind in {"runs", "specs"} and len(parts) == 2:
             active_task(session, identifier, actor.workspace_id, lock=True)
         elif kind in {"chat", "attention", "cancel", "resolve-blocked", "runs"}:
@@ -707,8 +733,16 @@ class Service:
                     IdempotencyRecord.key == key,
                 )
             )
-            active_task(session, task_id, actor.workspace_id)
             if previous:
+                if (
+                    session.scalar(
+                        select(Task.id).where(
+                            Task.id == task_id, Task.workspace_id == actor.workspace_id
+                        )
+                    )
+                    is not None
+                ):
+                    active_task(session, task_id, actor.workspace_id)
                 if previous.request_hash != digest(body):
                     raise DomainError(409, "IDEMPOTENCY_CONFLICT")
                 return previous.response
