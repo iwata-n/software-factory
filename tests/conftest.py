@@ -16,6 +16,8 @@ from software_factory.models import Enrollment, Principal, Workspace
 from software_factory.security import redact
 from software_factory.service import issue_token, token_hash
 
+pytest_plugins = ["scripts.acceptance_reporter"]
+
 
 @pytest.fixture
 def evidence(request, pytestconfig):
@@ -39,7 +41,9 @@ def migrated_database():
     engine = create_engine(url)
     with engine.begin() as connection:
         connection.execute(text(f'CREATE SCHEMA "{schema}"'))
-    scoped_url = make_url(url).update_query_dict({"options": f"-csearch_path={schema}"})
+    scoped_url = make_url(url).update_query_dict(
+        {"options": f"-csearch_path={schema}", "application_name": schema}
+    )
     old_url = os.environ.get("FACTORY_DATABASE_URL")
     os.environ["FACTORY_DATABASE_URL"] = scoped_url.render_as_string(hide_password=False)
     database = Database(os.environ["FACTORY_DATABASE_URL"])

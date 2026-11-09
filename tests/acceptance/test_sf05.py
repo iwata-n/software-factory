@@ -319,14 +319,24 @@ def test_twenty_second_poll_holds_no_db_transaction_or_row_lock(world, evidence)
         try:
             assert entered.wait(5)
             with world.database.engine.connect() as connection:
-                active = connection.scalar(
-                    text(
-                        "SELECT count(*) FROM pg_stat_activity "
-                        "WHERE datname=current_database() AND pid<>pg_backend_pid() "
-                        "AND xact_start IS NOT NULL"
-                    )
+                active_transactions = text(
+                    "SELECT count(*) FROM pg_stat_activity "
+                    "WHERE datname=current_database() AND pid<>pg_backend_pid() "
+                    "AND application_name=current_setting('application_name') "
+                    "AND xact_start IS NOT NULL"
                 )
-                assert active == 0
+                with world.database.engine.connect() as other_worker:
+                    other_worker.execute(
+                        text("SET LOCAL application_name = 'factory_test_other_worker'")
+                    )
+                    # A transaction from this worker must still be detected, while
+                    # another worker's transaction must not affect the observation.
+                    with world.database.engine.connect() as same_worker:
+                        same_worker.execute(text("SELECT 1"))
+                        assert connection.scalar(active_transactions) == 1
+                    connection.commit()  # Refresh PostgreSQL's activity snapshot.
+                    active = connection.scalar(active_transactions)
+                    assert active == 0
             created = world.post(f"/v1/tasks/{world.task_id}/runs", {"spec_version": 1})
             assert created.status_code == 202
             run = created.json()
