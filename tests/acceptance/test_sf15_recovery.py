@@ -394,6 +394,8 @@ def test_migration_preserves_actual_and_reserved_or_provisional_balances(world, 
             migrated = tasks[row["id"]]
             retention_touched_at = migrated.pop("retention_touched_at")
             assert retention_touched_at >= min(item["created_at"] for item in original["runs"])
+            for added in ("clarified_spec_version", "deleted_at", "deleted_by"):
+                assert migrated.pop(added) is None
             assert migrated == row
         for name in ("task_spec_versions", "job_attempts"):
             assert after[name] == before[name]
