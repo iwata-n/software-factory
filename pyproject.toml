@@ -20,7 +20,11 @@ factory-source-runner = "software_factory.source_runner:main"
 factory-publisher = "software_factory.publisher:main"
 
 [dependency-groups]
-dev = ["pytest>=8,<10", "ruff>=0.11,<1"]
+dev = [
+    "pytest>=8,<10",
+    "pytest-xdist>=3.6,<4",
+    "ruff>=0.11,<1",
+]
 
 [build-system]
 requires = ["hatchling"]

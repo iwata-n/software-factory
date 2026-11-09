@@ -16,6 +16,8 @@ from software_factory.models import Enrollment, Principal, Workspace
 from software_factory.security import redact
 from software_factory.service import issue_token, token_hash
 
+pytest_plugins = ["scripts.acceptance_reporter"]
+
 
 @pytest.fixture
 def evidence(request, pytestconfig):
@@ -30,16 +32,46 @@ def evidence(request, pytestconfig):
 
 
 @pytest.fixture(scope="session")
-def migrated_database():
+def test_database_url():
     url = os.environ.get("TEST_DATABASE_URL")
     if not url:
         pytest.skip("TEST_DATABASE_URL is unset; PostgreSQL integration tests were not run")
+    if not os.environ.get("PYTEST_XDIST_WORKER"):
+        yield url
+        return
+    # pg_dump snapshots the whole database, so schemas alone cannot isolate
+    # concurrent backup tests from another worker's schema migrations.
+    name = "factory_worker_" + uuid4().hex
+    admin = create_engine(url, isolation_level="AUTOCOMMIT")
+    created = False
+    try:
+        with admin.connect() as connection:
+            connection.execute(text(f'CREATE DATABASE "{name}"'))
+        created = True
+        worker_url = make_url(url).set(database=name).render_as_string(hide_password=False)
+        os.environ["TEST_DATABASE_URL"] = worker_url
+        yield worker_url
+    finally:
+        os.environ["TEST_DATABASE_URL"] = url
+        try:
+            if created:
+                with admin.connect() as connection:
+                    connection.execute(text(f'DROP DATABASE "{name}" WITH (FORCE)'))
+        finally:
+            admin.dispose()
+
+
+@pytest.fixture(scope="session")
+def migrated_database(test_database_url):
+    url = test_database_url
     # A random schema keeps the tests separate from all existing application data.
     schema = "factory_test_" + uuid4().hex
     engine = create_engine(url)
     with engine.begin() as connection:
         connection.execute(text(f'CREATE SCHEMA "{schema}"'))
-    scoped_url = make_url(url).update_query_dict({"options": f"-csearch_path={schema}"})
+    scoped_url = make_url(url).update_query_dict(
+        {"options": f"-csearch_path={schema}", "application_name": schema}
+    )
     old_url = os.environ.get("FACTORY_DATABASE_URL")
     os.environ["FACTORY_DATABASE_URL"] = scoped_url.render_as_string(hide_password=False)
     database = Database(os.environ["FACTORY_DATABASE_URL"])

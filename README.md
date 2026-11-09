@@ -252,7 +252,7 @@ export FACTORY_RUNNER_IMAGE_DIGEST="$(docker image inspect software-factory-runn
 ```sh
 export TEST_DATABASE_URL='postgresql+psycopg://factory:factory@127.0.0.1:5432/factory'
 mkdir -p .local/acceptance/current
-uv run pytest -q --junitxml=.local/acceptance/current/junit.xml
+uv run pytest -q -n 4 --dist worksteal --max-worker-restart=0 --durations=20 --junitxml=.local/acceptance/current/junit.xml
 uv run python scripts/verify_acceptance.py .local/acceptance/current --allow-ci-pending
 ```
 
@@ -269,7 +269,9 @@ pgserver 0.1.4付属のPostgreSQL 16は既存回帰の補助用途に限りま�
 
 `.local/acceptance/current/` に対象コード・試験・設定のdigest、ACごとの期待/実測結果、環境、JUnitを保存します。独立した証拠検査が入力一致と実行結果を照合します。`--allow-ci-pending` で保留を許すのは実GitHub CIのSF-01-AC06だけで、他の未検証や失敗は非0終了します。
 
-CIは同じ試験をPostgreSQL 17とDockerで実行し、`factory-acceptance` Artifactを保存します。完了後に実CIとダウンロード済みArtifactを照合します。
+全件検証は4プロセスで並列実行します。各プロセスは専用の一時DB・schemaを使い、親プロセスが全結果を集約して受け入れ証拠・ATシナリオ・保留項目を保存します。全DBを取得するバックアップ試験もあるため、並列実行のDBユーザーには `CREATEDB` 権限が必要です。一時DBは終了時に削除します。DB監視も接続の `application_name` で各プロセスに限定します。`--durations=20` で準備・後片付けも含めた遅い処理を確認できます。余力が少ない環境では `-n 2`、直列で調査するときは `-n 0` に変更できます。開発途中は `uv run pytest -q tests/test_worker.py` のように対象ファイルを指定し、部分実行の受け入れ証拠には `FACTORY_ACCEPTANCE_OUTPUT=.local/acceptance/development` など別の出力先を使います。
+
+CIは同じ全件試験をPostgreSQL 17とDockerで4並列実行し、`factory-acceptance` Artifactを保存します。Runnerのビルド層はGitHub Actionsキャッシュで再利用し、Lintはビルド前に実行します。同じブランチ・PRの古い自動実行は新しい実行でキャンセルします。手動の証拠評価は実行ごとに分離し、後続実行によるキャンセルを防ぎます。完了後に実CIとダウンロード済みArtifactを照合します。
 
 ```sh
 uv run python scripts/collect_ci_evidence.py \
