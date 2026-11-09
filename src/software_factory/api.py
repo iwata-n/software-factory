@@ -76,6 +76,7 @@ from .operations import event_view, operations_router
 from .resolver import SourceResolver
 from .service import WEB_SESSION_PREFIX, DomainError, Service, owned, run_view
 from .slack_delivery import NOTIFICATION, SlackClient, SlackDispatcher
+from .tailscale_access import TailscaleAccess
 from .task_chat import task_chat_router
 from .task_lifecycle import run_stage, task_stage
 from .temporary_web_access import TemporaryWebAccess
@@ -94,6 +95,9 @@ def bearer(
         ):
             return credentials.credentials
     elif not request.headers.get("Authorization"):
+        tailscale = request.app.state.tailscale_access
+        if tailscale and (token := tailscale.token_for(request)):
+            return token
         temporary = request.app.state.temporary_web_access
         if temporary and (token := temporary.token_for(request)):
             return token
@@ -201,6 +205,7 @@ def create_app(
     )
     app.state.service = service
     app.state.lan_access = LANAccess.configured()
+    app.state.tailscale_access = TailscaleAccess.configured()
     app.state.temporary_web_access = TemporaryWebAccess.configured()
     app.include_router(webhook_router(service, integrations, vault if vault.cipher else None))
     if jira := configured_jira():

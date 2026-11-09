@@ -197,6 +197,18 @@ def web_accounts_router(service, token_type):
     @router.get("/session")
     def current_session(request: Request, response: Response):
         response.headers["Cache-Control"] = "no-store"
+        tailscale = request.app.state.tailscale_access
+        if tailscale and (token := tailscale.token_for(request)):
+            return service.read(
+                token,
+                lambda session, actor: {
+                    "id": actor.id,
+                    "username": "Tailscale 共有",
+                    "access": actor.user_access,
+                    "active": actor.active,
+                    "authentication": "tailscale",
+                },
+            )
         temporary = request.app.state.temporary_web_access
         if temporary and (token := temporary.token_for(request)):
             return service.read(

@@ -8,6 +8,7 @@ import time
 from dataclasses import dataclass
 from ipaddress import ip_address, ip_network
 from pathlib import Path
+from typing import ClassVar
 from urllib.parse import urlsplit
 
 from .service import WEB_SESSION_PREFIX, DomainError
@@ -18,13 +19,15 @@ TAILNET_NETWORKS = (ip_network("100.64.0.0/10"), ip_network("fd7a:115c:a1e0::/48
 
 @dataclass(frozen=True, repr=False)
 class TemporaryWebAccess:
+    environment: ClassVar[str] = "FACTORY_TEMPORARY_WEB_ACCESS_FILE"
+    time_limited: ClassVar[bool] = True
     origin: str
     user_token: str
-    expires_at: float
+    expires_at: float | None
 
     @classmethod
     def configured(cls):
-        filename = os.getenv("FACTORY_TEMPORARY_WEB_ACCESS_FILE")
+        filename = os.getenv(cls.environment)
         if not filename:
             return None
         try:
@@ -33,7 +36,8 @@ class TemporaryWebAccess:
             if not stat.S_ISREG(info.st_mode) or info.st_mode & 0o077 or info.st_uid != os.getuid():
                 raise ValueError
             data = json.loads(path.read_text())
-            if set(data) != {"origin", "user_token", "expires_at"}:
+            keys = {"origin", "user_token"} | ({"expires_at"} if cls.time_limited else set())
+            if set(data) != keys:
                 raise ValueError
             origin = urlsplit(data["origin"])
             if (
@@ -55,18 +59,18 @@ class TemporaryWebAccess:
                 or token.startswith(WEB_SESSION_PREFIX)
             ):
                 raise ValueError
-            expires = float(data["expires_at"])
-            if not math.isfinite(expires) or expires > time.time() + 86400:
-                raise ValueError
+            expires = None
+            if cls.time_limited:
+                expires = float(data["expires_at"])
+                if not math.isfinite(expires) or expires > time.time() + 86400:
+                    raise ValueError
             return cls(data["origin"], token, expires)
         except (OSError, ValueError, TypeError, KeyError, AttributeError):
-            raise ValueError(
-                "Invalid owner-only FACTORY_TEMPORARY_WEB_ACCESS_FILE configuration"
-            ) from None
+            raise ValueError(f"Invalid owner-only {cls.environment} configuration") from None
 
     def token_for(self, request):
         if (
-            time.time() >= self.expires_at
+            (self.expires_at is not None and time.time() >= self.expires_at)
             or not request.client
             or f"{request.url.scheme}://{request.url.netloc}" != self.origin
             or request.headers.get("X-Forwarded-Proto") != "https"
@@ -90,7 +94,12 @@ class TemporaryWebAccess:
 
         def validate(session, actor):
             if actor.user_access != "OPERATOR":
-                raise DomainError(403, "TEMPORARY_OPERATOR_REQUIRED")
+                code = (
+                    "TEMPORARY_OPERATOR_REQUIRED"
+                    if self.time_limited
+                    else "TAILSCALE_OPERATOR_REQUIRED"
+                )
+                raise DomainError(403, code)
 
         request.app.state.service.read(self.user_token, validate)
         return self.user_token

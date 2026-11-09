@@ -90,6 +90,16 @@ HTTPSリバースプロキシは指定LANだけを許可し、受信した `X-Fa
 プロキシの接続だけを信頼します。設定ファイルとプロキシ設定に含まれる秘密値は
 ブラウザーへ配信しません。自動接続の書き込みにも同一Originが必要です。
 
+Tailscale経由のWebログインを継続して省く場合は、所有者のみが読める `0600` の設定ファイルを
+`FACTORY_TAILSCALE_ACCESS_FILE` で指定して再起動します。内容は `origin`（この端末の正確な
+HTTPS Tailscale URL）と `user_token`（有効期限なしの専用操作者トークン）です。
+Tailscale ServeのHTTPS転送ヘッダー、指定Origin、Tailnetの接続元アドレスを照合します。
+画面では「Tailscale 共有」と表示し、ID・パスワード入力やログアウト操作は不要です。
+この設定には24時間の期限はありません。通常のLAN、直接接続、公開Funnel経由には適用しません。
+共有操作者のWorkspaceと権限が適用され、トークンはブラウザーへ配信しません。
+書き込みには同一Originが必要で、管理者・Workerの権限には昇格しません。
+戻す場合は起動環境から設定ファイルの指定を外して再起動するか、専用操作者を無効化します。
+
 Tailscale経由のWebログインを一時的に省く場合は、所有者のみが読める `0600` の設定ファイルを
 `FACTORY_TEMPORARY_WEB_ACCESS_FILE` で指定します。内容は `origin`（この端末の正確なHTTPS
 Tailscale URL）、`user_token`（専用の操作者トークン）、`expires_at`（期限のUNIX秒）です。
