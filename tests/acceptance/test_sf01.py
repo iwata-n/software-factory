@@ -163,11 +163,18 @@ def test_previous_revision_data_survives_upgrade(database, evidence, revision):
         after = dump(old)
         for name, rows in before.items():
             if name != "alembic_version":
+                expected = rows
+                if name == "projects" and revision == "0001":
+                    # 0030 adds read-only visibility; all original policy values remain.
+                    expected = [
+                        row | {"policy": row["policy"] | {"allowed_read_paths": ["."]}}
+                        for row in rows
+                    ]
                 assert (
-                    [{key: row[key] for key in rows[0]} for row in after[name]] == rows
+                    [{key: row[key] for key in rows[0]} for row in after[name]] == expected
                     if rows
                     else not after[name]
-                )
+                ), name
         assert after["repositories"][0]["active"] is True
         assert after["principals"][0]["credential_revision"] == 0
         command.upgrade(Config("alembic.ini"), "head")
